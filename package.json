@@ -1,0 +1,18 @@
+{
+  "name": "aushadharth",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @aushadharth/web build",
+    "dev": "pnpm --filter @aushadharth/web dev",
+    "test": "pnpm --filter @aushadharth/web test",
+    "test:e2e": "pnpm --filter @aushadharth/web test:e2e",
+    "typecheck": "pnpm --filter @aushadharth/web typecheck",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "store-service:test": "cargo test --manifest-path apps/store-service/Cargo.toml"
+  }
+}

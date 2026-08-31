@@ -1,0 +1,32 @@
+node_modules/
+dist/
+target/
+coverage/
+playwright-report/
+test-results/
+.vite/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+
+# Runtime business data must never enter source control.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.aushbackup
+runtime/
+data/
+logs/
+backups/
+attachments/
+keys/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

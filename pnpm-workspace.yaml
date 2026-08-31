@@ -1,0 +1,9 @@
+packages:
+  - "apps/web"
+  - "packages/*"
+
+allowBuilds:
+  esbuild: true
+
+overrides:
+  vite: 7.3.5
