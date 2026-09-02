@@ -2,9 +2,12 @@ use std::path::PathBuf;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{API_VERSION, APPLICATION_VERSION};
+
+pub mod reference_masters;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,10 +33,12 @@ pub struct SystemInfoResponse {
     compatibility: Compatibility,
 }
 
-pub fn router(web_dist: Option<PathBuf>) -> Router {
+pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/system/info", get(system_info));
+        .route("/api/v1/system/info", get(system_info))
+        .merge(reference_masters::routes())
+        .with_state(reference_masters::ReferenceState { pool });
 
     if let Some(dist) = web_dist {
         router.fallback_service(
@@ -74,7 +79,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_works_without_internet() {
-        let response = router(None)
+        let temp = tempfile::tempdir().unwrap();
+        let pool = crate::infrastructure::database::connect(&temp.path().join("api.sqlite3"))
+            .await
+            .unwrap();
+        let response = router(pool, None)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")

@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let paths = RuntimePaths::resolve(&repository_root)?;
     paths.create_required_directories()?;
     let _logging_guard = logging::initialize(&paths.logs)?;
-    let _database = database::connect(&paths.database_file()).await?;
+    let database = database::connect(&paths.database_file()).await?;
 
     let address = loopback_address(DEFAULT_PORT);
     let listener = tokio::net::TcpListener::bind(address)
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind Store Service loopback listener")?;
     info!(address = %address, api_version = "v1", "Store Service started");
     let web_dist = repository_root.join("apps").join("web").join("dist");
-    axum::serve(listener, api::router(Some(web_dist)))
+    axum::serve(listener, api::router(database, Some(web_dist)))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("Store Service stopped unexpectedly")
