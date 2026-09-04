@@ -7,6 +7,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{API_VERSION, APPLICATION_VERSION};
 
+pub mod product_catalog;
 pub mod reference_masters;
 
 #[derive(Debug, Serialize)]
@@ -38,6 +39,7 @@ pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/system/info", get(system_info))
         .merge(reference_masters::routes())
+        .merge(product_catalog::routes())
         .with_state(reference_masters::ReferenceState { pool });
 
     if let Some(dist) = web_dist {

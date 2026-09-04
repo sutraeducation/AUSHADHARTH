@@ -168,3 +168,208 @@ export type CreateReferenceRequest = z.infer<typeof CreateReferenceRequestSchema
 export type UpdateReferenceRequest = z.infer<typeof UpdateReferenceRequestSchema>;
 export type ReferenceLifecycleRequest = z.infer<typeof ReferenceLifecycleRequestSchema>;
 export type ReferenceErrorResponse = z.infer<typeof ReferenceErrorResponseSchema>;
+
+export const ProductKindSchema = z.enum([
+  "medicine",
+  "device",
+  "general_pharmacy_item"
+]);
+
+export const ProductFieldsSchema = z.object({
+  productKind: ProductKindSchema,
+  brandId: z.string().nullable().optional(),
+  dosageFormId: z.string().nullable().optional(),
+  baseUnitId: z.string(),
+  quantityScale: z.number().int().min(0).max(6),
+  formulationDescriptor: z.string().nullable().optional(),
+  routeDescriptor: z.string().nullable().optional(),
+  releaseDescriptor: z.string().nullable().optional(),
+  displayName: z.string()
+});
+
+export const ProductCompanyRoleFieldsSchema = z.object({
+  companyId: z.string(),
+  role: z.enum(["manufacturer", "marketer", "brand_owner", "importer"]),
+  effectiveFrom: z.string().nullable().optional(),
+  effectiveTo: z.string().nullable().optional()
+});
+
+export const ProductCompanyRoleSchema = ProductCompanyRoleFieldsSchema.extend({
+  id: z.string(),
+  productId: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const ProductPackFieldsSchema = z.object({
+  containerUnitId: z.string(),
+  baseQuantityAtoms: z.number().int().positive(),
+  containedPackId: z.string().nullable().optional(),
+  containedPackCount: z.number().int().positive().nullable().optional(),
+  skuCode: z.string().nullable().optional(),
+  skuStoreId: z.string().nullable().optional(),
+  displayLabel: z.string().nullable().optional()
+});
+
+export const ProductPackSchema = ProductPackFieldsSchema.extend({
+  id: z.string(),
+  productId: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const StorePackPolicyFieldsSchema = z.object({
+  storeId: z.string(),
+  purchaseEnabled: z.boolean(),
+  saleEnabled: z.boolean(),
+  wholePackOnlyPurchase: z.boolean(),
+  fractionalSaleAllowed: z.boolean(),
+  minimumSaleIncrementAtoms: z.number().int().positive(),
+  defaultPurchasePack: z.boolean(),
+  defaultSalePack: z.boolean()
+});
+
+export const StorePackPolicySchema = StorePackPolicyFieldsSchema.extend({
+  id: z.string(),
+  productId: z.string(),
+  packId: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const BarcodeFieldsSchema = z.object({
+  namespace: z.string(),
+  value: z.string(),
+  symbology: z.string().nullable().optional(),
+  scope: z.enum(["global", "store"]),
+  storeId: z.string().nullable().optional()
+});
+
+export const BarcodeLookupSchema = z.object({
+  namespace: z.string(),
+  value: z.string(),
+  scope: z.enum(["global", "store"]),
+  storeId: z.string().nullable().optional()
+});
+
+export const BarcodeSchema = z.object({
+  id: z.string(),
+  packId: z.string(),
+  namespace: z.string(),
+  normalizedValue: z.string(),
+  symbology: z.string().nullable(),
+  scope: z.enum(["global", "store"]),
+  storeId: z.string().nullable(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const ProductSchema = ProductFieldsSchema.extend({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const ProductDetailSchema = ProductSchema.extend({
+  companyRoles: z.array(ProductCompanyRoleSchema),
+  packs: z.array(ProductPackSchema)
+});
+
+export const AggregatePackSchema = ProductPackFieldsSchema.extend({
+  clientKey: z.string(),
+  containedPackClientKey: z.string().nullable().optional(),
+  policy: StorePackPolicyFieldsSchema.nullable().optional(),
+  barcodes: z.array(BarcodeFieldsSchema).default([])
+});
+
+export const CreateProductRequestSchema = z.object({
+  product: ProductFieldsSchema,
+  companyRoles: z.array(ProductCompanyRoleFieldsSchema).default([]),
+  packs: z.array(AggregatePackSchema).default([]),
+  reason: z.string().nullable().optional()
+});
+
+export const UpdateProductRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  product: ProductFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const UpdateProductPackRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  pack: ProductPackFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const UpdateProductCompanyRoleRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  role: ProductCompanyRoleFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const UpdateStorePackPolicyRequestSchema = z.object({
+  expectedRevision: z.number().int().positive().nullable().optional(),
+  policy: StorePackPolicyFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const ProductLifecycleRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  reason: z.string()
+});
+
+export const DuplicateCandidateSchema = z.object({
+  candidateId: z.string(),
+  score: z.number().int().nonnegative(),
+  reasonCodes: z.array(z.string()),
+  explanation: z.string()
+});
+
+export const CatalogErrorResponseSchema = z.object({
+  code: z.enum([
+    "validation_failed",
+    "duplicate_conflict",
+    "revision_conflict",
+    "not_found",
+    "archived_conflict",
+    "conversion_conflict",
+    "barcode_conflict",
+    "default_pack_conflict",
+    "internal_error"
+  ]),
+  message: z.string(),
+  issues: z.array(z.object({ field: z.string(), message: z.string() })),
+  expectedRevision: z.number().int().nullable(),
+  currentRevision: z.number().int().nullable()
+});
+
+export type ProductFields = z.infer<typeof ProductFieldsSchema>;
+export type Product = z.infer<typeof ProductSchema>;
+export type ProductDetail = z.infer<typeof ProductDetailSchema>;
+export type ProductCompanyRole = z.infer<typeof ProductCompanyRoleSchema>;
+export type ProductPack = z.infer<typeof ProductPackSchema>;
+export type StorePackPolicy = z.infer<typeof StorePackPolicySchema>;
+export type Barcode = z.infer<typeof BarcodeSchema>;
+export type DuplicateCandidate = z.infer<typeof DuplicateCandidateSchema>;
+export type CreateProductRequest = z.infer<typeof CreateProductRequestSchema>;
+export type CatalogErrorResponse = z.infer<typeof CatalogErrorResponseSchema>;
