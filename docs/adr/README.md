@@ -15,3 +15,4 @@ retained and linked from its replacement rather than silently rewritten.
 | 008 | Identifier and future sync readiness |
 | 009 | Money, quantity, and time representation |
 | 010 | Security and privacy baseline |
+| 011 | Local authentication and opaque cookie sessions |

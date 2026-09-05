@@ -373,3 +373,68 @@ export type Barcode = z.infer<typeof BarcodeSchema>;
 export type DuplicateCandidate = z.infer<typeof DuplicateCandidateSchema>;
 export type CreateProductRequest = z.infer<typeof CreateProductRequestSchema>;
 export type CatalogErrorResponse = z.infer<typeof CatalogErrorResponseSchema>;
+
+export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
+
+export const SafeUserSchema = z.object({
+  id: z.string(),
+  loginIdentifier: z.string(),
+  displayName: z.string(),
+  role: UserRoleSchema,
+  revision: z.number().int().positive()
+});
+
+export const AuthStatusResponseSchema = z.object({
+  setupRequired: z.boolean(),
+  authenticated: z.boolean(),
+  user: SafeUserSchema.nullable(),
+  storeDisplayName: z.string().nullable()
+});
+
+export const SessionResponseSchema = z.object({
+  user: SafeUserSchema,
+  storeDisplayName: z.string(),
+  expiresAtUtc: z.string()
+});
+
+export const SetupRequestSchema = z.object({
+  storeDisplayName: z.string(),
+  ownerDisplayName: z.string(),
+  loginIdentifier: z.string(),
+  password: z.string()
+});
+
+export const LoginRequestSchema = z.object({
+  loginIdentifier: z.string(),
+  password: z.string()
+});
+
+export const DashboardSummarySchema = z.object({
+  storeDisplayName: z.string(),
+  activeProductCount: z.number().int().nonnegative(),
+  activePackCount: z.number().int().nonnegative()
+});
+
+export const AuthErrorResponseSchema = z.object({
+  code: z.enum([
+    "validation_failed",
+    "setup_unavailable",
+    "invalid_credentials",
+    "rate_limited",
+    "authentication_required",
+    "session_expired",
+    "internal_error"
+  ]),
+  message: z.string(),
+  issues: z.array(z.object({ field: z.string(), message: z.string() })),
+  retryAfterSeconds: z.number().int().positive().nullable()
+});
+
+export type UserRole = z.infer<typeof UserRoleSchema>;
+export type SafeUser = z.infer<typeof SafeUserSchema>;
+export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;
+export type SessionResponse = z.infer<typeof SessionResponseSchema>;
+export type SetupRequest = z.infer<typeof SetupRequestSchema>;
+export type LoginRequest = z.infer<typeof LoginRequestSchema>;
+export type DashboardSummary = z.infer<typeof DashboardSummarySchema>;
+export type AuthErrorResponse = z.infer<typeof AuthErrorResponseSchema>;

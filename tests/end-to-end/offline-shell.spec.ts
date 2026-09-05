@@ -5,7 +5,7 @@ test("cached application shell reloads offline and reports the local service off
   page
 }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "AUSHADHARTH" })).toBeVisible();
+  await expect(page.getByText("AUSHADHARTH").first()).toBeVisible();
 
   await page.evaluate(async () => {
     if (!("serviceWorker" in navigator)) throw new Error("Service workers are unavailable");
@@ -21,8 +21,8 @@ test("cached application shell reloads offline and reports the local service off
   await context.setOffline(true);
   try {
     await page.reload({ waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "AUSHADHARTH" })).toBeVisible();
-    await expect(page.getByRole("status")).toHaveText("Local Service Offline");
+    await expect(page.getByText("AUSHADHARTH").first()).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Local Store Service Unavailable" })).toBeVisible();
   } finally {
     await context.setOffline(false);
   }
