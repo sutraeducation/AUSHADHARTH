@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::reference_masters::ReferenceState;
@@ -21,15 +22,18 @@ const SESSION_HOURS: i64 = 12;
 const ATTEMPT_WINDOW_MINUTES: i64 = 5;
 const ATTEMPT_RETENTION_HOURS: i64 = 24;
 const FAILURE_THRESHOLD: i64 = 5;
+static AUTH_WRITE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug)]
-enum AuthError {
+pub(crate) enum AuthError {
     Validation(&'static str, &'static str),
     SetupUnavailable,
     InvalidCredentials,
     RateLimited(i64),
     AuthenticationRequired,
     SessionExpired,
+    AuthorizationDenied,
+    ServiceBusy,
     Internal,
 }
 
@@ -92,6 +96,20 @@ impl IntoResponse for AuthError {
                 "Your session has expired. Sign in again.",
                 Vec::new(),
                 None,
+            ),
+            Self::AuthorizationDenied => (
+                StatusCode::FORBIDDEN,
+                "authorization_denied",
+                "Your role does not permit this operation.",
+                Vec::new(),
+                None,
+            ),
+            Self::ServiceBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_busy",
+                "The local service is busy. Try again shortly.",
+                Vec::new(),
+                Some(1),
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -176,6 +194,12 @@ struct SessionRecord {
     revision: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedActor {
+    pub id: String,
+    pub role: String,
+}
+
 pub fn routes() -> Router<ReferenceState> {
     Router::new()
         .route("/api/v1/auth/status", get(auth_status))
@@ -215,8 +239,9 @@ async fn setup(
     let owner_display_name = required_text(&request.owner_display_name, "ownerDisplayName", 120)?;
     let (login_identifier, normalized_login) = normalize_login(&request.login_identifier)?;
     validate_password(&request.password)?;
-    let password_hash = hash_password(&request.password)?;
+    let password_hash = hash_password_blocking(request.password).await?;
 
+    let _write_guard = AUTH_WRITE_LOCK.lock().await;
     let mut connection = state
         .pool
         .acquire()
@@ -225,13 +250,13 @@ async fn setup(
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *connection)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
 
     let result: Result<(SessionResponse, String), AuthError> = async {
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&mut *connection)
             .await
-            .map_err(|_| AuthError::Internal)?;
+            .map_err(map_database_error)?;
         if user_count != 0 {
             return Err(AuthError::SetupUnavailable);
         }
@@ -242,7 +267,7 @@ async fn setup(
         )
         .fetch_optional(&mut *connection)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
         let final_store_name = if let Some((_, name)) = existing_store {
             name
         } else {
@@ -255,7 +280,7 @@ async fn setup(
             .bind(&now)
             .execute(&mut *connection)
             .await
-            .map_err(|_| AuthError::Internal)?;
+            .map_err(map_database_error)?;
             store_display_name.clone()
         };
 
@@ -279,7 +304,7 @@ async fn setup(
         .bind(&now)
         .execute(&mut *connection)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
         let (token, expires_at_utc) = create_session_on(&mut connection, &user.id, &now).await?;
         Ok((
             SessionResponse { user, store_display_name: final_store_name, expires_at_utc },
@@ -293,7 +318,7 @@ async fn setup(
             sqlx::query("COMMIT")
                 .execute(&mut *connection)
                 .await
-                .map_err(|_| AuthError::Internal)?;
+                .map_err(map_database_error)?;
             Ok(with_session_cookie(
                 StatusCode::CREATED,
                 body,
@@ -329,12 +354,12 @@ async fn login(
     .bind(&normalized_login)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| AuthError::Internal)?;
+    .map_err(map_database_error)?;
 
     let verified = if let Some((_, password_hash, _)) = &row {
-        verify_password(&request.password, password_hash)
+        verify_password_blocking(request.password, password_hash.clone()).await?
     } else {
-        verify_against_dummy(&request.password)?;
+        verify_against_dummy_blocking(request.password).await?;
         false
     };
     let Some((user_id, _, status)) = row else {
@@ -346,13 +371,14 @@ async fn login(
         return Err(AuthError::InvalidCredentials);
     }
 
-    let mut transaction = state.pool.begin().await.map_err(|_| AuthError::Internal)?;
+    let _write_guard = AUTH_WRITE_LOCK.lock().await;
+    let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
     let now = now_text()?;
     sqlx::query("DELETE FROM login_attempts WHERE identifier_hash=?")
         .bind(&identifier_hash)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
     sqlx::query(
         "UPDATE users SET last_login_at_utc=?,updated_at_utc=? WHERE id=? AND status='active'",
     )
@@ -361,13 +387,10 @@ async fn login(
     .bind(&user_id)
     .execute(&mut *transaction)
     .await
-    .map_err(|_| AuthError::Internal)?;
+    .map_err(map_database_error)?;
     let (token, expires_at_utc) =
         create_session_in_transaction(&mut transaction, &user_id, &now).await?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| AuthError::Internal)?;
+    transaction.commit().await.map_err(map_database_error)?;
 
     let user = fetch_safe_user(&state.pool, &user_id).await?;
     let store_display_name = store_name(&state.pool)
@@ -391,13 +414,14 @@ async fn logout(
 ) -> Result<Response, AuthError> {
     validate_mutation_request(&headers)?;
     if let Some(token) = cookie_token(&headers) {
+        let _write_guard = AUTH_WRITE_LOCK.lock().await;
         sqlx::query(
             "UPDATE user_sessions SET revoked_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE token_hash=? AND revoked_at_utc IS NULL",
         )
         .bind(sha256_hex(token.as_bytes()))
         .execute(&state.pool)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
     }
     let cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response())
@@ -456,7 +480,7 @@ async fn create_session_on(
         .map_err(|_| AuthError::Internal)?;
     sqlx::query("INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,last_seen_at_utc) VALUES (?,?,?,?,?,?)")
         .bind(Uuid::now_v7().to_string()).bind(user_id).bind(token_hash).bind(now).bind(&expires).bind(now)
-        .execute(&mut **connection).await.map_err(|_| AuthError::Internal)?;
+        .execute(&mut **connection).await.map_err(map_database_error)?;
     Ok((token, expires))
 }
 
@@ -471,7 +495,7 @@ async fn create_session_in_transaction(
         .map_err(|_| AuthError::Internal)?;
     sqlx::query("INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,last_seen_at_utc) VALUES (?,?,?,?,?,?)")
         .bind(Uuid::now_v7().to_string()).bind(user_id).bind(token_hash).bind(now).bind(&expires).bind(now)
-        .execute(&mut **transaction).await.map_err(|_| AuthError::Internal)?;
+        .execute(&mut **transaction).await.map_err(map_database_error)?;
     Ok((token, expires))
 }
 
@@ -500,9 +524,22 @@ async fn required_session(
     if is_expired(&record.expires_at_utc) {
         return Err(AuthError::SessionExpired);
     }
+    let _write_guard = AUTH_WRITE_LOCK.lock().await;
     sqlx::query("UPDATE user_sessions SET last_seen_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE token_hash=?")
-        .bind(sha256_hex(token.as_bytes())).execute(pool).await.map_err(|_| AuthError::Internal)?;
+        .bind(sha256_hex(token.as_bytes())).execute(pool).await.map_err(map_database_error)?;
     Ok(record)
+}
+
+pub(crate) async fn require_authenticated_actor(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActor, AuthError> {
+    validate_host(headers)?;
+    let record = required_session(pool, headers).await?;
+    Ok(AuthenticatedActor {
+        id: record.user_id,
+        role: record.role,
+    })
 }
 
 async fn fetch_session(pool: &SqlitePool, token: &str) -> Result<Option<SessionRecord>, AuthError> {
@@ -599,6 +636,10 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
         .map_err(|_| AuthError::Internal)
 }
 
+async fn hash_password_blocking(password: String) -> Result<String, AuthError> {
+    run_password_work(move || hash_password(&password)).await?
+}
+
 fn verify_password(password: &str, encoded: &str) -> bool {
     PasswordHash::new(encoded).ok().is_some_and(|hash| {
         Argon2::default()
@@ -607,10 +648,50 @@ fn verify_password(password: &str, encoded: &str) -> bool {
     })
 }
 
+async fn verify_password_blocking(password: String, encoded: String) -> Result<bool, AuthError> {
+    run_password_work(move || verify_password(&password, &encoded)).await
+}
+
 fn verify_against_dummy(password: &str) -> Result<(), AuthError> {
     let dummy = hash_password("Dummy-password-1!")?;
     let _ = verify_password(password, &dummy);
     Ok(())
+}
+
+async fn verify_against_dummy_blocking(password: String) -> Result<(), AuthError> {
+    run_password_work(move || verify_against_dummy(&password)).await?
+}
+
+async fn run_password_work<T, F>(work: F) -> Result<T, AuthError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| AuthError::Internal)
+}
+
+fn map_database_error(error: sqlx::Error) -> AuthError {
+    let is_contention = match &error {
+        sqlx::Error::Database(database) => {
+            matches!(
+                database.code().as_deref(),
+                Some("5" | "6" | "261" | "262" | "517")
+            ) || {
+                let message = database.message().to_ascii_lowercase();
+                message.contains("database is locked")
+                    || message.contains("database table is locked")
+                    || message.contains("database is busy")
+            }
+        }
+        _ => false,
+    };
+    if is_contention {
+        AuthError::ServiceBusy
+    } else {
+        AuthError::Internal
+    }
 }
 
 fn new_session_token() -> (String, String) {
@@ -621,7 +702,7 @@ fn new_session_token() -> (String, String) {
     (token, hash)
 }
 
-fn sha256_hex(value: &[u8]) -> String {
+pub(crate) fn sha256_hex(value: &[u8]) -> String {
     Sha256::digest(value)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -654,7 +735,7 @@ fn with_session_cookie<T: Serialize>(
     (status, [(header::SET_COOKIE, cookie)], Json(body)).into_response()
 }
 
-fn validate_mutation_request(headers: &HeaderMap) -> Result<(), AuthError> {
+pub(crate) fn validate_mutation_request(headers: &HeaderMap) -> Result<(), AuthError> {
     validate_host(headers)?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -747,20 +828,22 @@ async fn cleanup_stale_attempts(pool: &SqlitePool) -> Result<(), AuthError> {
     let cutoff = (OffsetDateTime::now_utc() - Duration::hours(ATTEMPT_RETENTION_HOURS))
         .format(&Rfc3339)
         .map_err(|_| AuthError::Internal)?;
+    let _write_guard = AUTH_WRITE_LOCK.lock().await;
     sqlx::query("DELETE FROM login_attempts WHERE last_failed_at_utc < ?")
         .bind(cutoff)
         .execute(pool)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
     Ok(())
 }
 
 async fn record_failure(pool: &SqlitePool, identifier_hash: &str) -> Result<(), AuthError> {
+    let _write_guard = AUTH_WRITE_LOCK.lock().await;
     let mut connection = pool.acquire().await.map_err(|_| AuthError::Internal)?;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *connection)
         .await
-        .map_err(|_| AuthError::Internal)?;
+        .map_err(map_database_error)?;
 
     let result = record_failure_on(&mut connection, identifier_hash).await;
     match result {
@@ -768,7 +851,7 @@ async fn record_failure(pool: &SqlitePool, identifier_hash: &str) -> Result<(), 
             sqlx::query("COMMIT")
                 .execute(&mut *connection)
                 .await
-                .map_err(|_| AuthError::Internal)?;
+                .map_err(map_database_error)?;
             Ok(())
         }
         Err(error) => {
@@ -789,7 +872,7 @@ async fn record_failure_on(
     .bind(identifier_hash)
     .fetch_optional(&mut **connection)
     .await
-    .map_err(|_| AuthError::Internal)?;
+    .map_err(map_database_error)?;
     let (count, window_start) = match existing.and_then(|(count, start)| {
         OffsetDateTime::parse(&start, &Rfc3339)
             .ok()
@@ -818,7 +901,7 @@ async fn record_failure_on(
         "INSERT INTO login_attempts (identifier_hash,failure_count,window_started_at_utc,last_failed_at_utc,cooldown_until_utc) VALUES (?,?,?,?,?) \
          ON CONFLICT(identifier_hash) DO UPDATE SET failure_count=excluded.failure_count,window_started_at_utc=excluded.window_started_at_utc,last_failed_at_utc=excluded.last_failed_at_utc,cooldown_until_utc=excluded.cooldown_until_utc",
     ).bind(identifier_hash).bind(count).bind(window_text).bind(now_text).bind(cooldown)
-      .execute(&mut **connection).await.map_err(|_| AuthError::Internal)?;
+      .execute(&mut **connection).await.map_err(map_database_error)?;
     Ok(())
 }
 
@@ -842,6 +925,14 @@ fn is_expired(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration as StdDuration, Instant},
+    };
+
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
@@ -1624,5 +1715,199 @@ mod tests {
                 .ip()
                 .is_loopback()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_work_boundary_does_not_block_the_async_executor() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let observed_heartbeat = Arc::new(AtomicBool::new(false));
+        let worker = tokio::spawn(run_password_work({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+        }));
+        let watchdog = std::thread::spawn({
+            let entered = Arc::clone(&entered);
+            let heartbeat = Arc::clone(&heartbeat);
+            let release = Arc::clone(&release);
+            let observed_heartbeat = Arc::clone(&observed_heartbeat);
+            move || {
+                while !entered.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                let deadline = Instant::now() + StdDuration::from_secs(1);
+                while !heartbeat.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                observed_heartbeat.store(heartbeat.load(Ordering::SeqCst), Ordering::SeqCst);
+                release.store(true, Ordering::SeqCst);
+            }
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        heartbeat.store(true, Ordering::SeqCst);
+        worker.await.unwrap().unwrap();
+        watchdog.join().unwrap();
+        assert!(observed_heartbeat.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn blocking_password_helpers_preserve_hash_known_and_dummy_semantics() {
+        let hash = hash_password_blocking("Strong-Password-42".to_owned())
+            .await
+            .unwrap();
+        assert!(
+            verify_password_blocking("Strong-Password-42".to_owned(), hash.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_password_blocking("Wrong-Password-42".to_owned(), hash)
+                .await
+                .unwrap()
+        );
+        verify_against_dummy_blocking("Unknown-Password-42".to_owned())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_contention_is_bounded_and_never_reported_as_internal_error() {
+        let (_temp, pool) = test_pool().await;
+        request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/setup",
+            setup_body(),
+            None,
+        )
+        .await;
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            StdDuration::from_secs(8),
+            request(
+                pool.clone(),
+                "POST",
+                "/api/v1/auth/login",
+                json!({"loginIdentifier":"owner.admin","password":"Wrong-Password-42"}),
+                None,
+            ),
+        )
+        .await
+        .expect("authentication contention must remain bounded");
+        sqlx::query("ROLLBACK")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.2["code"], "service_busy");
+        assert!(started.elapsed() < StdDuration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn mixed_success_and_failure_for_one_identifier_is_serialized_safely() {
+        let (_temp, pool) = test_pool().await;
+        request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/setup",
+            setup_body(),
+            None,
+        )
+        .await;
+        let success = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/login",
+            json!({"loginIdentifier":"owner.admin","password":"Strong-Password-42"}),
+            None,
+        );
+        let failure = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/login",
+            json!({"loginIdentifier":"owner.admin","password":"Wrong-Password-42"}),
+            None,
+        );
+        let (success, failure) = tokio::time::timeout(StdDuration::from_secs(15), async {
+            tokio::join!(success, failure)
+        })
+        .await
+        .expect("mixed authentication must not deadlock");
+        assert_eq!(success.0, StatusCode::OK);
+        assert_eq!(failure.0, StatusCode::UNAUTHORIZED);
+        let attempts: Option<i64> =
+            sqlx::query_scalar("SELECT failure_count FROM login_attempts WHERE identifier_hash=?")
+                .bind(sha256_hex(b"owner.admin"))
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(matches!(attempts, None | Some(1)));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 2);
+    }
+
+    #[tokio::test]
+    async fn different_identifiers_progress_concurrently_without_state_leakage() {
+        let (_temp, pool) = test_pool().await;
+        request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/setup",
+            setup_body(),
+            None,
+        )
+        .await;
+        let owner = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/login",
+            json!({"loginIdentifier":"owner.admin","password":"Strong-Password-42"}),
+            None,
+        );
+        let unknown = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/login",
+            json!({"loginIdentifier":"unknown.user","password":"Wrong-Password-42"}),
+            None,
+        );
+        let (owner, unknown) = tokio::time::timeout(StdDuration::from_secs(15), async {
+            tokio::join!(owner, unknown)
+        })
+        .await
+        .expect("independent authentication must not deadlock");
+        assert_eq!(owner.0, StatusCode::OK);
+        assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+        let unknown_count: i64 =
+            sqlx::query_scalar("SELECT failure_count FROM login_attempts WHERE identifier_hash=?")
+                .bind(sha256_hex(b"unknown.user"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unknown_count, 1);
+        let owner_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM login_attempts WHERE identifier_hash=?")
+                .bind(sha256_hex(b"owner.admin"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(owner_count, 0);
     }
 }

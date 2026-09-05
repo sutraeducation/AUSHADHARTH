@@ -118,17 +118,27 @@ export const ReferenceAttributesSchema = z.union([
   RegulatoryCategoryAttributesSchema
 ]);
 
-export const ReferenceMasterResponseSchema = z.object({
+const ReferenceMasterBaseSchema = z.object({
   id: z.string(),
-  kind: ReferenceKindSchema,
   revision: z.number().int(),
   status: MasterStatusSchema,
-  attributes: ReferenceAttributesSchema,
   createdAtUtc: z.string(),
   updatedAtUtc: z.string(),
   archivedAtUtc: z.string().nullable(),
   archiveReason: z.string().nullable()
 });
+
+export const ReferenceMasterResponseSchema = z.discriminatedUnion("kind", [
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("units"), attributes: UnitAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("dosage-forms"), attributes: DosageFormAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("companies"), attributes: CompanyAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("company-identifiers"), attributes: CompanyIdentifierAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("brands"), attributes: BrandAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("hsn-codes"), attributes: HsnAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-categories"), attributes: TaxCategoryAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-rate-versions"), attributes: TaxRateVersionAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("regulatory-categories"), attributes: RegulatoryCategoryAttributesSchema })
+]);
 
 export const CreateReferenceRequestSchema = z.object({
   attributes: ReferenceAttributesSchema,
@@ -154,7 +164,11 @@ export const ReferenceErrorResponseSchema = z.object({
     "not_found",
     "archived_conflict",
     "effective_date_overlap",
-    "internal_error"
+    "internal_error",
+    "authentication_required",
+    "session_expired",
+    "authorization_denied",
+    "service_busy"
   ]),
   message: z.string(),
   issues: z.array(z.object({ field: z.string(), message: z.string() })),
@@ -423,6 +437,8 @@ export const AuthErrorResponseSchema = z.object({
     "rate_limited",
     "authentication_required",
     "session_expired",
+    "authorization_denied",
+    "service_busy",
     "internal_error"
   ]),
   message: z.string(),

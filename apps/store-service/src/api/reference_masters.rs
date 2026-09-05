@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, str::FromStr};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -12,7 +12,10 @@ use serde_json::{Map, Value, json};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use crate::domain::references::{DbValue, MasterKind, ValidationIssue, validate_attributes};
+use crate::{
+    api::auth::{self, AuthError, AuthenticatedActor},
+    domain::references::{DbValue, MasterKind, ValidationIssue, validate_attributes},
+};
 
 #[derive(Clone)]
 pub struct ReferenceState {
@@ -24,6 +27,7 @@ pub struct ReferenceState {
 pub struct ListQuery {
     search: Option<String>,
     status: Option<String>,
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +79,8 @@ struct StoredRow {
 }
 
 #[derive(Debug)]
-pub enum ReferenceError {
+pub(crate) enum ReferenceError {
+    Auth(AuthError),
     Validation(Vec<ValidationIssue>),
     Duplicate,
     RevisionConflict { expected: i64, current: i64 },
@@ -104,6 +109,7 @@ struct ErrorIssue {
 impl IntoResponse for ReferenceError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
+            Self::Auth(error) => return error.into_response(),
             Self::Validation(issues) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ErrorBody {
@@ -164,6 +170,12 @@ impl IntoResponse for ReferenceError {
     }
 }
 
+impl From<AuthError> for ReferenceError {
+    fn from(value: AuthError) -> Self {
+        Self::Auth(value)
+    }
+}
+
 fn simple_error(code: &'static str, message: &'static str) -> ErrorBody {
     ErrorBody {
         code,
@@ -184,9 +196,11 @@ pub fn routes() -> Router<ReferenceState> {
 
 async fn list(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(kind): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<MasterResponse>>, ReferenceError> {
+    auth::require_authenticated_actor(&state.pool, &headers).await?;
     let kind = parse_kind(&kind)?;
     let status = query.status.unwrap_or_else(|| "active".to_owned());
     if !matches!(status.as_str(), "active" | "archived" | "all") {
@@ -197,19 +211,38 @@ async fn list(
         .search
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
+    if let Some(parent_id) = query.parent_id.as_deref() {
+        validate_id(parent_id)?;
+    }
+    let parent_column = match kind {
+        MasterKind::CompanyIdentifier => Some("company_id"),
+        MasterKind::TaxRateVersion => Some("tax_category_id"),
+        _ => None,
+    };
+    if query.parent_id.is_some() && parent_column.is_none() {
+        return Err(validation(
+            "parentId",
+            "is supported only for company identifiers and tax rate versions",
+        ));
+    }
+    let parent_expression = parent_column.unwrap_or("id");
     let sql = format!(
         "SELECT id, revision, status, {} AS attributes_json, created_at_utc, updated_at_utc, archived_at_utc, archive_reason \
          FROM {} WHERE (? IS NULL OR status = ?) AND (? IS NULL OR lower({}) LIKE '%' || ? || '%') \
+         AND (? IS NULL OR {} = ?) \
          ORDER BY updated_at_utc DESC, id LIMIT 500",
         kind.json_expression(),
         kind.table(),
-        kind.search_expression()
+        kind.search_expression(),
+        parent_expression
     );
     let rows = sqlx::query_as::<_, StoredRow>(&sql)
         .bind(&status_filter)
         .bind(&status_filter)
         .bind(&search)
         .bind(&search)
+        .bind(&query.parent_id)
+        .bind(&query.parent_id)
         .fetch_all(&state.pool)
         .await
         .map_err(|_| ReferenceError::Internal)?;
@@ -221,8 +254,10 @@ async fn list(
 
 async fn get_one(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path((kind, id)): Path<(String, String)>,
 ) -> Result<Json<MasterResponse>, ReferenceError> {
+    auth::require_authenticated_actor(&state.pool, &headers).await?;
     let kind = parse_kind(&kind)?;
     validate_id(&id)?;
     fetch_one(&state.pool, kind, &id).await.map(Json)
@@ -230,9 +265,11 @@ async fn get_one(
 
 async fn create(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(kind): Path<String>,
     Json(request): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<MasterResponse>), ReferenceError> {
+    let actor = require_reference_admin(&state, &headers).await?;
     let kind = parse_kind(&kind)?;
     let fields =
         validate_attributes(kind, &request.attributes).map_err(ReferenceError::Validation)?;
@@ -250,8 +287,11 @@ async fn create(
         &id,
         1,
         "created",
-        request.reason.as_deref(),
         &fields,
+        EventContext {
+            reason: request.reason.as_deref(),
+            actor_id: &actor.id,
+        },
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -261,9 +301,11 @@ async fn create(
 
 async fn update(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path((kind, id)): Path<(String, String)>,
     Json(request): Json<UpdateRequest>,
 ) -> Result<Json<MasterResponse>, ReferenceError> {
+    let actor = require_reference_admin(&state, &headers).await?;
     let kind = parse_kind(&kind)?;
     validate_id(&id)?;
     if kind == MasterKind::TaxRateVersion {
@@ -293,8 +335,11 @@ async fn update(
         &id,
         next_revision,
         "updated",
-        request.reason.as_deref(),
         &fields,
+        EventContext {
+            reason: request.reason.as_deref(),
+            actor_id: &actor.id,
+        },
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -303,20 +348,24 @@ async fn update(
 
 async fn archive(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path((kind, id)): Path<(String, String)>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<MasterResponse>, ReferenceError> {
-    lifecycle_change(state, &kind, &id, request, false)
+    let actor = require_reference_admin(&state, &headers).await?;
+    lifecycle_change(state, &kind, &id, request, false, &actor.id)
         .await
         .map(Json)
 }
 
 async fn restore(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path((kind, id)): Path<(String, String)>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<MasterResponse>, ReferenceError> {
-    lifecycle_change(state, &kind, &id, request, true)
+    let actor = require_reference_admin(&state, &headers).await?;
+    lifecycle_change(state, &kind, &id, request, true, &actor.id)
         .await
         .map(Json)
 }
@@ -327,6 +376,7 @@ async fn lifecycle_change(
     id: &str,
     request: LifecycleRequest,
     restoring: bool,
+    actor_id: &str,
 ) -> Result<MasterResponse, ReferenceError> {
     let kind = parse_kind(kind_path)?;
     validate_id(id)?;
@@ -388,12 +438,27 @@ async fn lifecycle_change(
         id,
         next_revision,
         if restoring { "restored" } else { "archived" },
-        Some(reason),
         &payload,
+        EventContext {
+            reason: Some(reason),
+            actor_id,
+        },
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
     fetch_one(&state.pool, kind, id).await
+}
+
+async fn require_reference_admin(
+    state: &ReferenceState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActor, ReferenceError> {
+    auth::validate_mutation_request(headers)?;
+    let actor = auth::require_authenticated_actor(&state.pool, headers).await?;
+    if actor.role != "owner_admin" {
+        return Err(AuthError::AuthorizationDenied.into());
+    }
+    Ok(actor)
 }
 
 fn parse_kind(value: &str) -> Result<MasterKind, ReferenceError> {
@@ -523,23 +588,28 @@ fn bind<'q>(
     }
 }
 
+struct EventContext<'a> {
+    reason: Option<&'a str>,
+    actor_id: &'a str,
+}
+
 async fn insert_event(
     transaction: &mut Transaction<'_, Sqlite>,
     kind: MasterKind,
     entity_id: &str,
     revision: i64,
     action: &str,
-    reason: Option<&str>,
     fields: &BTreeMap<&'static str, DbValue>,
+    context: EventContext<'_>,
 ) -> Result<(), ReferenceError> {
     let payload = normalized_payload(fields).to_string();
     sqlx::query(
         "INSERT INTO master_change_events \
-         (event_id,entity_type,entity_id,entity_revision,action,occurred_at_utc,reason,payload_schema_version,change_payload) \
-         VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,?,?)",
+         (event_id,entity_type,entity_id,entity_revision,action,occurred_at_utc,reason,payload_schema_version,change_payload,actor_id) \
+         VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,?,?,?)",
     )
     .bind(Uuid::now_v7().to_string()).bind(kind.entity_type()).bind(entity_id).bind(revision)
-    .bind(action).bind(reason).bind(1_i64).bind(payload)
+    .bind(action).bind(context.reason).bind(1_i64).bind(payload).bind(context.actor_id)
     .execute(&mut **transaction).await.map_err(map_database_error)?;
     Ok(())
 }
@@ -621,13 +691,48 @@ mod tests {
 
     use super::*;
 
+    const OWNER_TOKEN: &str = "reference-owner-session-token";
+
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let temp = tempfile::tempdir().unwrap();
         let pool =
             crate::infrastructure::database::connect(&temp.path().join("references.sqlite3"))
                 .await
                 .unwrap();
+        insert_session(&pool, "owner_admin", OWNER_TOKEN).await;
         (temp, pool)
+    }
+
+    async fn insert_session(pool: &SqlitePool, role: &str, token: &str) -> String {
+        let user_id = Uuid::now_v7().to_string();
+        let login = format!("{role}-{}", &user_id[0..8]);
+        sqlx::query(
+            "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,password_hash,role,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',?,?,?)",
+        )
+        .bind(&user_id)
+        .bind(&login)
+        .bind(&login)
+        .bind(format!("{role} test user"))
+        .bind(role)
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,last_seen_at_utc) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&user_id)
+        .bind(crate::api::auth::sha256_hex(token.as_bytes()))
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2099-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
     }
 
     async fn request_json(
@@ -641,6 +746,8 @@ mod tests {
                 Request::builder()
                     .method(method)
                     .uri(uri)
+                    .header("host", "127.0.0.1:47831")
+                    .header("cookie", format!("aushadharth_session={OWNER_TOKEN}"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -667,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_revisions_conflicts_and_audit_events_work_offline() {
         let (_temp, pool) = test_pool().await;
-        let create_body = json!({"attributes":{
+        let create_body = json!({"actorId":"browser-supplied-actor","attributes":{
             "canonicalCode":"dose_unit", "displayName":"Dose", "dimension":"count",
             "isDiscrete":true, "allowedScale":0
         }});
@@ -734,6 +841,10 @@ mod tests {
             "SELECT COUNT(*) FROM master_change_events WHERE entity_type='unit_of_measure' AND entity_id=?",
         ).bind(id).fetch_one(&pool).await.unwrap();
         assert_eq!(event_count, 4);
+        let actor_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM master_change_events WHERE entity_type='unit_of_measure' AND entity_id=? AND actor_id=(SELECT id FROM users WHERE role='owner_admin')",
+        ).bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(actor_count, 4);
     }
 
     #[tokio::test]
@@ -813,5 +924,138 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(invalid["code"], "validation_failed");
+    }
+
+    #[tokio::test]
+    async fn reference_access_requires_session_and_owner_for_mutations() {
+        let (_temp, pool) = test_pool().await;
+        let router = || crate::api::router(pool.clone(), None);
+        let unauthenticated = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/reference/units")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let hostile_host = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/reference/units")
+                    .header("host", "attacker.example")
+                    .header("cookie", format!("aushadharth_session={OWNER_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        for (role, token) in [
+            ("cashier", "cashier-reference-token"),
+            ("pharmacist", "pharmacist-reference-token"),
+        ] {
+            insert_session(&pool, role, token).await;
+            let read = router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/reference/units")
+                        .header("cookie", format!("aushadharth_session={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(read.status(), StatusCode::OK);
+
+            let mutation = router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/reference/dosage-forms")
+                        .header("host", "127.0.0.1:47831")
+                        .header("content-type", "application/json")
+                        .header("cookie", format!("aushadharth_session={token}"))
+                        .body(Body::from(
+                            json!({"attributes":{
+                                "canonicalCode":format!("{role}-form"),
+                                "displayName":format!("{role} form")
+                            }})
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(mutation.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_duplicate_overlap_and_parent_filter_semantics_are_preserved() {
+        let (_temp, pool) = test_pool().await;
+        let (status, duplicate) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/reference/units",
+            json!({"attributes":{
+                "canonicalCode":"tablet", "displayName":"Duplicate tablet",
+                "dimension":"count", "isDiscrete":true, "allowedScale":0
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(duplicate["code"], "duplicate_conflict");
+
+        let (status, category) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/reference/tax-categories",
+            json!({"attributes":{
+                "jurisdiction":"IN", "categoryCode":"test-gst", "displayName":"Test GST",
+                "taxTreatment":"taxable"
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let category_id = category["id"].as_str().unwrap();
+        let rate = |from: &str, to: Option<&str>| {
+            json!({"attributes":{
+                "taxCategoryId":category_id, "effectiveFrom":from, "effectiveTo":to,
+                "cgstBasisPoints":250, "sgstBasisPoints":250,
+                "igstBasisPoints":500, "cessBasisPoints":0
+            }})
+        };
+        let (status, _) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/reference/tax-rate-versions",
+            rate("2026-01-01", Some("2027-01-01")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, overlap) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/reference/tax-rate-versions",
+            rate("2026-06-01", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(overlap["code"], "effective_date_overlap");
+
+        let (status, rates) = request_json(
+            pool,
+            "GET",
+            &format!("/api/v1/reference/tax-rate-versions?status=all&parentId={category_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rates.as_array().unwrap().len(), 1);
+        assert_eq!(rates[0]["attributes"]["taxCategoryId"], category_id);
     }
 }

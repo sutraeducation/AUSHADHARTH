@@ -89,6 +89,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       storeDisplayName: current?.storeDisplayName ?? null
     }));
     queryClient.removeQueries({ queryKey: ["dashboard"] });
+    queryClient.removeQueries({ queryKey: ["reference"] });
   };
 
   const value: AuthContextValue = {

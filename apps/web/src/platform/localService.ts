@@ -5,7 +5,10 @@ export class LocalServiceError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
-    public readonly retryAfterSeconds?: number
+    public readonly retryAfterSeconds?: number,
+    public readonly issues: ReadonlyArray<{ field: string; message: string }> = [],
+    public readonly expectedRevision: number | null = null,
+    public readonly currentRevision: number | null = null
   ) {
     super(message);
   }
@@ -44,13 +47,19 @@ export async function localServiceRequest(
     code?: string;
     message?: string;
     retryAfterSeconds?: number;
+    issues?: Array<{ field: string; message: string }>;
+    expectedRevision?: number | null;
+    currentRevision?: number | null;
   } | null;
   if (!response.ok) {
     throw new LocalServiceError(
       response.status,
       body?.code ?? "internal_error",
       safeErrorMessage(body?.code),
-      body?.retryAfterSeconds
+      body?.retryAfterSeconds,
+      body?.issues ?? [],
+      body?.expectedRevision ?? null,
+      body?.currentRevision ?? null
     );
   }
   return body;
@@ -63,6 +72,13 @@ function safeErrorMessage(code?: string): string {
     case "setup_unavailable": return "Setup was already completed. Continue to sign in.";
     case "session_expired": return "Your session expired. Sign in again.";
     case "authentication_required": return "Sign in to continue.";
+    case "authorization_denied": return "Your role does not permit this operation.";
+    case "service_busy": return "The local service is busy. Try again shortly.";
+    case "duplicate_conflict": return "A conflicting active record already exists.";
+    case "revision_conflict": return "This record was changed after you opened it.";
+    case "not_found": return "This record no longer exists.";
+    case "archived_conflict": return "This action conflicts with the record's archive status.";
+    case "effective_date_overlap": return "This effective period overlaps an existing active rate.";
     case "validation_failed": return "Check the highlighted information and try again.";
     default: return "AUSHADHARTH could not complete that request. Try again.";
   }

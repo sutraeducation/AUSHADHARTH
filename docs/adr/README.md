@@ -16,3 +16,4 @@ retained and linked from its replacement rather than silently rewritten.
 | 009 | Money, quantity, and time representation |
 | 010 | Security and privacy baseline |
 | 011 | Local authentication and opaque cookie sessions |
+| 012 | Authenticated reference administration and server-derived audit actors |
