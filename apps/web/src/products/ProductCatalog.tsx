@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 import type {
   Barcode,
+  Batch,
+  BatchFields,
   CompositionComponent,
   CompositionComponentFields,
   CreateProductRequest,
@@ -25,12 +27,14 @@ import { CatalogDialog } from "./CatalogDialog";
 import {
   atomsToQuantity,
   changeBarcodeLifecycle,
+  changeBatchLifecycle,
   changeCompanyRoleLifecycle,
   changeComponentLifecycle,
   changePackPolicyLifecycle,
   changePackLifecycle,
   changeProductLifecycle,
   createBarcode,
+  createBatch,
   createCompanyRole,
   createComponent,
   createPack,
@@ -40,9 +44,13 @@ import {
   getPackPolicy,
   getProduct,
   listBarcodes,
+  listBatches,
   listProducts,
+  paiseToRupees,
+  rupeesToPaise,
   quantityToAtoms,
   savePackPolicy,
+  updateBatch,
   updateCompanyRole,
   updateComponent,
   updatePack,
@@ -243,6 +251,13 @@ export function ProductDetailPage() {
   // Authoritative reload for every revision conflict raised inside this workspace: invalidate the
   // Product query, await the refetch, and hand the caller the latest record to repopulate from.
   const reloadProduct = async () => { await refresh(); return queryClient.getQueryData<ProductDetail>(["product", id]) ?? null; };
+  // Batches live in their own per-Pack query, so a batch conflict reloads that query rather than
+  // the Product; every other lifecycle target comes from the Product itself.
+  const reloadLifecycle = async (state: LifecycleState) => {
+    if (state.kind !== "batch-lifecycle") return (await reloadProduct()) !== null;
+    await queryClient.invalidateQueries({ queryKey: ["pack-batches", state.packId] });
+    return Boolean(queryClient.getQueryData<Batch[]>(["pack-batches", state.packId])?.some((batch) => batch.id === state.batchId));
+  };
   usePageTitle(product.data?.displayName ?? "Product");
   if (!id) return <Navigate to="/app/products" replace />;
   if (product.isPending) return <Loading label="Loading product…" />;
@@ -265,30 +280,32 @@ export function ProductDetailPage() {
     </CatalogSection>}
     <CatalogSection title="Packs & SKUs" description={`Conversions are authoritative in ${unit} units; no stock quantities are stored here.`} action={canMutate && record.status === "active" ? <button className="button button--secondary" type="button" onClick={() => setDialog({ kind: "pack" })}>Add Pack</button> : undefined}>
       <PackTable product={record} units={references.data?.units} referenceState={refState} canMutate={canMutate} managedPackId={managedPackId} onManage={setManagedPackId} onEdit={(pack) => setDialog({ kind: "pack", packId: pack.id })} onLifecycle={(pack) => setDialog({ kind: "pack-lifecycle", packId: pack.id })} />
-      {managedPackId && <PackWorkspace product={record} pack={record.packs.find((pack) => pack.id === managedPackId)!} canMutate={canMutate} onPolicy={() => setDialog({ kind: "policy", packId: managedPackId })} onBarcode={() => setDialog({ kind: "barcode", packId: managedPackId })} onRefresh={refresh} />}
+      {managedPackId && <PackWorkspace product={record} pack={record.packs.find((pack) => pack.id === managedPackId)!} canMutate={canMutate} onPolicy={() => setDialog({ kind: "policy", packId: managedPackId })} onBarcode={() => setDialog({ kind: "barcode", packId: managedPackId })} onBatch={(batch) => setDialog({ kind: "batch", packId: managedPackId, batchId: batch?.id })} onBatchLifecycle={(batch) => setDialog({ kind: "batch-lifecycle", packId: managedPackId, batchId: batch.id })} onRefresh={refresh} />}
     </CatalogSection>
     {dialog?.kind === "role" && <RoleDialog product={record} roleId={dialog.roleId} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
     {dialog?.kind === "pack" && <PackDialog product={record} packId={dialog.packId} units={references.data?.units} referenceState={refState} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
     {dialog?.kind === "component" && <ComponentDialog product={record} componentId={dialog.componentId} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
     {dialog?.kind === "policy" && <PolicyDialog product={record} packId={dialog.packId} onClose={() => setDialog(null)} onSaved={() => { const packId = dialog.packId; setDialog(null); void queryClient.invalidateQueries({ queryKey: ["pack-policy", packId] }); void refresh(); }} />}
     {dialog?.kind === "barcode" && <BarcodeDialog packId={dialog.packId} onClose={() => setDialog(null)} onSaved={() => { const packId = dialog.packId; setDialog(null); void queryClient.invalidateQueries({ queryKey: ["pack-barcodes", packId] }); void refresh(); }} />}
-    {isLifecycleDialog(dialog) && <LifecycleDialog state={dialog} target={lifecycleTarget(dialog, record)} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
+    {dialog?.kind === "batch" && <BatchDialog pack={record.packs.find((pack) => pack.id === dialog.packId)!} batchId={dialog.batchId} onClose={() => setDialog(null)} onSaved={() => { const packId = dialog.packId; setDialog(null); void queryClient.invalidateQueries({ queryKey: ["pack-batches", packId] }); }} />}
+    {isLifecycleDialog(dialog) && <LifecycleDialog state={dialog} target={lifecycleTarget(dialog, record, queryClient)} onClose={() => setDialog(null)} onSaved={() => { const state = dialog; setDialog(null); if (state.kind === "batch-lifecycle") void queryClient.invalidateQueries({ queryKey: ["pack-batches", state.packId] }); else void refresh(); }} onReload={() => reloadLifecycle(dialog)} />}
   </>;
 }
 
-type DialogState = { kind: "role"; roleId?: string } | { kind: "pack"; packId?: string } | { kind: "component"; componentId?: string } | { kind: "policy" | "barcode"; packId: string } | LifecycleState | null;
-type LifecycleState = { kind: "product-lifecycle" } | { kind: "role-lifecycle"; roleId: string } | { kind: "pack-lifecycle"; packId: string } | { kind: "component-lifecycle"; componentId: string };
-type LifecycleTarget = Product | ProductCompanyRole | ProductPack | CompositionComponent;
+type DialogState = { kind: "role"; roleId?: string } | { kind: "pack"; packId?: string } | { kind: "component"; componentId?: string } | { kind: "policy" | "barcode"; packId: string } | { kind: "batch"; packId: string; batchId?: string } | LifecycleState | null;
+type LifecycleState = { kind: "product-lifecycle" } | { kind: "role-lifecycle"; roleId: string } | { kind: "pack-lifecycle"; packId: string } | { kind: "component-lifecycle"; componentId: string } | { kind: "batch-lifecycle"; packId: string; batchId: string };
+type LifecycleTarget = Product | ProductCompanyRole | ProductPack | CompositionComponent | Batch;
 
 function isLifecycleDialog(state: DialogState): state is LifecycleState {
-  return state !== null && ["product-lifecycle", "role-lifecycle", "pack-lifecycle", "component-lifecycle"].includes(state.kind);
+  return state !== null && ["product-lifecycle", "role-lifecycle", "pack-lifecycle", "component-lifecycle", "batch-lifecycle"].includes(state.kind);
 }
 // Resolved from the live Product query on every render, so a reloaded record immediately supplies
 // the revision the next lifecycle attempt sends.
-function lifecycleTarget(state: LifecycleState, product: ProductDetail): LifecycleTarget | undefined {
+function lifecycleTarget(state: LifecycleState, product: ProductDetail, queryClient: QueryClient): LifecycleTarget | undefined {
   if (state.kind === "product-lifecycle") return product;
   if (state.kind === "role-lifecycle") return product.companyRoles.find((role) => role.id === state.roleId);
   if (state.kind === "component-lifecycle") return product.composition.find((item) => item.id === state.componentId);
+  if (state.kind === "batch-lifecycle") return queryClient.getQueryData<Batch[]>(["pack-batches", state.packId])?.find((batch) => batch.id === state.batchId);
   return product.packs.find((pack) => pack.id === state.packId);
 }
 
@@ -300,6 +317,73 @@ function RoleTable({ roles, companies, referenceState, canMutate, onEdit, onLife
 function PackTable({ product, units, referenceState, canMutate, managedPackId, onManage, onEdit, onLifecycle }: { product: ProductDetail; units: ReferenceMasterResponse[] | undefined; referenceState: ReferenceState; canMutate: boolean; managedPackId: string | null; onManage: (id: string | null) => void; onEdit: (pack: ProductPack) => void; onLifecycle: (pack: ProductPack) => void }) {
   if (!product.packs.length) return <InlineEmpty text="No Packs configured." />;
   return <div className="table-scroll"><table className="data-table"><thead><tr><th scope="col">Pack</th><th scope="col">Contains</th><th scope="col">Containment</th><th scope="col">SKU</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead><tbody>{product.packs.map((pack) => { const child = product.packs.find((item) => item.id === pack.containedPackId); return <tr key={pack.id}><td data-label="Pack">{pack.displayLabel || referenceName(units, pack.containerUnitId, referenceState)}</td><td data-label="Contains">{atomsToQuantity(pack.baseQuantityAtoms, product.quantityScale)} {referenceName(units, product.baseUnitId, referenceState)}</td><td data-label="Containment">{child ? `${pack.containedPackCount} × ${child.displayLabel || referenceName(units, child.containerUnitId, referenceState)}` : "Direct"}</td><td data-label="SKU">{pack.skuCode || "—"}</td><td data-label="Status"><Status value={pack.status} /></td><td className="row-actions"><div><button type="button" onClick={() => onManage(managedPackId === pack.id ? null : pack.id)}>{managedPackId === pack.id ? "Close management" : "Manage"}</button>{canMutate && pack.status === "active" && <button type="button" onClick={() => onEdit(pack)}>Edit</button>}{canMutate && <button type="button" onClick={() => onLifecycle(pack)}>{pack.status === "active" ? "Archive" : "Restore"}</button>}</div></td></tr>; })}</tbody></table></div>;
+}
+
+/**
+ * A display aid only. Making this configurable is deferred; nothing in the Store Service consumes it
+ * and no decision is taken on its basis.
+ */
+const NEAR_EXPIRY_DAYS = 90;
+
+function todayIso() { const now = new Date(); return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`; }
+
+/** Compares YYYY-MM-DD strings, so the result never depends on a timezone offset. */
+function expiryState(expiresOn: string | null | undefined): "none" | "expired" | "soon" | "valid" {
+  if (!expiresOn) return "none";
+  const today = todayIso();
+  if (expiresOn < today) return "expired";
+  const horizon = new Date(`${today}T00:00:00Z`);
+  horizon.setUTCDate(horizon.getUTCDate() + NEAR_EXPIRY_DAYS);
+  return expiresOn <= horizon.toISOString().slice(0, 10) ? "soon" : "valid";
+}
+
+function BatchDialog({ pack, batchId, onClose, onSaved }: { pack: ProductPack; batchId?: string; onClose: () => void; onSaved: () => void }) {
+  const queryClient = useQueryClient();
+  const batches = useQuery({ queryKey: ["pack-batches", pack.id], queryFn: () => listBatches(pack.id), retry: false });
+  const batch = batchId ? batches.data?.find((item) => item.id === batchId) : undefined;
+  const [values, setValues] = useState(() => batchValues(queryClient.getQueryData<Batch[]>(["pack-batches", pack.id])?.find((item) => item.id === batchId)));
+  const [error, setError] = useState<string | null>(null);
+  const paise = values.mrp.trim() ? rupeesToPaise(values.mrp) : null;
+  const mutation = useMutation({
+    mutationFn: () => {
+      const fields: BatchFields = { batchNumber: values.batchNumber.trim(), manufacturedOn: values.manufacturedOn || null, expiresOn: values.expiresOn || null, mrpPaise: paise };
+      return batch ? updateBatch(batch, fields) : createBatch(pack.id, fields);
+    },
+    onSuccess: onSaved,
+    onError: (caught) => setError(caught instanceof LocalServiceError ? caught.message : caught instanceof Error ? caught.message : "The batch could not be saved.")
+  });
+  const reload = useReloadLatest(async () => {
+    if (!batchId) return;
+    await queryClient.invalidateQueries({ queryKey: ["pack-batches", pack.id] });
+    const latest = queryClient.getQueryData<Batch[]>(["pack-batches", pack.id])?.find((item) => item.id === batchId);
+    if (!latest) { setError("The latest version of this batch could not be loaded. Cancel and reopen it."); return; }
+    setValues(batchValues(latest)); setError(null); mutation.reset();
+  });
+  const submit = (event: FormEvent) => {
+    event.preventDefault(); setError(null);
+    if (!values.batchNumber.trim()) { setError("Enter the batch or lot number."); return; }
+    if (values.mrp.trim() && paise === null) { setError("Enter the MRP in rupees with at most two decimal places."); return; }
+    if (values.manufacturedOn && values.expiresOn && values.expiresOn < values.manufacturedOn) { setError("Expiry cannot be earlier than the manufacturing date."); return; }
+    mutation.mutate();
+  };
+  return <CatalogDialog title={batch ? "Edit Batch" : "Add Batch"} description="Lot identity and the MRP printed on it. Recording a batch does not record stock." onClose={onClose}><form className="master-form" onSubmit={submit}>
+    <TextField label="Batch / Lot number" name="batchNumber" value={values.batchNumber} onChange={(batchNumber) => setValues({ ...values, batchNumber })} required hint="Stored exactly as printed; comparison ignores case and spacing." />
+    <TextField label="Manufactured on" name="manufacturedOn" type="date" value={values.manufacturedOn} onChange={(manufacturedOn) => setValues({ ...values, manufacturedOn })} hint="Optional." />
+    <TextField label="Expires on" name="expiresOn" type="date" value={values.expiresOn} onChange={(expiresOn) => setValues({ ...values, expiresOn })} hint="Optional. An already-expired lot may be recorded." />
+    <TextField label="MRP (₹)" name="mrpPaise" value={values.mrp} onChange={(mrp) => setValues({ ...values, mrp })} hint="Optional. Up to two decimal places." />
+    <div className="field catalog-span"><span className="field-label">Will be stored as</span><strong>{paise === null ? "No MRP recorded" : `${paise} paise`}</strong><small>Money is kept as exact integer paise, never as a decimal fraction.</small></div>
+    {error && <div className="inline-notice inline-notice--error" role="alert">{isRevisionConflict(mutation.error) ? STALE_RECORD_MESSAGE : error}{isRevisionConflict(mutation.error) && batch && <button type="button" onClick={() => void reload.run()} disabled={reload.pending}>{reload.pending ? "Reloading…" : "Reload latest"}</button>}</div>}
+    <DialogActions onClose={onClose} pending={mutation.isPending} />
+  </form></CatalogDialog>;
+}
+
+function batchValues(record?: Batch) {
+  return {
+    batchNumber: record?.batchNumber ?? "",
+    manufacturedOn: record?.manufacturedOn ?? "",
+    expiresOn: record?.expiresOn ?? "",
+    mrp: record?.mrpPaise != null ? paiseToRupees(record.mrpPaise) : ""
+  };
 }
 
 function CompositionTable({ product, canMutate, onEdit, onLifecycle }: { product: ProductDetail; canMutate: boolean; onEdit: (component: CompositionComponent) => void; onLifecycle: (component: CompositionComponent) => void }) {
@@ -363,7 +447,7 @@ function StrengthUnitField({ label, name, value, units, state, optional = false,
   return <div className="field"><label htmlFor={id}>{label}{!optional && <span aria-hidden="true"> *</span>}</label><select id={id} name={name} value={value} onChange={(event) => onChange(event.target.value)} disabled={state === "pending"}><option value="">{state === "pending" ? "Loading…" : state === "error" ? "Units unavailable" : optional ? "Not applicable" : "Select a unit"}</option>{units.map((unit) => <option key={unit.id} value={unit.id}>{referencePrimaryName(unit)}</option>)}</select></div>;
 }
 
-function PackWorkspace({ product, pack, canMutate, onPolicy, onBarcode, onRefresh }: { product: ProductDetail; pack: ProductPack; canMutate: boolean; onPolicy: () => void; onBarcode: () => void; onRefresh: () => void }) {
+function PackWorkspace({ product, pack, canMutate, onPolicy, onBarcode, onBatch, onBatchLifecycle, onRefresh }: { product: ProductDetail; pack: ProductPack; canMutate: boolean; onPolicy: () => void; onBarcode: () => void; onBatch: (batch?: Batch) => void; onBatchLifecycle: (batch: Batch) => void; onRefresh: () => void }) {
   const policy = useQuery({ queryKey: ["pack-policy", pack.id], queryFn: () => getPackPolicy(pack.id), retry: false });
   const barcodes = useQuery({ queryKey: ["pack-barcodes", pack.id], queryFn: () => listBarcodes(pack.id), retry: false });
   const lifecycle = useMutation({ mutationFn: ({ barcode, action }: { barcode: Barcode; action: "archive" | "restore" }) => changeBarcodeLifecycle(barcode, action, action === "archive" ? "No longer used" : "Required again"), onSuccess: () => { void barcodes.refetch(); onRefresh(); } });
@@ -371,7 +455,30 @@ function PackWorkspace({ product, pack, canMutate, onPolicy, onBarcode, onRefres
   return <div className="pack-workspace"><div className="pack-workspace__header"><div><strong>{pack.displayLabel || "Pack management"}</strong><p>Store policy and immutable barcode assignments.</p></div>{canMutate && pack.status === "active" && <div><button className="button button--secondary" type="button" onClick={onPolicy}>{policy.data ? "Edit Policy" : "Add Policy"}</button><button className="button button--secondary" type="button" onClick={onBarcode}>Add Barcode</button></div>}</div>
     <div className="pack-management-grid"><section><h3>Store Pack Policy</h3>{policy.isPending ? <p role="status">Loading store policy…</p> : policy.isError ? <InlineQueryError label="Store policy could not be loaded." onRetry={() => void policy.refetch()} /> : policy.data ? <><dl className="compact-list"><div><dt>Purchase</dt><dd>{policy.data.purchaseEnabled ? "Enabled" : "Disabled"}{policy.data.defaultPurchasePack ? " · Default" : ""}</dd></div><div><dt>Sale</dt><dd>{policy.data.saleEnabled ? "Enabled" : "Disabled"}{policy.data.defaultSalePack ? " · Default" : ""}</dd></div><div><dt>Minimum sale</dt><dd>{atomsToQuantity(policy.data.minimumSaleIncrementAtoms, product.quantityScale)}</dd></div></dl><div className="policy-status-actions"><Status value={policy.data.status} />{canMutate && <button type="button" onClick={() => policyLifecycle.mutate({ policy: policy.data!, action: policy.data!.status === "active" ? "archive" : "restore" })}>{policy.data.status === "active" ? "Archive Policy" : "Restore Policy"}</button>}</div>{policyLifecycle.error && <MutationError error={policyLifecycle.error} onReload={() => void policy.refetch()} reloading={policy.isRefetching} />}</> : <p>No store policy configured.</p>}</section>
       <section><h3>Barcodes</h3>{barcodes.isPending ? <p role="status">Loading barcodes…</p> : barcodes.isError ? <InlineQueryError label="Barcodes could not be loaded." onRetry={() => void barcodes.refetch()} /> : barcodes.data.length ? <ul className="barcode-list">{barcodes.data.map((barcode) => <li key={barcode.id}><span><strong>{barcode.normalizedValue}</strong><small>{barcode.namespace.toUpperCase()} · {barcode.scope} · {barcode.symbology || "Unspecified symbology"}</small></span><Status value={barcode.status} />{canMutate && <button type="button" onClick={() => lifecycle.mutate({ barcode, action: barcode.status === "active" ? "archive" : "restore" })}>{barcode.status === "active" ? "Archive" : "Restore"}</button>}</li>)}</ul> : <p>No barcodes assigned.</p>}{lifecycle.error && <MutationError error={lifecycle.error} onReload={() => void barcodes.refetch()} reloading={barcodes.isRefetching} />}</section></div>
+    <BatchWorkspace pack={pack} canMutate={canMutate} onBatch={onBatch} onBatchLifecycle={onBatchLifecycle} />
   </div>;
+}
+
+/**
+ * Manufactured lots of one Pack. Identity and commercial metadata only — there is deliberately no
+ * quantity column, because a batch existing is not stock existing.
+ */
+function BatchWorkspace({ pack, canMutate, onBatch, onBatchLifecycle }: { pack: ProductPack; canMutate: boolean; onBatch: (batch?: Batch) => void; onBatchLifecycle: (batch: Batch) => void }) {
+  const batches = useQuery({ queryKey: ["pack-batches", pack.id], queryFn: () => listBatches(pack.id), retry: false });
+  return <section className="batch-workspace"><header><div><h3>Batches</h3><p>Manufactured lots, expiry, and the MRP printed on each lot. No stock quantity is recorded here.</p></div>{canMutate && pack.status === "active" && <button className="button button--secondary" type="button" onClick={() => onBatch()}>Add Batch</button>}</header>
+    {batches.isPending ? <p role="status">Loading batches…</p> : batches.isError ? <InlineQueryError label="Batches could not be loaded." onRetry={() => void batches.refetch()} /> : batches.data.length === 0 ? <InlineEmpty text="No batches recorded." /> :
+      <div className="table-scroll"><table className="data-table"><thead><tr><th scope="col">Batch</th><th scope="col">Manufactured</th><th scope="col">Expiry</th><th scope="col">MRP</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead><tbody>{batches.data.map((batch) => <tr key={batch.id}><td data-label="Batch">{batch.batchNumber}</td><td data-label="Manufactured">{batch.manufacturedOn || "—"}</td><td data-label="Expiry">{batch.expiresOn ? <><span>{batch.expiresOn}</span> <ExpiryState value={batch.expiresOn} /></> : "Not recorded"}</td><td data-label="MRP">{batch.mrpPaise === null || batch.mrpPaise === undefined ? "—" : `₹${paiseToRupees(batch.mrpPaise)}`}</td><td data-label="Status"><Status value={batch.status} /></td><td className="row-actions"><div>{canMutate && batch.status === "active" && <button type="button" onClick={() => onBatch(batch)}>Edit</button>}{canMutate && <button type="button" onClick={() => onBatchLifecycle(batch)}>{batch.status === "active" ? "Archive" : "Restore"}</button>}</div></td></tr>)}</tbody></table></div>}
+  </section>;
+}
+
+/**
+ * Derived from the expiry date on every render rather than stored, so it can never be stale. The
+ * near-expiry window is a display aid with no clinical, regulatory, or business authority.
+ */
+function ExpiryState({ value }: { value: string }) {
+  const state = expiryState(value);
+  if (state === "valid") return null;
+  return <span className={`expiry-chip expiry-chip--${state}`}>{state === "expired" ? "Expired" : "Expiring soon"}</span>;
 }
 
 function RoleDialog({ product, roleId, onClose, onSaved, onReload }: { product: ProductDetail; roleId?: string; onClose: () => void; onSaved: () => void; onReload: ReloadProduct }) {
@@ -450,14 +557,14 @@ function BarcodeDialog({ packId, onClose, onSaved }: { packId: string; onClose: 
   return <CatalogDialog title="Add Pack Barcode" description="Barcode values cannot be reassigned or edited. Archive and add a replacement if necessary." onClose={onClose}><form className="master-form" onSubmit={submit}><SelectField label="Namespace / type" name="namespace" value={namespace} onChange={(next) => { setNamespace(next); if (next === "internal") setScope("store"); }} options={[["gtin", "GTIN"], ["internal", "Internal"], ["code128", "Code 128"]]} /><TextField label="Barcode value" name="value" value={value} onChange={setValue} required /><TextField label="Symbology (optional)" name="symbology" value={symbology} onChange={setSymbology} /><SelectField label="Scope" name="scope" value={namespace === "internal" ? "store" : scope} onChange={(next) => setScope(next as "global" | "store")} disabled={namespace === "internal"} options={[["global", "Global"], ["store", "This store"]]} />{context.isError && <InlineQueryError label="Store information could not be loaded. It is required for a Store-scoped Barcode." onRetry={() => void context.refetch()} />}{notice && <div className="inline-notice inline-notice--error" role="alert">{notice}</div>}{mutation.error && <MutationError error={mutation.error} />}<DialogActions onClose={onClose} pending={mutation.isPending || context.isPending} /></form></CatalogDialog>;
 }
 
-function LifecycleDialog({ state, target, onClose, onSaved, onReload }: { state: LifecycleState; target: LifecycleTarget | undefined; onClose: () => void; onSaved: () => void; onReload: ReloadProduct }) {
+function LifecycleDialog({ state, target, onClose, onSaved, onReload }: { state: LifecycleState; target: LifecycleTarget | undefined; onClose: () => void; onSaved: () => void; onReload: () => Promise<boolean> }) {
   const active = target?.status === "active"; const action = active ? "archive" : "restore"; const [reason, setReason] = useState(active ? "" : "Required again"); const [staleNotice, setStaleNotice] = useState<string | null>(null);
-  const mutation = useMutation<unknown, Error, void>({ mutationFn: () => { if (!target) throw new Error("This record is no longer available."); return state.kind === "product-lifecycle" ? changeProductLifecycle(target as Product, action, reason) : state.kind === "role-lifecycle" ? changeCompanyRoleLifecycle(target as ProductCompanyRole, action, reason) : state.kind === "component-lifecycle" ? changeComponentLifecycle(target as CompositionComponent, action, reason) : changePackLifecycle(target as ProductPack, action, reason); }, onSuccess: onSaved });
+  const mutation = useMutation<unknown, Error, void>({ mutationFn: () => { if (!target) throw new Error("This record is no longer available."); return state.kind === "product-lifecycle" ? changeProductLifecycle(target as Product, action, reason) : state.kind === "role-lifecycle" ? changeCompanyRoleLifecycle(target as ProductCompanyRole, action, reason) : state.kind === "component-lifecycle" ? changeComponentLifecycle(target as CompositionComponent, action, reason) : state.kind === "batch-lifecycle" ? changeBatchLifecycle(target as Batch, action, reason) : changePackLifecycle(target as ProductPack, action, reason); }, onSuccess: onSaved });
   // The lifecycle target is derived from the Product query on every render, so awaiting the refetch
   // is enough to arm the next attempt with the current revision rather than the stale one.
   const reload = useReloadLatest(async () => {
-    const latest = await onReload();
-    if (!latest) { setStaleNotice("The latest version of this record could not be loaded. Cancel and reopen it."); return; }
+    const reloaded = await onReload();
+    if (!reloaded) { setStaleNotice("The latest version of this record could not be loaded. Cancel and reopen it."); return; }
     setStaleNotice(null); mutation.reset();
   });
   if (!target) return <CatalogDialog title="Record unavailable" onClose={onClose}><div className="master-form"><div className="inline-notice inline-notice--error" role="alert">This record is no longer part of the Product. Close and review the latest Product.</div><div className="form-actions"><button className="button button--secondary" type="button" onClick={onClose}>Close</button></div></div></CatalogDialog>;

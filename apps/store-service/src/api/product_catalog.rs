@@ -17,9 +17,9 @@ use super::{
     reference_masters::ReferenceState,
 };
 use crate::domain::catalog::{
-    CatalogValidationIssue, MAX_BASE_QUANTITY_ATOMS, MAX_QUANTITY_SCALE, normalize_barcode,
-    normalize_sku, normalized_search_name, optional_text, required_text, validate_date,
-    validate_uuid_v7,
+    CatalogValidationIssue, MAX_BASE_QUANTITY_ATOMS, MAX_MRP_PAISE, MAX_QUANTITY_SCALE,
+    normalize_barcode, normalize_batch_number, normalize_sku, normalized_search_name,
+    optional_text, required_text, validate_date, validate_uuid_v7,
 };
 
 #[derive(Debug)]
@@ -34,6 +34,7 @@ enum CatalogError {
     Barcode,
     DefaultPack,
     Composition,
+    Batch,
     ServiceBusy,
     Internal,
 }
@@ -128,6 +129,13 @@ impl IntoResponse for CatalogError {
                 simple_error(
                     "composition_conflict",
                     "The composition conflicts with the product kind or an existing component.",
+                ),
+            ),
+            Self::Batch => (
+                StatusCode::CONFLICT,
+                simple_error(
+                    "batch_conflict",
+                    "The batch conflicts with an existing lot or with the pack's status.",
                 ),
             ),
             Self::ServiceBusy => (
@@ -406,6 +414,43 @@ struct UpdateCompositionRequest {
     reason: Option<String>,
 }
 
+/// One manufactured lot of one Product Pack. Identity and commercial metadata only — this carries
+/// no quantity, balance, or stock figure, and recording a batch is never a stock receipt.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchInput {
+    batch_number: String,
+    manufactured_on: Option<String>,
+    expires_on: Option<String>,
+    mrp_paise: Option<i64>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct BatchResponse {
+    id: String,
+    revision: i64,
+    status: String,
+    product_pack_id: String,
+    batch_number: String,
+    normalized_batch_number: String,
+    manufactured_on: Option<String>,
+    expires_on: Option<String>,
+    mrp_paise: Option<i64>,
+    created_at_utc: String,
+    updated_at_utc: String,
+    archived_at_utc: Option<String>,
+    archive_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateBatchRequest {
+    expected_revision: i64,
+    batch: BatchInput,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 struct PackResponse {
@@ -551,6 +596,13 @@ pub fn routes() -> Router<ReferenceState> {
             "/api/v1/packs/{id}/barcodes",
             get(list_barcodes).post(create_barcode),
         )
+        .route(
+            "/api/v1/packs/{id}/batches",
+            get(list_batches).post(create_batch),
+        )
+        .route("/api/v1/batches/{id}", get(get_batch).put(update_batch))
+        .route("/api/v1/batches/{id}/archive", post(archive_batch))
+        .route("/api/v1/batches/{id}/restore", post(restore_batch))
         .route("/api/v1/barcodes/resolve", get(resolve_barcode))
         .route("/api/v1/barcodes/{id}", get(get_barcode))
         .route("/api/v1/barcodes/{id}/archive", post(archive_barcode))
@@ -1058,6 +1110,158 @@ async fn restore_company_role(
     Ok(Json(fetch_company_role(&state.pool, &id).await?))
 }
 
+async fn list_batches(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(pack_id): Path<String>,
+) -> Result<Json<Vec<BatchResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
+    Ok(Json(batches_for(&state.pool, &pack_id).await?))
+}
+
+async fn get_batch(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<BatchResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    Ok(Json(fetch_batch(&state.pool, &id).await?))
+}
+
+async fn create_batch(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(pack_id): Path<String>,
+    Json(input): Json<BatchInput>,
+) -> Result<(StatusCode, Json<BatchResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
+    let (input, normalized) = prepare_batch(input)?;
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let pack = entity_state(&mut transaction, "product_packs", &pack_id).await?;
+    if pack.1 != "active" {
+        return Err(CatalogError::Archived);
+    }
+    let id = Uuid::now_v7().to_string();
+    let now = database_now(&mut transaction).await?;
+    insert_batch_row(&mut transaction, &id, &pack_id, &input, &normalized, &now).await?;
+    audit(
+        &mut transaction,
+        "product_batch",
+        &id,
+        1,
+        "created",
+        None,
+        &input,
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(fetch_batch(&state.pool, &id).await?),
+    ))
+}
+
+async fn update_batch(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateBatchRequest>,
+) -> Result<Json<BatchResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let (input, normalized) = prepare_batch(request.batch)?;
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let current = entity_state(&mut transaction, "product_batches", &id).await?;
+    require_active_revision(&current, request.expected_revision)?;
+    let now = database_now(&mut transaction).await?;
+    let next = current.0 + 1;
+    let result = sqlx::query(
+        "UPDATE product_batches SET revision=?,batch_number=?,normalized_batch_number=?,\
+         manufactured_on=?,expires_on=?,mrp_paise=?,updated_at_utc=? \
+         WHERE id=? AND revision=? AND status='active'",
+    )
+    .bind(next)
+    .bind(&input.batch_number)
+    .bind(&normalized)
+    .bind(&input.manufactured_on)
+    .bind(&input.expires_on)
+    .bind(input.mrp_paise)
+    .bind(&now)
+    .bind(&id)
+    .bind(current.0)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    if result.rows_affected() != 1 {
+        return Err(CatalogError::Internal);
+    }
+    audit(
+        &mut transaction,
+        "product_batch",
+        &id,
+        next,
+        "updated",
+        request.reason.as_deref(),
+        &input,
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok(Json(fetch_batch(&state.pool, &id).await?))
+}
+
+async fn archive_batch(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<BatchResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "product_batches",
+        "product_batch",
+        &id,
+        request,
+        false,
+        &actor.id,
+    )
+    .await?;
+    Ok(Json(fetch_batch(&state.pool, &id).await?))
+}
+
+async fn restore_batch(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<BatchResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "product_batches",
+        "product_batch",
+        &id,
+        request,
+        true,
+        &actor.id,
+    )
+    .await?;
+    Ok(Json(fetch_batch(&state.pool, &id).await?))
+}
+
 async fn list_composition(
     State(state): State<ReferenceState>,
     headers: HeaderMap,
@@ -1404,8 +1608,10 @@ async fn archive_pack(
     let references: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM store_pack_policies WHERE pack_id=? AND status='active') + \
          (SELECT COUNT(*) FROM barcodes WHERE pack_id=? AND status='active') + \
-         (SELECT COUNT(*) FROM product_packs WHERE contained_pack_id=? AND status='active')",
+         (SELECT COUNT(*) FROM product_packs WHERE contained_pack_id=? AND status='active') + \
+         (SELECT COUNT(*) FROM product_batches WHERE product_pack_id=? AND status='active')",
     )
+    .bind(&id)
     .bind(&id)
     .bind(&id)
     .bind(&id)
@@ -1949,6 +2155,37 @@ fn prepare_pack(mut input: PackInput) -> Result<PackInput, CatalogError> {
     Ok(input)
 }
 
+/// Validates one batch. Dates stay calendar-domain values that are really parsed, and MRP stays an
+/// exact integer paise value — binary floating point is never accepted.
+fn prepare_batch(mut input: BatchInput) -> Result<(BatchInput, String), CatalogError> {
+    let (display, normalized) =
+        normalize_batch_number(&input.batch_number).map_err(validation_issue)?;
+    input.batch_number = display;
+    input.manufactured_on = validate_date(input.manufactured_on.as_deref(), "manufacturedOn")
+        .map_err(validation_issue)?;
+    input.expires_on =
+        validate_date(input.expires_on.as_deref(), "expiresOn").map_err(validation_issue)?;
+    // An already-expired lot is historical fact and stays acceptable; only an impossible ordering is
+    // rejected.
+    if let (Some(manufactured), Some(expires)) = (&input.manufactured_on, &input.expires_on)
+        && expires < manufactured
+    {
+        return Err(validation(
+            "expiresOn",
+            "must not be earlier than manufacturedOn",
+        ));
+    }
+    if let Some(mrp) = input.mrp_paise
+        && !(1..=MAX_MRP_PAISE).contains(&mrp)
+    {
+        return Err(validation(
+            "mrpPaise",
+            "must be a positive amount in paise within the supported range",
+        ));
+    }
+    Ok((input, normalized))
+}
+
 /// Validates one composition component. Strength stays exact integer atoms with an explicit scale;
 /// no binary floating point is ever accepted or produced.
 fn prepare_composition(mut input: CompositionInput) -> Result<CompositionInput, CatalogError> {
@@ -2360,6 +2597,60 @@ async fn packs_for(pool: &SqlitePool, product_id: &str) -> Result<Vec<PackRespon
     ).bind(product_id).fetch_all(pool).await.map_err(|_| CatalogError::Internal)
 }
 
+const BATCH_COLUMNS: &str = "id,revision,status,product_pack_id,batch_number,normalized_batch_number,manufactured_on,\
+     expires_on,mrp_paise,created_at_utc,updated_at_utc,archived_at_utc,archive_reason";
+
+async fn insert_batch_row(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    pack_id: &str,
+    input: &BatchInput,
+    normalized: &str,
+    now: &str,
+) -> Result<(), CatalogError> {
+    sqlx::query(
+        "INSERT INTO product_batches (id,product_pack_id,batch_number,normalized_batch_number,\
+         manufactured_on,expires_on,mrp_paise,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(id)
+    .bind(pack_id)
+    .bind(&input.batch_number)
+    .bind(normalized)
+    .bind(&input.manufactured_on)
+    .bind(&input.expires_on)
+    .bind(input.mrp_paise)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_database_error)?;
+    Ok(())
+}
+
+async fn fetch_batch(pool: &SqlitePool, id: &str) -> Result<BatchResponse, CatalogError> {
+    sqlx::query_as::<_, BatchResponse>(&format!(
+        "SELECT {BATCH_COLUMNS} FROM product_batches WHERE id=?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| CatalogError::Internal)?
+    .ok_or(CatalogError::NotFound)
+}
+
+/// Soonest expiry first with undated lots last. Presentation ordering only — this is not a FEFO
+/// issue policy, which belongs to the deferred sales phase.
+async fn batches_for(pool: &SqlitePool, pack_id: &str) -> Result<Vec<BatchResponse>, CatalogError> {
+    sqlx::query_as::<_, BatchResponse>(&format!(
+        "SELECT {BATCH_COLUMNS} FROM product_batches WHERE product_pack_id=? \
+         ORDER BY expires_on IS NULL,expires_on,normalized_batch_number"
+    ))
+    .bind(pack_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| CatalogError::Internal)
+}
+
 const COMPOSITION_COLUMNS: &str = "id,revision,status,product_id,ingredient_id,salt_form_id,component_role,display_order,\
      strength_presentation,strength_numerator_atoms,strength_numerator_scale,strength_numerator_unit_id,\
      strength_denominator_atoms,strength_denominator_scale,strength_denominator_unit_id,\
@@ -2640,6 +2931,11 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
         || message.contains("product_composition_components_active_uq")
     {
         return CatalogError::Composition;
+    }
+    // A duplicate lot is a duplicate like any other, and maps to the frozen `duplicate_conflict`.
+    // `batch_conflict` is reserved for Pack/Product state violations raised by the trigger.
+    if message.contains("product_batch_conflict") {
+        return CatalogError::Batch;
     }
     if message.contains("pack_conversion_conflict")
         || message.contains("product_quantity_scale_conflict")
@@ -3820,6 +4116,321 @@ mod tests {
                 .unwrap();
         assert_eq!(authoritative_actor, owner_id);
         assert_ne!(authoritative_actor, spoofed_actor);
+    }
+
+    // ---- Phase 1C-C batch identity ----
+
+    async fn add_batch(pool: &SqlitePool, pack: &str, body: Value) -> (StatusCode, Value) {
+        request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/packs/{pack}/batches"),
+            body,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn batch_identity_is_scoped_to_its_pack_and_preserves_the_printed_form() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_product(&pool, "Batched item").await;
+        let product_id = product["id"].as_str().unwrap();
+        let strip = create_pack(&pool, product_id, STRIP, 15, None).await;
+        let strip_id = strip["id"].as_str().unwrap().to_owned();
+        let box_pack = create_pack(&pool, product_id, BOX_UNIT, 150, None).await;
+        let box_id = box_pack["id"].as_str().unwrap().to_owned();
+
+        let (status, created) = add_batch(
+            &pool,
+            &strip_id,
+            json!({"batchNumber":" ab-123 ","manufacturedOn":"2026-01-01","expiresOn":"2028-01-31","mrpPaise":12550}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        // The printed form survives; the normalized form is what uniqueness compares.
+        assert_eq!(created["batchNumber"], "ab-123");
+        assert_eq!(created["normalizedBatchNumber"], "AB-123");
+        assert_eq!(created["mrpPaise"], 12550);
+        assert_eq!(
+            Uuid::parse_str(created["id"].as_str().unwrap())
+                .unwrap()
+                .get_version_num(),
+            7
+        );
+
+        // Case and whitespace never create a second lot on the same Pack.
+        let (status, duplicate) =
+            add_batch(&pool, &strip_id, json!({"batchNumber":"  Ab - 123 "})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{duplicate}");
+        assert_eq!(duplicate["code"], "duplicate_conflict");
+
+        // Manufacturers reuse lot strings, so the same string on another Pack is legitimate.
+        let (status, other_pack) = add_batch(&pool, &box_id, json!({"batchNumber":"AB-123"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{other_pack}");
+
+        // A batch may not be created against an archived Pack.
+        let (status, archived_pack) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/packs/{box_id}/archive"),
+            json!({"expectedRevision":1,"reason":"Withdrawn presentation"}),
+        )
+        .await;
+        // The Pack still carries an active batch, so archiving it is refused.
+        assert_eq!(status, StatusCode::CONFLICT, "{archived_pack}");
+        assert_eq!(archived_pack["code"], "archived_conflict");
+    }
+
+    #[tokio::test]
+    async fn batch_dates_and_mrp_stay_exact_and_calendar_only() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_product(&pool, "Dated item").await;
+        let pack = create_pack(&pool, product["id"].as_str().unwrap(), STRIP, 15, None).await;
+        let pack_id = pack["id"].as_str().unwrap().to_owned();
+
+        // Both dates absent is legitimate for a non-expiring general item.
+        let (status, undated) = add_batch(&pool, &pack_id, json!({"batchNumber":"NODATE"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{undated}");
+        assert_eq!(undated["manufacturedOn"], Value::Null);
+        assert_eq!(undated["expiresOn"], Value::Null);
+        assert_eq!(undated["mrpPaise"], Value::Null);
+
+        // An already-expired historical lot must remain recordable.
+        let (status, expired) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"OLD-1","expiresOn":"2020-03-31"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{expired}");
+
+        // Shape alone is not validity: a GLOB-passing impossible date is still rejected.
+        let (status, impossible) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"BAD-1","expiresOn":"2027-02-30"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{impossible}");
+        assert_eq!(impossible["issues"][0]["field"], "expiresOn");
+
+        let (status, reversed) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"BAD-2","manufacturedOn":"2027-05-01","expiresOn":"2027-04-30"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reversed}");
+        assert_eq!(reversed["issues"][0]["field"], "expiresOn");
+
+        // Money is exact integer paise; nothing else is authoritative.
+        let (status, zero_mrp) =
+            add_batch(&pool, &pack_id, json!({"batchNumber":"BAD-3","mrpPaise":0})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{zero_mrp}");
+        assert_eq!(zero_mrp["issues"][0]["field"], "mrpPaise");
+        let (status, negative_mrp) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"BAD-4","mrpPaise":-100}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{negative_mrp}");
+
+        let stored: Option<i64> = sqlx::query_scalar(
+            "SELECT mrp_paise FROM product_batches WHERE normalized_batch_number='NODATE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, None);
+
+        // Soonest expiry first, undated lots last.
+        let (status, listed) = request_json(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/packs/{pack_id}/batches"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed[0]["normalizedBatchNumber"], "OLD-1");
+        assert_eq!(listed[1]["normalizedBatchNumber"], "NODATE");
+    }
+
+    #[tokio::test]
+    async fn batch_revision_lifecycle_and_history_are_safe() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_product(&pool, "Lifecycle item").await;
+        let pack = create_pack(&pool, product["id"].as_str().unwrap(), STRIP, 15, None).await;
+        let pack_id = pack["id"].as_str().unwrap().to_owned();
+        let (_, created) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"LOT-1","expiresOn":"2029-06-30","mrpPaise":9900}),
+        )
+        .await;
+        let batch_id = created["id"].as_str().unwrap().to_owned();
+
+        let (status, updated) = request_json(
+            pool.clone(),
+            "PUT",
+            &format!("/api/v1/batches/{batch_id}"),
+            json!({"expectedRevision":1,"batch":{"batchNumber":"LOT-1","expiresOn":"2029-07-31","mrpPaise":10500}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["revision"], 2);
+        assert_eq!(updated["mrpPaise"], 10500);
+
+        let (status, stale) = request_json(
+            pool.clone(),
+            "PUT",
+            &format!("/api/v1/batches/{batch_id}"),
+            json!({"expectedRevision":1,"batch":{"batchNumber":"LOT-1"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(stale["code"], "revision_conflict");
+        assert_eq!(stale["currentRevision"], 2);
+
+        // Archive preserves the lot and its history rather than pretending it never existed.
+        let (status, archived) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/batches/{batch_id}/archive"),
+            json!({"expectedRevision":2,"reason":"Lot withdrawn"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{archived}");
+        assert_eq!(archived["status"], "archived");
+        let preserved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_batches WHERE id=?")
+            .bind(&batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(preserved, 1);
+        // ON DELETE RESTRICT points at the Pack, so a Pack carrying lots can never be deleted out
+        // from under them and the batch's parent reference stays intact for future traceability.
+        assert!(
+            sqlx::query("DELETE FROM product_packs WHERE id=?")
+                .bind(&pack_id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+
+        // Archiving frees the lot string for reuse on the same Pack.
+        let (status, reused) = add_batch(&pool, &pack_id, json!({"batchNumber":"LOT-1"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{reused}");
+    }
+
+    #[tokio::test]
+    async fn batch_row_carries_no_stock_and_no_pricing_columns() {
+        let (_temp, pool, _) = test_pool().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT lower(name) FROM pragma_table_info('product_batches')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        // A batch existing is not stock existing: no mutable balance may live on the identity row.
+        for forbidden in [
+            "quantity_on_hand",
+            "current_stock",
+            "stock_balance",
+            "inward_quantity",
+            "outward_quantity",
+            "quantity",
+            "purchase_rate",
+            "selling_price",
+        ] {
+            assert!(
+                !columns.iter().any(|column| column == forbidden),
+                "product_batches must not carry {forbidden}"
+            );
+        }
+        assert!(columns.iter().any(|column| column == "mrp_paise"));
+        // Money is an integer column, never REAL.
+        let mrp_type: String = sqlx::query_scalar(
+            "SELECT lower(type) FROM pragma_table_info('product_batches') WHERE name='mrp_paise'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mrp_type, "integer");
+
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for deferred in ["stock", "stock_ledger", "prices", "purchases", "sales"] {
+            assert!(!tables.iter().any(|table| table == deferred));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_access_roles_and_server_audit_actor_are_enforced() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_product(&pool, "Guarded item").await;
+        let pack = create_pack(&pool, product["id"].as_str().unwrap(), STRIP, 15, None).await;
+        let pack_id = pack["id"].as_str().unwrap().to_owned();
+
+        let spoofed = Uuid::now_v7().to_string();
+        let (status, created) = add_batch(
+            &pool,
+            &pack_id,
+            json!({"batchNumber":"LOT-9","actorId":spoofed}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let batch_id = created["id"].as_str().unwrap();
+        let actor: String = sqlx::query_scalar(
+            "SELECT actor_id FROM master_change_events WHERE entity_type='product_batch' AND entity_id=?",
+        )
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let owner: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE role='owner_admin' LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actor, owner);
+        assert_ne!(actor, spoofed);
+
+        for role in ["pharmacist", "cashier"] {
+            let token = format!("{role}-batch-token");
+            insert_session(&pool, role, &token).await;
+            let (read_status, _) = request_json_as(
+                pool.clone(),
+                "GET",
+                &format!("/api/v1/packs/{pack_id}/batches"),
+                Value::Null,
+                Some(&token),
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::OK, "{role} must read batches");
+            let (write_status, body) = request_json_as(
+                pool.clone(),
+                "POST",
+                &format!("/api/v1/packs/{pack_id}/batches"),
+                json!({"batchNumber":"LOT-ROLE"}),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(write_status, StatusCode::FORBIDDEN, "{body}");
+        }
+
+        let (status, _) = request_json_as(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/packs/{pack_id}/batches"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     // ---- Phase 1C-B composition identity ----

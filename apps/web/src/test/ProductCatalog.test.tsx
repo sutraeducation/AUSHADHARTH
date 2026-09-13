@@ -2,9 +2,9 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Barcode, CompositionComponent, ProductDetail, ProductPack, ReferenceKind, ReferenceMasterResponse, StorePackPolicy, UserRole } from "@aushadharth/contracts";
+import type { Barcode, Batch, CompositionComponent, ProductDetail, ProductPack, ReferenceKind, ReferenceMasterResponse, StorePackPolicy, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
-import { atomsToQuantity, quantityToAtoms } from "../products/productApi";
+import { atomsToQuantity, paiseToRupees, quantityToAtoms, rupeesToPaise } from "../products/productApi";
 
 const IDs = {
   product: "01997000-0000-7000-8000-000000000001",
@@ -25,7 +25,8 @@ const IDs = {
   mg: "01997000-0000-7000-8000-000000000016",
   mlUnit: "01997000-0000-7000-8000-000000000017",
   gUnit: "01997000-0000-7000-8000-000000000018",
-  component: "01997000-0000-7000-8000-000000000019"
+  component: "01997000-0000-7000-8000-000000000019",
+  batch: "01997000-0000-7000-8000-000000000020"
 };
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
 const stamp = { createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null };
@@ -74,7 +75,15 @@ type Options = {
   failBarcodes?: number;
   failReferences?: number;
   failContext?: number;
+  failBatches?: number;
+  batches?: BatchRecord[];
 };
+
+type BatchRecord = Batch;
+function normalizeBatch(value: string) { return value.replace(/\s+/g, "").toUpperCase(); }
+function batchRecord(overrides: Partial<Batch> = {}): Batch {
+  return { id: IDs.batch, productPackId: IDs.pack, batchNumber: "AB-123", normalizedBatchNumber: "AB-123", manufacturedOn: "2026-01-01", expiresOn: "2029-12-31", mrpPaise: 12550, revision: 1, status: "active", ...stamp, ...overrides };
+}
 
 /**
  * A stateful Store Service double. It enforces the contracts the real service enforces — Phase 1B
@@ -88,6 +97,8 @@ function catalogService(options: Options = {}) {
     products: (options.products ?? [product()]).map((item) => JSON.parse(JSON.stringify(item)) as ProductDetail),
     policies: { [IDs.pack]: options.policy ? policyRecord() : null } as Record<string, StorePackPolicy | null>,
     barcodes: { [IDs.pack]: options.barcode ? [barcodeRecord()] : [] } as Record<string, Barcode[]>,
+    batches: { [IDs.pack]: options.batches ?? [] } as Record<string, BatchRecord[]>,
+    remainingBatchFailures: options.failBatches ?? 0,
     referenceCalls: 0,
     contextCalls: 0,
     remainingPolicyFailures: options.failPolicy ?? 0,
@@ -105,6 +116,22 @@ function catalogService(options: Options = {}) {
     const hasSku = typeof pack.skuCode === "string" && pack.skuCode.trim().length > 0;
     const hasStore = typeof pack.skuStoreId === "string" && pack.skuStoreId.length > 0;
     return hasSku === hasStore ? null : failure("validation_failed", 422, [{ field: "skuStoreId", message: "is required exactly when skuCode is present" }]);
+  };
+  // Phase 1C-C: the Store Service compares lot numbers case- and whitespace-insensitively, per Pack,
+  // and refuses an impossible date order or a non-positive MRP.
+  const batchError = (packId: string, batch: Record<string, unknown>, ignoreId: string | null) => {
+    const normalized = normalizeBatch(String(batch.batchNumber ?? ""));
+    if (!normalized) return failure("validation_failed", 422, [{ field: "batchNumber", message: "is required" }]);
+    if (batch.manufacturedOn && batch.expiresOn && String(batch.expiresOn) < String(batch.manufacturedOn)) {
+      return failure("validation_failed", 422, [{ field: "expiresOn", message: "must not be earlier than manufacturedOn" }]);
+    }
+    if (batch.mrpPaise !== null && batch.mrpPaise !== undefined && Number(batch.mrpPaise) <= 0) {
+      return failure("validation_failed", 422, [{ field: "mrpPaise", message: "must be a positive amount in paise" }]);
+    }
+    if ((state.batches[packId] ?? []).some((existing) => existing.id !== ignoreId && existing.status === "active" && existing.normalizedBatchNumber === normalized)) {
+      return failure("duplicate_conflict", 409);
+    }
+    return null;
   };
   // Phase 1C-B: the Store Service refuses composition on a non-medicine Product, a half-specified
   // denominator, a percentage that is not out of exactly 100, and a repeated ingredient/salt pair.
@@ -224,9 +251,32 @@ function catalogService(options: Options = {}) {
       return response(record);
     }
 
-    const packMatch = /^\/api\/v1\/packs\/([^/]+)(?:\/(archive|restore|policy|barcodes))?$/.exec(url.pathname);
+    const batchMatch = /^\/api\/v1\/batches\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
+    if (batchMatch) {
+      if (options.mutationError) return failure(options.mutationError, 409, [], { expectedRevision: 1, currentRevision: 2 });
+      const packId = Object.keys(state.batches).find((key) => state.batches[key].some((item) => item.id === batchMatch[1]))!;
+      const record = state.batches[packId].find((item) => item.id === batchMatch[1])!;
+      const conflict = revisionError(record.revision, body.expectedRevision); if (conflict) return conflict;
+      if (batchMatch[2]) record.status = batchMatch[2] === "archive" ? "archived" : "active";
+      else { const error = batchError(packId, body.batch, record.id); if (error) return error; Object.assign(record, body.batch, { normalizedBatchNumber: normalizeBatch(String(body.batch.batchNumber)) }); }
+      record.revision += 1;
+      return response(record);
+    }
+
+    const packMatch = /^\/api\/v1\/packs\/([^/]+)(?:\/(archive|restore|policy|barcodes|batches))?$/.exec(url.pathname);
     if (packMatch) {
       const packId = packMatch[1]; const action = packMatch[2];
+      if (action === "batches") {
+        if (method === "GET") {
+          if (state.remainingBatchFailures > 0) { state.remainingBatchFailures -= 1; return failure("internal_error", 500); }
+          return response(state.batches[packId] ?? []);
+        }
+        if (options.mutationError) return failure(options.mutationError, 409, [], { expectedRevision: 1, currentRevision: 2 });
+        const error = batchError(packId, body, null); if (error) return error;
+        const created: BatchRecord = { id: `${IDs.batch}-${(state.batches[packId] ?? []).length}`, productPackId: packId, manufacturedOn: null, expiresOn: null, mrpPaise: null, ...body, batchNumber: String(body.batchNumber).trim(), normalizedBatchNumber: normalizeBatch(String(body.batchNumber)), revision: 1, status: "active", ...stamp };
+        state.batches[packId] = [...(state.batches[packId] ?? []), created];
+        return response(created, 201);
+      }
       if (action === "policy") {
         if (method === "GET") {
           if (state.remainingPolicyFailures > 0) { state.remainingPolicyFailures -= 1; return failure("internal_error", 500); }
@@ -864,6 +914,147 @@ describe("Product Catalog UI", () => {
     renderApp(`/app/products/${IDs.product}`, catalogService({ role: "pharmacist" }));
     expect(await screen.findByRole("heading", { name: "Composition" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Add Component" })).not.toBeInTheDocument();
+  });
+
+  // ---- Phase 1C-C batches ----
+
+  it("shows an empty batch workspace and separates a batch query failure from it", async () => {
+    renderApp(`/app/products/${IDs.product}`);
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    expect(await screen.findByRole("heading", { name: "Batches" })).toBeInTheDocument();
+    expect(await screen.findByText("No batches recorded.")).toBeInTheDocument();
+    // The workspace states that a batch is not stock.
+    expect(screen.getByText(/No stock quantity is recorded here/)).toBeInTheDocument();
+    cleanup();
+
+    const failing = renderApp(`/app/products/${IDs.product}`, catalogService({ failBatches: 1, batches: [batchRecord()] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    const alert = await screen.findByText("Batches could not be loaded.");
+    expect(screen.queryByText("No batches recorded.")).not.toBeInTheDocument();
+    fireEvent.click(within(alert.closest("[role='alert']")!).getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("cell", { name: "AB-123" })).toBeInTheDocument();
+    expect(failing.state.remainingBatchFailures).toBe(0);
+  });
+
+  it("records a batch with exact paise and preserves the printed lot form", async () => {
+    const app = renderApp(`/app/products/${IDs.product}`);
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add Batch" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Batch" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /Batch \/ Lot number/ }), { target: { value: " ab-123 " } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /MRP/ }), { target: { value: "125.50" } });
+    // ₹125.50 is 12550 paise exactly — never a binary float.
+    expect(within(dialog).getByText("12550 paise")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      const [sent] = bodiesFor(app.fetchMock, (url, method) => /\/packs\/[^/]+\/batches$/.test(url) && method === "POST");
+      expect(sent).toMatchObject({ batchNumber: "ab-123", mrpPaise: 12550 });
+    });
+    expect(await screen.findByRole("cell", { name: "ab-123" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "₹125.50" })).toBeInTheDocument();
+  });
+
+  it("rejects an impossible date order and a malformed MRP before sending them", async () => {
+    const app = renderApp(`/app/products/${IDs.product}`);
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add Batch" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Batch" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /Batch \/ Lot number/ }), { target: { value: "LOT-1" } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /MRP/ }), { target: { value: "12.345" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByText(/at most two decimal places/)).toBeInTheDocument();
+    expect(bodiesFor(app.fetchMock, (url, method) => /\/batches$/.test(url) && method === "POST")).toHaveLength(0);
+
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /MRP/ }), { target: { value: "50" } });
+    fireEvent.change(within(dialog).getByLabelText(/Manufactured on/), { target: { value: "2027-05-01" } });
+    fireEvent.change(within(dialog).getByLabelText(/Expires on/), { target: { value: "2027-04-30" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByText(/Expiry cannot be earlier/)).toBeInTheDocument();
+    expect(bodiesFor(app.fetchMock, (url, method) => /\/batches$/.test(url) && method === "POST")).toHaveLength(0);
+  });
+
+  it("derives expiry state from the date rather than storing it", async () => {
+    const soon = new Date(); soon.setUTCDate(soon.getUTCDate() + 20);
+    const batches = [
+      batchRecord({ id: `${IDs.batch}-a`, batchNumber: "OLD-1", normalizedBatchNumber: "OLD-1", expiresOn: "2020-03-31" }),
+      batchRecord({ id: `${IDs.batch}-b`, batchNumber: "SOON-1", normalizedBatchNumber: "SOON-1", expiresOn: soon.toISOString().slice(0, 10) }),
+      batchRecord({ id: `${IDs.batch}-c`, batchNumber: "FAR-1", normalizedBatchNumber: "FAR-1", expiresOn: "2099-12-31" }),
+      batchRecord({ id: `${IDs.batch}-d`, batchNumber: "NONE-1", normalizedBatchNumber: "NONE-1", expiresOn: null })
+    ];
+    renderApp(`/app/products/${IDs.product}`, catalogService({ batches }));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    await screen.findByRole("cell", { name: /OLD-1/ });
+    const rowFor = (label: string) => screen.getAllByRole("row").find((row) => within(row).queryByText(label))!;
+    expect(within(rowFor("OLD-1")).getByText("Expired")).toBeInTheDocument();
+    expect(within(rowFor("SOON-1")).getByText("Expiring soon")).toBeInTheDocument();
+    expect(within(rowFor("FAR-1")).queryByText(/Expired|Expiring soon/)).not.toBeInTheDocument();
+    expect(within(rowFor("NONE-1")).getByText("Not recorded")).toBeInTheDocument();
+  });
+
+  it("edits, archives, and restores a batch and reloads a stale revision", async () => {
+    const app = renderApp(`/app/products/${IDs.product}`, catalogService({ batches: [batchRecord()] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    const batchRow = () => screen.getAllByRole("row").find((row) => within(row).queryByText("AB-123"))!;
+    await screen.findByRole("cell", { name: "AB-123" });
+    fireEvent.click(within(batchRow()).getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit Batch" });
+    await waitFor(() => expect(within(dialog).getByRole("textbox", { name: /MRP/ })).toHaveValue("125.50"));
+
+    // Another session saves first.
+    app.state.batches[IDs.pack][0].revision = 4;
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /MRP/ }), { target: { value: "130.00" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    const notice = await within(dialog).findByRole("alert");
+    expect(notice).toHaveTextContent("changed after you opened it");
+    expect(app.state.batches[IDs.pack][0].mrpPaise).toBe(12550);
+    fireEvent.click(within(notice).getByRole("button", { name: "Reload latest" }));
+    await waitFor(() => expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument());
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /MRP/ }), { target: { value: "130.00" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => { const sent = bodiesFor(app.fetchMock, (url, method) => /\/batches\/[^/]+$/.test(url) && method === "PUT"); expect(sent.at(-1).expectedRevision).toBe(4); });
+    await waitFor(() => expect(app.state.batches[IDs.pack][0].mrpPaise).toBe(13000));
+
+    fireEvent.click(within(batchRow()).getByRole("button", { name: "Archive" }));
+    fireEvent.change(await screen.findByRole("textbox", { name: /Reason/ }), { target: { value: "Lot withdrawn" } });
+    fireEvent.click(screen.getByRole("button", { name: "Archive record" }));
+    await waitFor(() => expect(app.state.batches[IDs.pack][0].status).toBe("archived"));
+    // Archive is never delete.
+    expect(app.state.batches[IDs.pack]).toHaveLength(1);
+    fireEvent.click(within(batchRow()).getByRole("button", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore record" }));
+    await waitFor(() => expect(app.state.batches[IDs.pack][0].status).toBe("active"));
+  });
+
+  it("refuses a duplicate lot on the same Pack without raw backend detail", async () => {
+    renderApp(`/app/products/${IDs.product}`, catalogService({ batches: [batchRecord()] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add Batch" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Batch" });
+    // Case and spacing must not create a second lot.
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /Batch \/ Lot number/ }), { target: { value: " ab - 123 " } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    const alert = await within(dialog).findByRole("alert", {}, { timeout: 3000 });
+    expect(alert).toHaveTextContent(/conflicting active record/i);
+    expect(alert).not.toHaveTextContent("raw backend detail");
+  });
+
+  it("hides batch mutations from pharmacist and cashier", async () => {
+    renderApp(`/app/products/${IDs.product}`, catalogService({ role: "cashier", batches: [batchRecord()] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
+    expect(await screen.findByRole("heading", { name: "Batches" })).toBeInTheDocument();
+    expect(await screen.findByRole("cell", { name: "AB-123" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Batch" })).not.toBeInTheDocument();
+  });
+
+  it("converts rupees to exact paise without binary floating point", () => {
+    expect(rupeesToPaise("125.50")).toBe(12550);
+    expect(rupeesToPaise("0.05")).toBe(5);
+    expect(rupeesToPaise("12.5")).toBe(1250);
+    expect(rupeesToPaise("12.345")).toBeNull();
+    expect(rupeesToPaise("0")).toBeNull();
+    expect(rupeesToPaise("-5")).toBeNull();
+    expect(paiseToRupees(12550)).toBe("125.50");
+    expect(paiseToRupees(5)).toBe("0.05");
   });
 
   it("uses exact integer quantity conversion without binary floating point", () => {

@@ -83,6 +83,7 @@ function safeErrorMessage(code?: string): string {
     case "barcode_conflict": return "This barcode is already assigned within the same scope.";
     case "default_pack_conflict": return "A default Pack must be enabled, and only one default is allowed for each purpose.";
     case "composition_conflict": return "This composition conflicts with the product kind or an ingredient already recorded.";
+    case "batch_conflict": return "This batch conflicts with the pack's current status.";
     case "validation_failed": return "Check the highlighted information and try again.";
     default: return "AUSHADHARTH could not complete that request. Try again.";
   }

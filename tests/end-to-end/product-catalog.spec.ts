@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const id = (suffix: string) => `01997000-0000-7000-8000-${suffix.padStart(12, "0")}`;
-const IDs = { product: id("1"), tablet: id("2"), strip: id("3"), box: id("4"), dosage: id("5"), brand: id("6"), company: id("7"), store: id("8"), pack: id("9"), pack2: id("10"), policy: id("11"), barcode: id("12"), paracetamol: id("13"), caffeine: id("14"), sodium: id("15"), mg: id("16"), component: id("17") };
+const IDs = { product: id("1"), tablet: id("2"), strip: id("3"), box: id("4"), dosage: id("5"), brand: id("6"), company: id("7"), store: id("8"), pack: id("9"), pack2: id("10"), policy: id("11"), barcode: id("12"), paracetamol: id("13"), caffeine: id("14"), sodium: id("15"), mg: id("16"), component: id("17"), batch2: id("18") };
 const stamp = { createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null };
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
 const references = {
@@ -26,7 +26,7 @@ function skuPairingViolation(pack: { skuCode?: unknown; skuStoreId?: unknown }) 
 const unprocessable = { status: 422, json: { code: "validation_failed", message: "validation failed", issues: [{ field: "skuStoreId", message: "is required exactly when skuCode is present" }] } };
 
 async function mockCatalogService(page: Page, options: { authenticated?: boolean; role?: "owner_admin" | "cashier"; empty?: boolean } = {}) {
-  const state = { authenticated: options.authenticated ?? true, role: options.role ?? "owner_admin", products: options.empty ? [] as ReturnType<typeof catalogProduct>[] : [catalogProduct()], policy: null as Record<string, unknown> | null, barcodes: [] as Record<string, unknown>[], referenceCalls: 0 };
+  const state = { authenticated: options.authenticated ?? true, role: options.role ?? "owner_admin", products: options.empty ? [] as ReturnType<typeof catalogProduct>[] : [catalogProduct()], policy: null as Record<string, unknown> | null, barcodes: [] as Record<string, unknown>[], batches: [] as Record<string, unknown>[], referenceCalls: 0 };
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request(); const url = new URL(request.url()); const method = request.method();
     const user = { id: id("100"), loginIdentifier: state.role, displayName: state.role === "cashier" ? "Store Cashier" : "Store Owner", role: state.role, revision: 1 };
@@ -46,6 +46,28 @@ async function mockCatalogService(page: Page, options: { authenticated?: boolean
     }
     const productMatch = /^\/api\/v1\/products\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
     if (productMatch) { const product = state.products[0]; if (method === "GET") return route.fulfill({ json: product }); product.status = productMatch[2] === "archive" ? "archived" : "active"; product.revision += 1; return route.fulfill({ json: product }); }
+    if (/\/packs\/[^/]+\/batches$/.test(url.pathname)) {
+      const packId = url.pathname.split("/")[4];
+      if (method === "GET") return route.fulfill({ json: state.batches.filter((item) => item.productPackId === packId) });
+      const body = request.postDataJSON();
+      const normalized = String(body.batchNumber).replace(/\s+/g, "").toUpperCase();
+      // Case and spacing never create a second lot on one Pack.
+      if (state.batches.some((item) => item.productPackId === packId && item.status === "active" && item.normalizedBatchNumber === normalized)) {
+        return route.fulfill({ status: 409, json: { code: "duplicate_conflict", message: "conflict", issues: [] } });
+      }
+      const batch = { id: `${IDs.batch2}-${state.batches.length}`, productPackId: packId, manufacturedOn: null, expiresOn: null, mrpPaise: null, ...body, batchNumber: String(body.batchNumber).trim(), normalizedBatchNumber: normalized, revision: 1, status: "active", ...stamp };
+      state.batches.push(batch);
+      return route.fulfill({ status: 201, json: batch });
+    }
+    const batchMatch = /^\/api\/v1\/batches\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
+    if (batchMatch) {
+      const batch = state.batches.find((item) => item.id === batchMatch[1])! as Record<string, unknown>;
+      const body = request.postDataJSON();
+      if (batchMatch[2]) batch.status = batchMatch[2] === "archive" ? "archived" : "active";
+      else Object.assign(batch, body.batch, { normalizedBatchNumber: String(body.batch.batchNumber).replace(/\s+/g, "").toUpperCase() });
+      batch.revision = (batch.revision as number) + 1;
+      return route.fulfill({ json: batch });
+    }
     if (/\/products\/[^/]+\/composition$/.test(url.pathname)) {
       const product = state.products[0];
       if (method === "GET") return route.fulfill({ json: product.composition });
@@ -157,6 +179,62 @@ test("owner records a single-ingredient composition and extends it to a combinat
   expect(state.products[0].composition).toHaveLength(2);
 });
 
+test("owner records, edits, archives, and restores a batch on a pack", async ({ page }) => {
+  const state = await mockCatalogService(page);
+  await page.goto(`/app/products/${IDs.product}`);
+  await page.getByRole("button", { name: "Manage" }).click();
+  await expect(page.getByRole("heading", { name: "Batches" })).toBeVisible();
+  await expect(page.getByText("No batches recorded.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Add Batch" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add Batch" });
+  await dialog.getByRole("textbox", { name: /Batch \/ Lot number/ }).fill(" ab-123 ");
+  await dialog.getByLabel("Expires on").fill("2029-12-31");
+  await dialog.getByRole("textbox", { name: /MRP/ }).fill("125.50");
+  // Money is stored as exact integer paise, never as a decimal fraction.
+  await expect(dialog.getByText("12550 paise")).toBeVisible();
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "ab-123" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "₹125.50" })).toBeVisible();
+  expect(state.batches[0]).toMatchObject({ batchNumber: "ab-123", normalizedBatchNumber: "AB-123", mrpPaise: 12550 });
+  // A batch is identity, never stock.
+  expect(state.batches[0]).not.toHaveProperty("quantityOnHand");
+
+  // Case and spacing must not create a second lot on the same Pack.
+  await page.getByRole("button", { name: "Add Batch" }).click();
+  const duplicate = page.getByRole("dialog", { name: "Add Batch" });
+  await duplicate.getByRole("textbox", { name: /Batch \/ Lot number/ }).fill(" Ab - 123 ");
+  await duplicate.getByRole("button", { name: "Save" }).click();
+  await expect(duplicate.getByRole("alert")).toContainText(/conflicting active record/i);
+  await page.keyboard.press("Escape");
+
+  const row = page.getByRole("row").filter({ hasText: "ab-123" });
+  await row.getByRole("button", { name: "Edit" }).click();
+  const editor = page.getByRole("dialog", { name: "Edit Batch" });
+  await editor.getByRole("textbox", { name: /MRP/ }).fill("130.00");
+  await editor.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "₹130.00" })).toBeVisible();
+  expect(state.batches[0].mrpPaise).toBe(13000);
+
+  await page.getByRole("row").filter({ hasText: "ab-123" }).getByRole("button", { name: "Archive" }).click();
+  await page.getByLabel("Reason").fill("Lot withdrawn");
+  await page.getByRole("button", { name: "Archive record" }).click();
+  await expect(page.getByRole("row").filter({ hasText: "ab-123" }).getByRole("button", { name: "Restore" })).toBeVisible();
+  // Archive is never delete.
+  expect(state.batches).toHaveLength(1);
+  await page.getByRole("row").filter({ hasText: "ab-123" }).getByRole("button", { name: "Restore" }).click();
+  await page.getByRole("button", { name: "Restore record" }).click();
+  await expect(page.getByRole("row").filter({ hasText: "ab-123" }).getByRole("button", { name: "Archive" })).toBeVisible();
+});
+
+test("a read-only role sees batches without any mutation control", async ({ page }) => {
+  await mockCatalogService(page, { role: "cashier" });
+  await page.goto(`/app/products/${IDs.product}`);
+  await page.getByRole("button", { name: "Manage" }).click();
+  await expect(page.getByRole("heading", { name: "Batches" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add Batch" })).toHaveCount(0);
+});
+
 test("a read-only role sees composition without any mutation control", async ({ page }) => {
   await mockCatalogService(page, { role: "cashier" });
   await page.goto(`/app/products/${IDs.product}`);
@@ -206,6 +284,21 @@ test("the Product catalog stays readable on a narrow viewport", async ({ page })
   const compositionLabels = await page.locator("table.data-table tbody td[data-label]").evaluateAll((cells) => cells.map((cell) => cell.getAttribute("data-label")));
   expect(compositionLabels).toContain("Ingredient");
   expect(compositionLabels).toContain("Strength");
+
+  // The Pack workspace adds the Batches table, the widest table on the page.
+  await page.getByRole("button", { name: "Manage" }).click();
+  await page.getByRole("button", { name: "Add Batch" }).click();
+  const batchDialog = page.getByRole("dialog", { name: "Add Batch" });
+  await batchDialog.getByRole("textbox", { name: /Batch \/ Lot number/ }).fill("AB-123");
+  await batchDialog.getByRole("textbox", { name: /MRP/ }).fill("125.50");
+  await batchDialog.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "AB-123" })).toBeVisible();
+  const batchOverflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(batchOverflow).toBeLessThanOrEqual(1);
+  const batchLabels = await page.locator("table.data-table tbody td[data-label]").evaluateAll((cells) => cells.map((cell) => cell.getAttribute("data-label")));
+  expect(batchLabels).toContain("Batch");
+  expect(batchLabels).toContain("Expiry");
+  expect(batchLabels).toContain("MRP");
 });
 
 test("unauthenticated Product route redirects while authenticated refresh remains protected", async ({ page }) => {

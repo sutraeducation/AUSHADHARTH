@@ -250,6 +250,13 @@ button, input { font: inherit; }
 .catalog-section > header h2 { margin: 0; font-size: .9rem; }
 .catalog-section > header p { margin: 4px 0 0; color: var(--ink-500); font-size: .67rem; }
 .catalog-inline-empty { padding: 22px 18px; color: var(--ink-500); font-size: .72rem; }
+.batch-workspace { padding: 15px; border-top: 1px solid var(--primary-100); background: white; }
+.batch-workspace > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.batch-workspace h3 { margin: 0; font-size: .76rem; }
+.batch-workspace > header p { margin: 3px 0 0; color: var(--ink-500); font-size: .65rem; }
+.expiry-chip { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: .6rem; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
+.expiry-chip--expired { color: var(--danger-700); background: var(--danger-100); }
+.expiry-chip--soon { color: #7a5312; background: #fdf0d8; }
 .catalog-inline-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 18px; padding: 12px 14px; border: 1px solid var(--danger-100); border-radius: 8px; background: #fff3f2; color: var(--danger-700); font-size: .7rem; }
 .catalog-inline-error .button { flex: none; }
 .reference-picker__error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; font-size: .62rem; }

@@ -113,6 +113,39 @@ pub fn normalize_barcode(
     Ok((namespace, normalized))
 }
 
+/// The largest MRP the schema accepts, in paise. Money is exact integer minor units per ADR-009.
+pub const MAX_MRP_PAISE: i64 = 100_000_000_000;
+
+/// Normalizes a manufacturer lot string for comparison while leaving the printed form to the caller.
+/// Whitespace is removed and letters uppercased, so case and spacing can never create a duplicate
+/// lot on one Pack.
+pub fn normalize_batch_number(value: &str) -> Result<(String, String), CatalogValidationIssue> {
+    let display = value.trim();
+    if display.is_empty() || display.chars().count() > 64 {
+        return Err(issue(
+            "batchNumber",
+            "is required and may not exceed 64 characters",
+        ));
+    }
+    let normalized = display
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || !normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+    {
+        return Err(issue(
+            "batchNumber",
+            "may contain only letters, digits, dot, underscore, slash, or hyphen",
+        ));
+    }
+    Ok((display.to_owned(), normalized))
+}
+
 pub fn validate_date(
     value: Option<&str>,
     field: &str,

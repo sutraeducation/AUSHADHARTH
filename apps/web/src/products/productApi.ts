@@ -1,5 +1,6 @@
 import {
   BarcodeSchema,
+  BatchSchema,
   CatalogContextSchema,
   CompositionComponentSchema,
   DuplicateCandidateSchema,
@@ -10,6 +11,8 @@ import {
   StorePackPolicySchema,
   type Barcode,
   type BarcodeLookup,
+  type Batch,
+  type BatchFields,
   type CompositionComponent,
   type CompositionComponentFields,
   type CreateProductRequest,
@@ -150,6 +153,48 @@ export async function changeBarcodeLifecycle(record: Barcode, action: "archive" 
     method: "POST",
     body: JSON.stringify({ expectedRevision: record.revision, reason })
   }));
+}
+
+export async function listBatches(packId: string): Promise<Batch[]> {
+  return BatchSchema.array().parse(await localServiceRequest(`/api/v1/packs/${encodeURIComponent(packId)}/batches`));
+}
+
+export async function createBatch(packId: string, batch: BatchFields): Promise<Batch> {
+  return BatchSchema.parse(await localServiceRequest(`/api/v1/packs/${packId}/batches`, {
+    method: "POST",
+    body: JSON.stringify(batch)
+  }));
+}
+
+export async function updateBatch(record: Batch, batch: BatchFields): Promise<Batch> {
+  return BatchSchema.parse(await localServiceRequest(`/api/v1/batches/${record.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: record.revision, batch })
+  }));
+}
+
+export async function changeBatchLifecycle(record: Batch, action: "archive" | "restore", reason: string): Promise<Batch> {
+  return BatchSchema.parse(await localServiceRequest(`/api/v1/batches/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+/**
+ * Rupees to exact integer paise using string arithmetic. `12.5` never becomes a binary float, and
+ * anything beyond two decimal places is rejected rather than silently rounded.
+ */
+export function rupeesToPaise(value: string): number | null {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(value.trim());
+  if (!match) return null;
+  const paise = Number.parseInt(`${match[1]}${(match[2] ?? "").padEnd(2, "0")}`, 10);
+  return Number.isSafeInteger(paise) && paise > 0 ? paise : null;
+}
+
+export function paiseToRupees(paise: number): string {
+  const sign = paise < 0 ? "-" : "";
+  const absolute = Math.abs(paise);
+  return `${sign}${Math.floor(absolute / 100)}.${String(absolute % 100).padStart(2, "0")}`;
 }
 
 export async function listComposition(productId: string): Promise<CompositionComponent[]> {

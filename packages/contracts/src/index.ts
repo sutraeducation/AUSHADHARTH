@@ -372,6 +372,36 @@ export const UpdateCompositionComponentRequestSchema = z.object({
   reason: z.string().nullable().optional()
 });
 
+/**
+ * One manufactured lot of one Product Pack. Identity and commercial metadata only — a batch carries
+ * no quantity, balance, or stock figure, and recording one is never a stock receipt.
+ * `mrpPaise` is exact integer minor units per ADR-009; binary floating-point money is never used.
+ */
+export const BatchFieldsSchema = z.object({
+  batchNumber: z.string(),
+  manufacturedOn: z.string().nullable().optional(),
+  expiresOn: z.string().nullable().optional(),
+  mrpPaise: z.number().int().positive().nullable().optional()
+});
+
+export const BatchSchema = BatchFieldsSchema.extend({
+  id: z.string(),
+  productPackId: z.string(),
+  normalizedBatchNumber: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const UpdateBatchRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  batch: BatchFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
 export const ProductDetailSchema = ProductSchema.extend({
   companyRoles: z.array(ProductCompanyRoleSchema),
   packs: z.array(ProductPackSchema),
@@ -443,6 +473,7 @@ export const CatalogErrorResponseSchema = z.object({
     "barcode_conflict",
     "default_pack_conflict",
     "composition_conflict",
+    "batch_conflict",
     "authentication_required",
     "session_expired",
     "authorization_denied",
@@ -463,6 +494,8 @@ export type ProductCompanyRoleFields = z.infer<typeof ProductCompanyRoleFieldsSc
 export type ProductPack = z.infer<typeof ProductPackSchema>;
 export type ProductPackFields = z.infer<typeof ProductPackFieldsSchema>;
 export type StorePackPolicy = z.infer<typeof StorePackPolicySchema>;
+export type Batch = z.infer<typeof BatchSchema>;
+export type BatchFields = z.infer<typeof BatchFieldsSchema>;
 export type CompositionComponent = z.infer<typeof CompositionComponentSchema>;
 export type CompositionComponentFields = z.infer<typeof CompositionComponentFieldsSchema>;
 export type StorePackPolicyFields = z.infer<typeof StorePackPolicyFieldsSchema>;
