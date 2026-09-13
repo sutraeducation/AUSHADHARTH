@@ -525,7 +525,15 @@ async fn required_session(
         return Err(AuthError::SessionExpired);
     }
     let _write_guard = AUTH_WRITE_LOCK.lock().await;
-    sqlx::query("UPDATE user_sessions SET last_seen_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE token_hash=?")
+    // A session's created_at_utc comes from the high-resolution Rust clock while this touch reads
+    // SQLite's, which on Windows can lag it by up to a timer tick. Taking the later of the two keeps
+    // last_seen_at_utc monotonic and can never violate the frozen
+    // `last_seen_at_utc >= created_at_utc` check, which would otherwise fail the first mutation
+    // performed immediately after signing in.
+    sqlx::query(
+        "UPDATE user_sessions SET last_seen_at_utc=max(strftime('%Y-%m-%dT%H:%M:%fZ','now'),last_seen_at_utc) \
+         WHERE token_hash=?",
+    )
         .bind(sha256_hex(token.as_bytes())).execute(pool).await.map_err(map_database_error)?;
     Ok(record)
 }
@@ -1954,5 +1962,60 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(owner_count, 0);
+    }
+
+    /// The session touch must never violate `last_seen_at_utc >= created_at_utc`.
+    ///
+    /// `created_at_utc` is written from the high-resolution Rust clock while the touch reads
+    /// SQLite's, which on Windows can lag by up to a timer tick — so a mutation performed within
+    /// milliseconds of signing in could fail with an opaque internal error. A session created ahead
+    /// of SQLite's clock reproduces that deterministically.
+    #[tokio::test]
+    async fn touching_a_session_never_moves_last_seen_before_its_creation() {
+        let (_temp, pool) = test_pool().await;
+        let (status, headers, body) = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/setup",
+            setup_body(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let cookie = session_cookie(&headers);
+
+        // Push the session's creation instant ahead of SQLite's clock, as a fast Rust clock does.
+        sqlx::query(
+            "UPDATE user_sessions SET created_at_utc='2099-01-01T00:00:00.000Z',\
+             last_seen_at_utc='2099-01-01T00:00:00.000Z',expires_at_utc='2099-06-01T00:00:00.000Z'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, _, session) = request(
+            pool.clone(),
+            "GET",
+            "/api/v1/auth/session",
+            Value::Null,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+
+        let last_seen: String =
+            sqlx::query_scalar("SELECT last_seen_at_utc FROM user_sessions LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let created: String =
+            sqlx::query_scalar("SELECT created_at_utc FROM user_sessions LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            last_seen >= created,
+            "last_seen {last_seen} moved before created {created}"
+        );
     }
 }
