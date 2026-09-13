@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 import type {
   Barcode,
+  CompositionComponent,
+  CompositionComponentFields,
   CreateProductRequest,
   Product,
   ProductCompanyRole,
@@ -24,11 +26,13 @@ import {
   atomsToQuantity,
   changeBarcodeLifecycle,
   changeCompanyRoleLifecycle,
+  changeComponentLifecycle,
   changePackPolicyLifecycle,
   changePackLifecycle,
   changeProductLifecycle,
   createBarcode,
   createCompanyRole,
+  createComponent,
   createPack,
   createProduct,
   findDuplicateCandidates,
@@ -40,6 +44,7 @@ import {
   quantityToAtoms,
   savePackPolicy,
   updateCompanyRole,
+  updateComponent,
   updatePack,
   updateProduct,
   type CatalogStatusFilter
@@ -255,30 +260,35 @@ export function ProductDetailPage() {
     <CatalogSection title="Company Roles" description="A Product may have multiple manufacturers, marketers, brand owners, and importers." action={canMutate && record.status === "active" ? <button className="button button--secondary" type="button" onClick={() => setDialog({ kind: "role" })}>Add Company Role</button> : undefined}>
       <RoleTable roles={record.companyRoles} companies={references.data?.companies} referenceState={refState} canMutate={canMutate} onEdit={(role) => setDialog({ kind: "role", roleId: role.id })} onLifecycle={(role) => setDialog({ kind: "role-lifecycle", roleId: role.id })} />
     </CatalogSection>
+    {record.productKind === "medicine" && <CatalogSection title="Composition" description="Manufacturer-stated ingredients and strengths. This is catalog identity only and implies no clinical, generic, or substitution equivalence." action={canMutate && record.status === "active" ? <button className="button button--secondary" type="button" onClick={() => setDialog({ kind: "component" })}>Add Component</button> : undefined}>
+      <CompositionTable product={record} canMutate={canMutate} onEdit={(component) => setDialog({ kind: "component", componentId: component.id })} onLifecycle={(component) => setDialog({ kind: "component-lifecycle", componentId: component.id })} />
+    </CatalogSection>}
     <CatalogSection title="Packs & SKUs" description={`Conversions are authoritative in ${unit} units; no stock quantities are stored here.`} action={canMutate && record.status === "active" ? <button className="button button--secondary" type="button" onClick={() => setDialog({ kind: "pack" })}>Add Pack</button> : undefined}>
       <PackTable product={record} units={references.data?.units} referenceState={refState} canMutate={canMutate} managedPackId={managedPackId} onManage={setManagedPackId} onEdit={(pack) => setDialog({ kind: "pack", packId: pack.id })} onLifecycle={(pack) => setDialog({ kind: "pack-lifecycle", packId: pack.id })} />
       {managedPackId && <PackWorkspace product={record} pack={record.packs.find((pack) => pack.id === managedPackId)!} canMutate={canMutate} onPolicy={() => setDialog({ kind: "policy", packId: managedPackId })} onBarcode={() => setDialog({ kind: "barcode", packId: managedPackId })} onRefresh={refresh} />}
     </CatalogSection>
     {dialog?.kind === "role" && <RoleDialog product={record} roleId={dialog.roleId} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
     {dialog?.kind === "pack" && <PackDialog product={record} packId={dialog.packId} units={references.data?.units} referenceState={refState} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
+    {dialog?.kind === "component" && <ComponentDialog product={record} componentId={dialog.componentId} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
     {dialog?.kind === "policy" && <PolicyDialog product={record} packId={dialog.packId} onClose={() => setDialog(null)} onSaved={() => { const packId = dialog.packId; setDialog(null); void queryClient.invalidateQueries({ queryKey: ["pack-policy", packId] }); void refresh(); }} />}
     {dialog?.kind === "barcode" && <BarcodeDialog packId={dialog.packId} onClose={() => setDialog(null)} onSaved={() => { const packId = dialog.packId; setDialog(null); void queryClient.invalidateQueries({ queryKey: ["pack-barcodes", packId] }); void refresh(); }} />}
     {isLifecycleDialog(dialog) && <LifecycleDialog state={dialog} target={lifecycleTarget(dialog, record)} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); void refresh(); }} onReload={reloadProduct} />}
   </>;
 }
 
-type DialogState = { kind: "role"; roleId?: string } | { kind: "pack"; packId?: string } | { kind: "policy" | "barcode"; packId: string } | LifecycleState | null;
-type LifecycleState = { kind: "product-lifecycle" } | { kind: "role-lifecycle"; roleId: string } | { kind: "pack-lifecycle"; packId: string };
-type LifecycleTarget = Product | ProductCompanyRole | ProductPack;
+type DialogState = { kind: "role"; roleId?: string } | { kind: "pack"; packId?: string } | { kind: "component"; componentId?: string } | { kind: "policy" | "barcode"; packId: string } | LifecycleState | null;
+type LifecycleState = { kind: "product-lifecycle" } | { kind: "role-lifecycle"; roleId: string } | { kind: "pack-lifecycle"; packId: string } | { kind: "component-lifecycle"; componentId: string };
+type LifecycleTarget = Product | ProductCompanyRole | ProductPack | CompositionComponent;
 
 function isLifecycleDialog(state: DialogState): state is LifecycleState {
-  return state !== null && ["product-lifecycle", "role-lifecycle", "pack-lifecycle"].includes(state.kind);
+  return state !== null && ["product-lifecycle", "role-lifecycle", "pack-lifecycle", "component-lifecycle"].includes(state.kind);
 }
 // Resolved from the live Product query on every render, so a reloaded record immediately supplies
 // the revision the next lifecycle attempt sends.
 function lifecycleTarget(state: LifecycleState, product: ProductDetail): LifecycleTarget | undefined {
   if (state.kind === "product-lifecycle") return product;
   if (state.kind === "role-lifecycle") return product.companyRoles.find((role) => role.id === state.roleId);
+  if (state.kind === "component-lifecycle") return product.composition.find((item) => item.id === state.componentId);
   return product.packs.find((pack) => pack.id === state.packId);
 }
 
@@ -290,6 +300,67 @@ function RoleTable({ roles, companies, referenceState, canMutate, onEdit, onLife
 function PackTable({ product, units, referenceState, canMutate, managedPackId, onManage, onEdit, onLifecycle }: { product: ProductDetail; units: ReferenceMasterResponse[] | undefined; referenceState: ReferenceState; canMutate: boolean; managedPackId: string | null; onManage: (id: string | null) => void; onEdit: (pack: ProductPack) => void; onLifecycle: (pack: ProductPack) => void }) {
   if (!product.packs.length) return <InlineEmpty text="No Packs configured." />;
   return <div className="table-scroll"><table className="data-table"><thead><tr><th scope="col">Pack</th><th scope="col">Contains</th><th scope="col">Containment</th><th scope="col">SKU</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead><tbody>{product.packs.map((pack) => { const child = product.packs.find((item) => item.id === pack.containedPackId); return <tr key={pack.id}><td data-label="Pack">{pack.displayLabel || referenceName(units, pack.containerUnitId, referenceState)}</td><td data-label="Contains">{atomsToQuantity(pack.baseQuantityAtoms, product.quantityScale)} {referenceName(units, product.baseUnitId, referenceState)}</td><td data-label="Containment">{child ? `${pack.containedPackCount} × ${child.displayLabel || referenceName(units, child.containerUnitId, referenceState)}` : "Direct"}</td><td data-label="SKU">{pack.skuCode || "—"}</td><td data-label="Status"><Status value={pack.status} /></td><td className="row-actions"><div><button type="button" onClick={() => onManage(managedPackId === pack.id ? null : pack.id)}>{managedPackId === pack.id ? "Close management" : "Manage"}</button>{canMutate && pack.status === "active" && <button type="button" onClick={() => onEdit(pack)}>Edit</button>}{canMutate && <button type="button" onClick={() => onLifecycle(pack)}>{pack.status === "active" ? "Archive" : "Restore"}</button>}</div></td></tr>; })}</tbody></table></div>;
+}
+
+function CompositionTable({ product, canMutate, onEdit, onLifecycle }: { product: ProductDetail; canMutate: boolean; onEdit: (component: CompositionComponent) => void; onLifecycle: (component: CompositionComponent) => void }) {
+  const references = useCompositionReferences();
+  const refState = referenceState(references);
+  if (!product.composition.length) return <>{references.isError && <InlineQueryError label="Ingredient and strength names could not be loaded." onRetry={() => void references.refetch()} />}<InlineEmpty text="No composition recorded." /></>;
+  return <>{references.isError && <InlineQueryError label="Ingredient and strength names could not be loaded." onRetry={() => void references.refetch()} />}
+    <div className="table-scroll"><table className="data-table"><thead><tr><th scope="col">Ingredient</th><th scope="col">Salt / Form</th><th scope="col">Strength</th><th scope="col">Role</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead><tbody>{product.composition.map((component) => <tr key={component.id}><td data-label="Ingredient">{referenceName(references.data?.ingredients, component.ingredientId, refState)}</td><td data-label="Salt / Form">{referenceName(references.data?.saltForms, component.saltFormId, refState)}</td><td data-label="Strength">{strengthText(component, references.data?.strengthUnits, refState)}</td><td data-label="Role">{component.componentRole === "active" ? "Active" : "Inactive"}</td><td data-label="Order">{component.displayOrder}</td><td data-label="Status"><Status value={component.status} /></td><td className="row-actions"><div>{canMutate && component.status === "active" && <button type="button" onClick={() => onEdit(component)}>Edit</button>}{canMutate && <button type="button" onClick={() => onLifecycle(component)}>{component.status === "active" ? "Archive" : "Restore"}</button>}</div></td></tr>)}</tbody></table></div></>;
+}
+
+function ComponentDialog({ product, componentId, onClose, onSaved, onReload }: { product: ProductDetail; componentId?: string; onClose: () => void; onSaved: () => void; onReload: ReloadProduct }) {
+  const record = componentId ? product.composition.find((item) => item.id === componentId) : undefined;
+  const references = useCompositionReferences();
+  const [values, setValues] = useState(() => componentValues(record));
+  const [error, setError] = useState<string | null>(null);
+  const units = references.data?.strengthUnits ?? [];
+  const numeratorUnit = units.find((item) => item.id === values.numeratorUnitId);
+  const denominatorUnit = units.find((item) => item.id === values.denominatorUnitId);
+  const preview = previewStrength(values, numeratorUnit, denominatorUnit);
+  const mutation = useMutation({
+    mutationFn: () => {
+      const fields = componentFields(values, numeratorUnit, denominatorUnit);
+      if (!fields) throw new Error("Enter an exact strength using the precision the unit allows.");
+      return record ? updateComponent(record, fields) : createComponent(product.id, fields);
+    },
+    onSuccess: onSaved,
+    onError: (caught) => setError(caught instanceof LocalServiceError ? caught.message : caught instanceof Error ? caught.message : "The component could not be saved.")
+  });
+  const reload = useReloadLatest(async () => {
+    const latest = await onReload();
+    const component = componentId && latest ? latest.composition.find((item) => item.id === componentId) : undefined;
+    if (!latest || (componentId && !component)) { setError("The latest version of this component could not be loaded. Cancel and reopen it."); return; }
+    setValues(componentValues(component)); setError(null); mutation.reset();
+  });
+  const submit = (event: FormEvent) => {
+    event.preventDefault(); setError(null);
+    if (!values.ingredientId) { setError("Select an Ingredient."); return; }
+    if (!values.numeratorUnitId) { setError("Select a strength unit."); return; }
+    if (values.percentage && !values.denominatorUnitId) { setError("A percentage strength needs the unit it is measured against."); return; }
+    mutation.mutate();
+  };
+  return <CatalogDialog title={record ? "Edit Component" : "Add Component"} description="Ingredient identity and manufacturer-stated strength only. No clinical or substitution meaning is recorded." onClose={onClose}><form className="master-form" onSubmit={submit}>
+    <ReferencePicker label="Ingredient" kind="ingredients" value={values.ingredientId} onChange={(ingredientId) => setValues({ ...values, ingredientId })} />
+    <ReferencePicker label="Salt / Form" kind="salt-forms" value={values.saltFormId} onChange={(saltFormId) => setValues({ ...values, saltFormId })} optional />
+    <SelectField label="Component role" name="componentRole" value={values.componentRole} onChange={(value) => setValues({ ...values, componentRole: value as CompositionComponentFields["componentRole"] })} options={[["active", "Active ingredient"], ["inactive", "Inactive ingredient"]]} />
+    <TextField label="Strength" name="strengthNumerator" value={values.numerator} onChange={(numerator) => setValues({ ...values, numerator })} required hint={numeratorUnit ? `Up to ${strengthUnitScale(numeratorUnit)} decimal places.` : undefined} />
+    <StrengthUnitField label="Strength unit" name="strengthNumeratorUnit" value={values.numeratorUnitId} units={units} state={referenceState(references)} onChange={(numeratorUnitId) => setValues({ ...values, numeratorUnitId })} />
+    <label className="check-field catalog-span"><input type="checkbox" checked={values.percentage} onChange={(event) => setValues({ ...values, percentage: event.target.checked, denominator: event.target.checked ? "100" : values.denominator })} /> <span>Percentage strength<small>Stored exactly as a ratio out of 100, never as a decimal fraction.</small></span></label>
+    <TextField label="Per quantity (optional)" name="strengthDenominator" value={values.denominator} onChange={(denominator) => setValues({ ...values, denominator })} hint={values.percentage ? "A percentage is always per exactly 100." : "Leave blank for a strength per one base unit."} />
+    <StrengthUnitField label="Per unit" name="strengthDenominatorUnit" value={values.denominatorUnitId} units={units} state={referenceState(references)} optional onChange={(denominatorUnitId) => setValues({ ...values, denominatorUnitId })} />
+    <TextField label="Order" name="displayOrder" type="number" value={values.displayOrder} onChange={(displayOrder) => setValues({ ...values, displayOrder })} hint="Controls the sequence shown for combination medicines." />
+    <div className="field catalog-span"><span className="field-label">Will be recorded as</span><strong>{preview}</strong><small>Generated from the stored values, so the display can never disagree with the data.</small></div>
+    {references.isError && <InlineQueryError label="Ingredient and strength references could not be loaded." onRetry={() => void references.refetch()} />}
+    {error && <div className="inline-notice inline-notice--error" role="alert">{isRevisionConflict(mutation.error) ? STALE_RECORD_MESSAGE : error}{isRevisionConflict(mutation.error) && <button type="button" onClick={() => void reload.run()} disabled={reload.pending}>{reload.pending ? "Reloading…" : "Reload latest"}</button>}</div>}
+    <DialogActions onClose={onClose} pending={mutation.isPending || references.isPending} />
+  </form></CatalogDialog>;
+}
+
+function StrengthUnitField({ label, name, value, units, state, optional = false, onChange }: { label: string; name: string; value: string; units: ReferenceMasterResponse[]; state: ReferenceState; optional?: boolean; onChange: (value: string) => void }) {
+  const id = `catalog-${name}`;
+  return <div className="field"><label htmlFor={id}>{label}{!optional && <span aria-hidden="true"> *</span>}</label><select id={id} name={name} value={value} onChange={(event) => onChange(event.target.value)} disabled={state === "pending"}><option value="">{state === "pending" ? "Loading…" : state === "error" ? "Units unavailable" : optional ? "Not applicable" : "Select a unit"}</option>{units.map((unit) => <option key={unit.id} value={unit.id}>{referencePrimaryName(unit)}</option>)}</select></div>;
 }
 
 function PackWorkspace({ product, pack, canMutate, onPolicy, onBarcode, onRefresh }: { product: ProductDetail; pack: ProductPack; canMutate: boolean; onPolicy: () => void; onBarcode: () => void; onRefresh: () => void }) {
@@ -381,7 +452,7 @@ function BarcodeDialog({ packId, onClose, onSaved }: { packId: string; onClose: 
 
 function LifecycleDialog({ state, target, onClose, onSaved, onReload }: { state: LifecycleState; target: LifecycleTarget | undefined; onClose: () => void; onSaved: () => void; onReload: ReloadProduct }) {
   const active = target?.status === "active"; const action = active ? "archive" : "restore"; const [reason, setReason] = useState(active ? "" : "Required again"); const [staleNotice, setStaleNotice] = useState<string | null>(null);
-  const mutation = useMutation<unknown, Error, void>({ mutationFn: () => { if (!target) throw new Error("This record is no longer available."); return state.kind === "product-lifecycle" ? changeProductLifecycle(target as Product, action, reason) : state.kind === "role-lifecycle" ? changeCompanyRoleLifecycle(target as ProductCompanyRole, action, reason) : changePackLifecycle(target as ProductPack, action, reason); }, onSuccess: onSaved });
+  const mutation = useMutation<unknown, Error, void>({ mutationFn: () => { if (!target) throw new Error("This record is no longer available."); return state.kind === "product-lifecycle" ? changeProductLifecycle(target as Product, action, reason) : state.kind === "role-lifecycle" ? changeCompanyRoleLifecycle(target as ProductCompanyRole, action, reason) : state.kind === "component-lifecycle" ? changeComponentLifecycle(target as CompositionComponent, action, reason) : changePackLifecycle(target as ProductPack, action, reason); }, onSuccess: onSaved });
   // The lifecycle target is derived from the Product query on every render, so awaiting the refetch
   // is enough to arm the next attempt with the current revision rather than the stale one.
   const reload = useReloadLatest(async () => {
@@ -401,6 +472,104 @@ function useCatalogContext() {
   return useQuery({ queryKey: ["catalog-context"], queryFn: getCatalogContext, retry: false });
 }
 
+// Loaded only where composition is shown, so the Product list never pays for it.
+function useCompositionReferences() {
+  return useQuery({ queryKey: ["catalog", "composition-references"], queryFn: async () => { const [ingredients, saltForms, strengthUnits] = await Promise.all([listReferences("ingredients", "", "active"), listReferences("salt-forms", "", "active"), listReferences("strength-units", "", "active")]); return { ingredients, saltForms, strengthUnits }; }, staleTime: 30_000, retry: false });
+}
+
+type ComponentValues = { ingredientId: string; saltFormId: string; componentRole: CompositionComponentFields["componentRole"]; numerator: string; numeratorUnitId: string; denominator: string; denominatorUnitId: string; percentage: boolean; displayOrder: string };
+
+function strengthUnitScale(unit: ReferenceMasterResponse | undefined) { return Number((unit?.attributes as Record<string, unknown> | undefined)?.allowedScale ?? 0); }
+function strengthUnitDimension(unit: ReferenceMasterResponse | undefined) { return String((unit?.attributes as Record<string, unknown> | undefined)?.dimension ?? ""); }
+
+/**
+ * Parses a typed strength into exact integer atoms plus the scale the operator actually used. The
+ * arithmetic is string-based, so no binary floating-point value is ever produced or submitted.
+ */
+function parseStrength(value: string, maxScale: number): { atoms: number; scale: number } | null {
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!match) return null;
+  const decimals = match[2] ?? "";
+  if (decimals.length > maxScale) return null;
+  const atoms = Number.parseInt(`${match[1]}${decimals}`, 10);
+  return Number.isSafeInteger(atoms) && atoms > 0 ? { atoms, scale: decimals.length } : null;
+}
+
+/** w/w, w/v, v/v is derived from the unit dimensions, never stored, so it cannot disagree. */
+function ratioSuffix(numerator: string, denominator: string) {
+  if (numerator === "mass" && denominator === "mass") return "w/w";
+  if (numerator === "mass" && denominator === "volume") return "w/v";
+  if (numerator === "volume" && denominator === "volume") return "v/v";
+  return "";
+}
+
+function unitCode(unit: ReferenceMasterResponse | undefined) { return unit ? String((unit.attributes as Record<string, unknown>).canonicalCode ?? referencePrimaryName(unit)) : ""; }
+
+function strengthText(component: CompositionComponent, units: ReferenceMasterResponse[] | undefined, state: ReferenceState) {
+  if (!units) return state === "error" ? "Strength unavailable" : "Loading…";
+  const numeratorUnit = units.find((unit) => unit.id === component.strengthNumeratorUnitId);
+  const denominatorUnit = units.find((unit) => unit.id === component.strengthDenominatorUnitId);
+  const numerator = atomsToQuantity(component.strengthNumeratorAtoms, component.strengthNumeratorScale);
+  if (component.strengthPresentation === "percentage") {
+    const suffix = ratioSuffix(strengthUnitDimension(numeratorUnit), strengthUnitDimension(denominatorUnit));
+    return `${numerator}%${suffix ? ` ${suffix}` : ""}`;
+  }
+  const base = `${numerator} ${unitCode(numeratorUnit)}`.trim();
+  if (component.strengthDenominatorAtoms === null || component.strengthDenominatorAtoms === undefined) return base;
+  return `${base} / ${atomsToQuantity(component.strengthDenominatorAtoms, component.strengthDenominatorScale ?? 0)} ${unitCode(denominatorUnit)}`.trim();
+}
+
+function componentValues(record: CompositionComponent | undefined): ComponentValues {
+  return {
+    ingredientId: record?.ingredientId ?? "",
+    saltFormId: record?.saltFormId ?? "",
+    componentRole: record?.componentRole ?? "active",
+    numerator: record ? atomsToQuantity(record.strengthNumeratorAtoms, record.strengthNumeratorScale) : "",
+    numeratorUnitId: record?.strengthNumeratorUnitId ?? "",
+    denominator: record?.strengthDenominatorAtoms != null ? atomsToQuantity(record.strengthDenominatorAtoms, record.strengthDenominatorScale ?? 0) : "",
+    denominatorUnitId: record?.strengthDenominatorUnitId ?? "",
+    percentage: record?.strengthPresentation === "percentage",
+    displayOrder: record ? String(record.displayOrder) : ""
+  };
+}
+
+function componentFields(values: ComponentValues, numeratorUnit: ReferenceMasterResponse | undefined, denominatorUnit: ReferenceMasterResponse | undefined): CompositionComponentFields | null {
+  const numerator = parseStrength(values.numerator, strengthUnitScale(numeratorUnit));
+  if (!numerator) return null;
+  const wantsDenominator = values.percentage || Boolean(values.denominator.trim()) || Boolean(values.denominatorUnitId);
+  let denominator: { atoms: number; scale: number } | null = null;
+  if (wantsDenominator) {
+    denominator = values.percentage ? { atoms: 100, scale: 0 } : parseStrength(values.denominator, strengthUnitScale(denominatorUnit));
+    if (!denominator || !values.denominatorUnitId) return null;
+  }
+  const order = values.displayOrder.trim();
+  return {
+    ingredientId: values.ingredientId,
+    saltFormId: values.saltFormId || null,
+    componentRole: values.componentRole,
+    displayOrder: order === "" ? null : Number(order),
+    strengthPresentation: values.percentage ? "percentage" : "absolute",
+    strengthNumeratorAtoms: numerator.atoms,
+    strengthNumeratorScale: numerator.scale,
+    strengthNumeratorUnitId: values.numeratorUnitId,
+    strengthDenominatorAtoms: denominator?.atoms ?? null,
+    strengthDenominatorScale: denominator?.scale ?? null,
+    strengthDenominatorUnitId: denominator ? values.denominatorUnitId : null
+  };
+}
+
+function previewStrength(values: ComponentValues, numeratorUnit: ReferenceMasterResponse | undefined, denominatorUnit: ReferenceMasterResponse | undefined) {
+  const numerator = parseStrength(values.numerator, strengthUnitScale(numeratorUnit));
+  if (!numerator || !numeratorUnit) return "—";
+  if (values.percentage) {
+    const suffix = ratioSuffix(strengthUnitDimension(numeratorUnit), strengthUnitDimension(denominatorUnit));
+    return `${values.numerator.trim()}%${suffix ? ` ${suffix}` : ""}`;
+  }
+  const base = `${values.numerator.trim()} ${unitCode(numeratorUnit)}`;
+  if (!values.denominator.trim() || !denominatorUnit) return base;
+  return `${base} / ${values.denominator.trim()} ${unitCode(denominatorUnit)}`;
+}
+
 // Serialises an awaited authoritative refetch so "Reload latest" can report progress and can never
 // be issued twice concurrently.
 function useReloadLatest(reload: () => Promise<void>) {
@@ -409,7 +578,7 @@ function useReloadLatest(reload: () => Promise<void>) {
 }
 
 function ReferencePicker({ label, kind, value, onChange, optional = false, error }: { label: string; kind: ReferenceKind; value: string; onChange: (value: string, record?: ReferenceMasterResponse) => void; optional?: boolean; error?: string }) {
-  const [search, setSearch] = useState(""); const debounced = useDebouncedValue(search, 250); const query = useQuery({ queryKey: ["reference-picker", kind, debounced], queryFn: () => listReferences(kind, debounced, "active"), retry: false }); const id = `catalog-${label.toLowerCase().replace(/\W+/g, "-")}`; const fieldName = ({ Brand: "brandId", "Dosage Form": "dosageFormId", "Base Unit": "baseUnitId", "Pack Unit": "initialPackUnitId", Company: "companyId" } as Record<string, string>)[label] ?? label.replace(/\s+/g, "").replace(/^./, (letter) => letter.toLowerCase());
+  const [search, setSearch] = useState(""); const debounced = useDebouncedValue(search, 250); const query = useQuery({ queryKey: ["reference-picker", kind, debounced], queryFn: () => listReferences(kind, debounced, "active"), retry: false }); const id = `catalog-${label.toLowerCase().replace(/\W+/g, "-")}`; const fieldName = ({ Brand: "brandId", "Dosage Form": "dosageFormId", "Base Unit": "baseUnitId", "Pack Unit": "initialPackUnitId", Company: "companyId", Ingredient: "ingredientId", "Salt / Form": "saltFormId" } as Record<string, string>)[label] ?? label.replace(/\s+/g, "").replace(/^./, (letter) => letter.toLowerCase());
   return <div className="field reference-picker"><label htmlFor={`${id}-search`}>Search {label}</label><input id={`${id}-search`} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={`Type to filter ${label.toLowerCase()}`} /><label htmlFor={id}>{label}{!optional && <span aria-hidden="true"> *</span>}</label><select id={id} name={fieldName} value={value} onChange={(event) => onChange(event.target.value, query.data?.find((item) => item.id === event.target.value))} aria-invalid={Boolean(error)} disabled={query.isPending}><option value="">{query.isPending ? "Loading…" : query.isError ? `${label} options unavailable` : optional ? `No ${label.toLowerCase()} selected` : `Select ${label}`}</option>{query.data?.map((item) => <option key={item.id} value={item.id}>{referencePrimaryName(item)}</option>)}</select>{query.isError && <span className="field-error reference-picker__error" role="alert">Options could not be loaded.<button type="button" onClick={() => void query.refetch()}>Retry {label}</button></span>}{!query.isPending && !query.isError && query.data?.length === 0 && <small>No matching options.</small>}{error && <small className="field-error">{error}</small>}</div>;
 }
 

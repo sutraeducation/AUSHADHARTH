@@ -1,17 +1,20 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const id = (suffix: string) => `01997000-0000-7000-8000-${suffix.padStart(12, "0")}`;
-const IDs = { product: id("1"), tablet: id("2"), strip: id("3"), box: id("4"), dosage: id("5"), brand: id("6"), company: id("7"), store: id("8"), pack: id("9"), pack2: id("10"), policy: id("11"), barcode: id("12") };
+const IDs = { product: id("1"), tablet: id("2"), strip: id("3"), box: id("4"), dosage: id("5"), brand: id("6"), company: id("7"), store: id("8"), pack: id("9"), pack2: id("10"), policy: id("11"), barcode: id("12"), paracetamol: id("13"), caffeine: id("14"), sodium: id("15"), mg: id("16"), component: id("17") };
 const stamp = { createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null };
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
 const references = {
   units: [ref("units", IDs.tablet, { canonicalCode: "tablet", displayName: "Tablet", dimension: "count", isDiscrete: true, allowedScale: 0 }), ref("units", IDs.strip, { canonicalCode: "strip", displayName: "Strip", dimension: "count", isDiscrete: true, allowedScale: 0 }), ref("units", IDs.box, { canonicalCode: "box", displayName: "Box", dimension: "count", isDiscrete: true, allowedScale: 0 })],
   "dosage-forms": [ref("dosage-forms", IDs.dosage, { canonicalCode: "tablet", displayName: "Tablet", description: null, routeHint: "oral", releaseHint: null })],
   brands: [ref("brands", IDs.brand, { displayName: "Crocin", brandOwnerCompanyId: IDs.company })],
-  companies: [ref("companies", IDs.company, { displayName: "GSK Pharma", legalName: null, city: null, state: null, countryCode: "IN" })]
+  companies: [ref("companies", IDs.company, { displayName: "GSK Pharma", legalName: null, city: null, state: null, countryCode: "IN" })],
+  ingredients: [ref("ingredients", IDs.paracetamol, { canonicalCode: "paracetamol", displayName: "Paracetamol", description: null }), ref("ingredients", IDs.caffeine, { canonicalCode: "caffeine", displayName: "Caffeine", description: null })],
+  "salt-forms": [ref("salt-forms", IDs.sodium, { canonicalCode: "sodium", displayName: "Sodium" })],
+  "strength-units": [ref("strength-units", IDs.mg, { canonicalCode: "mg", displayName: "Milligram", dimension: "mass", allowedScale: 3 })]
 };
 function ref(kind: string, recordId: string, attributes: object) { return { id: recordId, kind, revision: 1, status: "active", attributes, ...stamp }; }
-function catalogProduct() { return { id: IDs.product, productKind: "medicine", brandId: IDs.brand, dosageFormId: IDs.dosage, baseUnitId: IDs.tablet, quantityScale: 0, displayName: "Crocin 500 mg Tablet", formulationDescriptor: "500 mg", routeDescriptor: "Oral", releaseDescriptor: null, revision: 1, status: "active", ...stamp, companyRoles: [], packs: [{ id: IDs.pack, productId: IDs.product, containerUnitId: IDs.strip, baseQuantityAtoms: 15, containedPackId: null, containedPackCount: null, skuCode: "CROCIN-15", skuStoreId: IDs.store, displayLabel: "Strip of 15", revision: 1, status: "active", ...stamp }] }; }
+function catalogProduct() { return { id: IDs.product, productKind: "medicine", brandId: IDs.brand, dosageFormId: IDs.dosage, baseUnitId: IDs.tablet, quantityScale: 0, displayName: "Crocin 500 mg Tablet", formulationDescriptor: "500 mg", routeDescriptor: "Oral", releaseDescriptor: null, revision: 1, status: "active", ...stamp, companyRoles: [], packs: [{ id: IDs.pack, productId: IDs.product, containerUnitId: IDs.strip, baseQuantityAtoms: 15, containedPackId: null, containedPackCount: null, skuCode: "CROCIN-15", skuStoreId: IDs.store, displayLabel: "Strip of 15", revision: 1, status: "active", ...stamp }], composition: [] as Record<string, unknown>[] }; }
 
 // Phase 1B: sku_store_id is present exactly when sku_code is present. The double rejects the pairing
 // the Store Service rejects, so an unscoped SKU can never pass an end-to-end run.
@@ -43,6 +46,28 @@ async function mockCatalogService(page: Page, options: { authenticated?: boolean
     }
     const productMatch = /^\/api\/v1\/products\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
     if (productMatch) { const product = state.products[0]; if (method === "GET") return route.fulfill({ json: product }); product.status = productMatch[2] === "archive" ? "archived" : "active"; product.revision += 1; return route.fulfill({ json: product }); }
+    if (/\/products\/[^/]+\/composition$/.test(url.pathname)) {
+      const product = state.products[0];
+      if (method === "GET") return route.fulfill({ json: product.composition });
+      const body = request.postDataJSON();
+      // The Store Service refuses a repeated ingredient/salt pair on one Product.
+      if (product.composition.some((item) => item.ingredientId === body.ingredientId && (item.saltFormId ?? null) === (body.saltFormId ?? null) && item.status === "active")) {
+        return route.fulfill({ status: 409, json: { code: "composition_conflict", message: "conflict", issues: [] } });
+      }
+      const component = { id: `${IDs.component}-${product.composition.length}`, productId: IDs.product, saltFormId: null, componentRole: "active", strengthPresentation: "absolute", strengthDenominatorAtoms: null, strengthDenominatorScale: null, strengthDenominatorUnitId: null, ...body, displayOrder: body.displayOrder ?? product.composition.length, revision: 1, status: "active", ...stamp };
+      product.composition.push(component);
+      return route.fulfill({ status: 201, json: component });
+    }
+    const componentMatch = /^\/api\/v1\/composition-components\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
+    if (componentMatch) {
+      const product = state.products[0];
+      const component = product.composition.find((item) => item.id === componentMatch[1])! as Record<string, unknown>;
+      const body = request.postDataJSON();
+      if (componentMatch[2]) component.status = componentMatch[2] === "archive" ? "archived" : "active";
+      else Object.assign(component, body.component);
+      component.revision = (component.revision as number) + 1;
+      return route.fulfill({ json: component });
+    }
     if (/\/products\/[^/]+\/packs$/.test(url.pathname) && method === "POST") { const body = request.postDataJSON(); if (skuPairingViolation(body)) return route.fulfill(unprocessable); const pack = { id: IDs.pack2, productId: IDs.product, ...body, revision: 1, status: "active", ...stamp }; state.products[0].packs.push(pack); return route.fulfill({ status: 201, json: pack }); }
     if (/\/packs\/[^/]+$/.test(url.pathname) && method === "PUT") { const body = request.postDataJSON(); if (skuPairingViolation(body.pack)) return route.fulfill(unprocessable); const pack = state.products[0].packs.find((item) => url.pathname.endsWith(item.id))!; Object.assign(pack, body.pack, { revision: pack.revision + 1 }); return route.fulfill({ json: pack }); }
     if (/\/packs\/[^/]+\/policy$/.test(url.pathname)) { if (method === "GET") return state.policy ? route.fulfill({ json: state.policy }) : route.fulfill({ status: 404, json: { code: "not_found", message: "not found", issues: [] } }); const body = request.postDataJSON(); state.policy = { id: IDs.policy, productId: IDs.product, packId: IDs.pack2, ...body.policy, revision: 1, status: "active", ...stamp }; return route.fulfill({ json: state.policy }); }
@@ -95,6 +120,50 @@ test("an added Pack carries a Store-scoped SKU end to end", async ({ page }) => 
   expect(state.products[0].packs[1]).toMatchObject({ skuCode: "BOX-10", skuStoreId: IDs.store, displayLabel: "Box of ten strips" });
 });
 
+test("owner records a single-ingredient composition and extends it to a combination", async ({ page }) => {
+  const state = await mockCatalogService(page);
+  await page.goto(`/app/products/${IDs.product}`);
+  await expect(page.getByRole("heading", { name: "Composition" })).toBeVisible();
+  await expect(page.getByText("No composition recorded.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Add Component" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add Component" });
+  await dialog.getByRole("combobox", { name: /^Ingredient/ }).selectOption(IDs.paracetamol);
+  await dialog.getByRole("textbox", { name: /^Strength/ }).fill("500");
+  await dialog.getByRole("combobox", { name: /^Strength unit/ }).selectOption(IDs.mg);
+  await expect(dialog.getByText("500 mg")).toBeVisible();
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "Paracetamol" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "500 mg" })).toBeVisible();
+  expect(state.products[0].composition[0]).toMatchObject({ strengthNumeratorAtoms: 500, strengthNumeratorScale: 0 });
+
+  // A combination medicine is simply a second component, appended in order.
+  await page.getByRole("button", { name: "Add Component" }).click();
+  const second = page.getByRole("dialog", { name: "Add Component" });
+  await second.getByRole("combobox", { name: /^Ingredient/ }).selectOption(IDs.caffeine);
+  await second.getByRole("textbox", { name: /^Strength/ }).fill("65");
+  await second.getByRole("combobox", { name: /^Strength unit/ }).selectOption(IDs.mg);
+  await second.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "Caffeine" })).toBeVisible();
+  expect(state.products[0].composition).toHaveLength(2);
+  expect(state.products[0].composition[1].displayOrder).toBe(1);
+
+  // Archive preserves the component rather than deleting it.
+  const row = page.getByRole("row").filter({ hasText: "Caffeine" });
+  await row.getByRole("button", { name: "Archive" }).click();
+  await page.getByLabel("Reason").fill("Recorded in error");
+  await page.getByRole("button", { name: "Archive record" }).click();
+  await expect(page.getByRole("row").filter({ hasText: "Caffeine" }).getByRole("button", { name: "Restore" })).toBeVisible();
+  expect(state.products[0].composition).toHaveLength(2);
+});
+
+test("a read-only role sees composition without any mutation control", async ({ page }) => {
+  await mockCatalogService(page, { role: "cashier" });
+  await page.goto(`/app/products/${IDs.product}`);
+  await expect(page.getByRole("heading", { name: "Composition" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add Component" })).toHaveCount(0);
+});
+
 test("signing out discards the previous session's Catalog reference data", async ({ page }) => {
   const state = await mockCatalogService(page);
   await page.goto("/app/products");
@@ -122,6 +191,21 @@ test("the Product catalog stays readable on a narrow viewport", async ({ page })
   const labels = await page.locator("table.data-table tbody td[data-label]").evaluateAll((cells) => cells.map((cell) => cell.getAttribute("data-label")));
   expect(labels).toContain("Brand");
   expect(labels).toContain("Status");
+
+  // The detail page carries the widest tables, including the seven-column Composition table.
+  await page.goto(`/app/products/${IDs.product}`);
+  await page.getByRole("button", { name: "Add Component" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add Component" });
+  await dialog.getByRole("combobox", { name: /^Ingredient/ }).selectOption(IDs.paracetamol);
+  await dialog.getByRole("textbox", { name: /^Strength/ }).fill("500");
+  await dialog.getByRole("combobox", { name: /^Strength unit/ }).selectOption(IDs.mg);
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("cell", { name: "Paracetamol" })).toBeVisible();
+  const detailOverflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(detailOverflow).toBeLessThanOrEqual(1);
+  const compositionLabels = await page.locator("table.data-table tbody td[data-label]").evaluateAll((cells) => cells.map((cell) => cell.getAttribute("data-label")));
+  expect(compositionLabels).toContain("Ingredient");
+  expect(compositionLabels).toContain("Strength");
 });
 
 test("unauthenticated Product route redirects while authenticated refresh remains protected", async ({ page }) => {

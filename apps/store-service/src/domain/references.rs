@@ -15,6 +15,9 @@ pub enum MasterKind {
     TaxCategory,
     TaxRateVersion,
     RegulatoryCategory,
+    Ingredient,
+    SaltForm,
+    StrengthUnit,
 }
 
 impl MasterKind {
@@ -29,6 +32,9 @@ impl MasterKind {
             Self::TaxCategory => "tax-categories",
             Self::TaxRateVersion => "tax-rate-versions",
             Self::RegulatoryCategory => "regulatory-categories",
+            Self::Ingredient => "ingredients",
+            Self::SaltForm => "salt-forms",
+            Self::StrengthUnit => "strength-units",
         }
     }
 
@@ -43,6 +49,9 @@ impl MasterKind {
             Self::TaxCategory => "tax_categories",
             Self::TaxRateVersion => "tax_rate_versions",
             Self::RegulatoryCategory => "regulatory_categories",
+            Self::Ingredient => "ingredients",
+            Self::SaltForm => "salt_forms",
+            Self::StrengthUnit => "strength_units",
         }
     }
 
@@ -57,6 +66,9 @@ impl MasterKind {
             Self::TaxCategory => "tax_category",
             Self::TaxRateVersion => "tax_rate_version",
             Self::RegulatoryCategory => "regulatory_category",
+            Self::Ingredient => "ingredient",
+            Self::SaltForm => "salt_form",
+            Self::StrengthUnit => "strength_unit",
         }
     }
 
@@ -89,6 +101,15 @@ impl MasterKind {
             Self::RegulatoryCategory => {
                 "json_object('jurisdiction',jurisdiction,'categorySystem',category_system,'categoryCode',category_code,'displayName',display_name,'effectiveFrom',effective_from,'effectiveTo',effective_to,'sourceReference',source_reference,'verificationState',verification_state)"
             }
+            Self::Ingredient => {
+                "json_object('canonicalCode',canonical_code,'displayName',display_name,'normalizedSearchName',normalized_search_name,'description',description)"
+            }
+            Self::SaltForm => {
+                "json_object('canonicalCode',canonical_code,'displayName',display_name,'normalizedSearchName',normalized_search_name)"
+            }
+            Self::StrengthUnit => {
+                "json_object('canonicalCode',canonical_code,'displayName',display_name,'dimension',dimension,'allowedScale',allowed_scale)"
+            }
         }
     }
 
@@ -105,6 +126,10 @@ impl MasterKind {
             Self::RegulatoryCategory => {
                 "jurisdiction || ' ' || category_system || ' ' || category_code || ' ' || display_name"
             }
+            Self::Ingredient | Self::SaltForm => {
+                "canonical_code || ' ' || normalized_search_name || ' ' || display_name"
+            }
+            Self::StrengthUnit => "canonical_code || ' ' || display_name",
         }
     }
 }
@@ -123,6 +148,9 @@ impl FromStr for MasterKind {
             Self::TaxCategory,
             Self::TaxRateVersion,
             Self::RegulatoryCategory,
+            Self::Ingredient,
+            Self::SaltForm,
+            Self::StrengthUnit,
         ]
         .into_iter()
         .find(|kind| kind.path() == value)
@@ -161,8 +189,92 @@ pub fn validate_attributes(
         MasterKind::TaxCategory => validate_tax_category(object),
         MasterKind::TaxRateVersion => validate_tax_rate(object),
         MasterKind::RegulatoryCategory => validate_regulatory_category(object),
+        MasterKind::Ingredient => validate_ingredient(object),
+        MasterKind::SaltForm => validate_salt_form(object),
+        MasterKind::StrengthUnit => validate_strength_unit(object),
     };
     result.map_err(|error| vec![error])
+}
+
+/// The active moiety. Deliberately carries no salt, no strength, and no clinical attribute.
+fn validate_ingredient(object: &Map<String, Value>) -> Result<ValidatedFields, ValidationIssue> {
+    let display = required_text(object, "displayName", 160)?;
+    fields([
+        (
+            "canonical_code",
+            DbValue::Text(Some(canonical_code(required_text(
+                object,
+                "canonicalCode",
+                64,
+            )?)?)),
+        ),
+        ("display_name", DbValue::Text(Some(display.clone()))),
+        (
+            "normalized_search_name",
+            DbValue::Text(Some(normalized_search_name(&display))),
+        ),
+        (
+            "description",
+            DbValue::Text(optional_text(object, "description", 500)?),
+        ),
+    ])
+}
+
+/// The chemical form modifier applied to an ingredient, never the ingredient itself.
+fn validate_salt_form(object: &Map<String, Value>) -> Result<ValidatedFields, ValidationIssue> {
+    let display = required_text(object, "displayName", 120)?;
+    fields([
+        (
+            "canonical_code",
+            DbValue::Text(Some(canonical_code(required_text(
+                object,
+                "canonicalCode",
+                64,
+            )?)?)),
+        ),
+        ("display_name", DbValue::Text(Some(display.clone()))),
+        (
+            "normalized_search_name",
+            DbValue::Text(Some(normalized_search_name(&display))),
+        ),
+    ])
+}
+
+/// A unit a strength may be expressed in. Separate from inventory units of measure, which carry
+/// discrete/subdivision semantics that have no meaning for a stated strength.
+fn validate_strength_unit(object: &Map<String, Value>) -> Result<ValidatedFields, ValidationIssue> {
+    fields([
+        (
+            "canonical_code",
+            DbValue::Text(Some(canonical_code(required_text(
+                object,
+                "canonicalCode",
+                32,
+            )?)?)),
+        ),
+        (
+            "display_name",
+            DbValue::Text(Some(required_text(object, "displayName", 100)?)),
+        ),
+        (
+            "dimension",
+            DbValue::Text(Some(enum_text(
+                object,
+                "dimension",
+                &[
+                    "mass",
+                    "volume",
+                    "count",
+                    "activity",
+                    "substance_equivalent",
+                ],
+            )?)),
+        ),
+        (
+            "allowed_scale",
+            DbValue::Integer(required_integer(object, "allowedScale", 0, 6)?),
+        ),
+    ])
 }
 
 fn validate_unit(object: &Map<String, Value>) -> Result<ValidatedFields, ValidationIssue> {

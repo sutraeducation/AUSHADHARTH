@@ -33,6 +33,7 @@ enum CatalogError {
     Conversion,
     Barcode,
     DefaultPack,
+    Composition,
     ServiceBusy,
     Internal,
 }
@@ -120,6 +121,13 @@ impl IntoResponse for CatalogError {
                 simple_error(
                     "default_pack_conflict",
                     "The pack policy conflicts with another default or its enabled flags.",
+                ),
+            ),
+            Self::Composition => (
+                StatusCode::CONFLICT,
+                simple_error(
+                    "composition_conflict",
+                    "The composition conflicts with the product kind or an existing component.",
                 ),
             ),
             Self::ServiceBusy => (
@@ -338,6 +346,66 @@ struct CompanyRoleResponse {
     archive_reason: Option<String>,
 }
 
+/// One manufacturer-stated component of a medicine Product. Business identity only: this carries no
+/// clinical, equivalence, or substitution meaning.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompositionInput {
+    ingredient_id: String,
+    salt_form_id: Option<String>,
+    #[serde(default = "default_component_role")]
+    component_role: String,
+    display_order: Option<i64>,
+    #[serde(default = "default_strength_presentation")]
+    strength_presentation: String,
+    strength_numerator_atoms: i64,
+    strength_numerator_scale: i64,
+    strength_numerator_unit_id: String,
+    strength_denominator_atoms: Option<i64>,
+    strength_denominator_scale: Option<i64>,
+    strength_denominator_unit_id: Option<String>,
+}
+
+fn default_component_role() -> String {
+    "active".to_owned()
+}
+
+fn default_strength_presentation() -> String {
+    "absolute".to_owned()
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct CompositionResponse {
+    id: String,
+    revision: i64,
+    status: String,
+    product_id: String,
+    ingredient_id: String,
+    salt_form_id: Option<String>,
+    component_role: String,
+    display_order: i64,
+    strength_presentation: String,
+    strength_numerator_atoms: i64,
+    strength_numerator_scale: i64,
+    strength_numerator_unit_id: String,
+    strength_denominator_atoms: Option<i64>,
+    strength_denominator_scale: Option<i64>,
+    strength_denominator_unit_id: Option<String>,
+    created_at_utc: String,
+    updated_at_utc: String,
+    archived_at_utc: Option<String>,
+    archive_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCompositionRequest {
+    expected_revision: i64,
+    component: CompositionInput,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 struct PackResponse {
@@ -405,6 +473,7 @@ struct ProductDetailResponse {
     product: ProductResponse,
     company_roles: Vec<CompanyRoleResponse>,
     packs: Vec<PackResponse>,
+    composition: Vec<CompositionResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -451,6 +520,22 @@ pub fn routes() -> Router<ReferenceState> {
         .route(
             "/api/v1/company-roles/{id}/restore",
             post(restore_company_role),
+        )
+        .route(
+            "/api/v1/products/{id}/composition",
+            get(list_composition).post(create_composition),
+        )
+        .route(
+            "/api/v1/composition-components/{id}",
+            axum::routing::put(update_composition),
+        )
+        .route(
+            "/api/v1/composition-components/{id}/archive",
+            post(archive_composition),
+        )
+        .route(
+            "/api/v1/composition-components/{id}/restore",
+            post(restore_composition),
         )
         .route(
             "/api/v1/products/{id}/packs",
@@ -785,8 +870,10 @@ async fn lifecycle_product(
     if !restoring {
         let children: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM product_packs WHERE product_id=? AND status='active') + \
-             (SELECT COUNT(*) FROM product_company_roles WHERE product_id=? AND status='active')",
+             (SELECT COUNT(*) FROM product_company_roles WHERE product_id=? AND status='active') + \
+             (SELECT COUNT(*) FROM product_composition_components WHERE product_id=? AND status='active')",
         )
+        .bind(id)
         .bind(id)
         .bind(id)
         .fetch_one(&mut *transaction)
@@ -831,10 +918,12 @@ async fn fetch_product_detail(
     ).bind(id).fetch_optional(pool).await.map_err(|_| CatalogError::Internal)?.ok_or(CatalogError::NotFound)?;
     let company_roles = company_roles_for(pool, id).await?;
     let packs = packs_for(pool, id).await?;
+    let composition = composition_for(pool, id).await?;
     Ok(ProductDetailResponse {
         product,
         company_roles,
         packs,
+        composition,
     })
 }
 
@@ -967,6 +1056,185 @@ async fn restore_company_role(
     )
     .await?;
     Ok(Json(fetch_company_role(&state.pool, &id).await?))
+}
+
+async fn list_composition(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(product_id): Path<String>,
+) -> Result<Json<Vec<CompositionResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
+    ensure_product_exists(&state.pool, &product_id).await?;
+    Ok(Json(composition_for(&state.pool, &product_id).await?))
+}
+
+async fn create_composition(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(product_id): Path<String>,
+    Json(input): Json<CompositionInput>,
+) -> Result<(StatusCode, Json<CompositionResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
+    let input = prepare_composition(input)?;
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let product = product_state(&mut transaction, &product_id).await?;
+    if product.1 != "active" {
+        return Err(CatalogError::Archived);
+    }
+    // Composition is a medicine-only concept; the database enforces this too.
+    let kind: String = sqlx::query_scalar("SELECT product_kind FROM products WHERE id=?")
+        .bind(&product_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    if kind != "medicine" {
+        return Err(CatalogError::Composition);
+    }
+    // Appending never requires the client to compute an ordering.
+    let order = match input.display_order {
+        Some(order) => order,
+        None => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(display_order), -1) + 1 FROM product_composition_components WHERE product_id=?",
+            )
+            .bind(&product_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| CatalogError::Internal)?
+        }
+    };
+    let id = Uuid::now_v7().to_string();
+    let now = database_now(&mut transaction).await?;
+    insert_composition_row(&mut transaction, &id, &product_id, &input, order, &now).await?;
+    audit(
+        &mut transaction,
+        "product_composition_component",
+        &id,
+        1,
+        "created",
+        None,
+        &input,
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(fetch_composition(&state.pool, &id).await?),
+    ))
+}
+
+async fn update_composition(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateCompositionRequest>,
+) -> Result<Json<CompositionResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let input = prepare_composition(request.component)?;
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let current = entity_state(&mut transaction, "product_composition_components", &id).await?;
+    require_active_revision(&current, request.expected_revision)?;
+    let existing_order: i64 =
+        sqlx::query_scalar("SELECT display_order FROM product_composition_components WHERE id=?")
+            .bind(&id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| CatalogError::Internal)?;
+    let order = input.display_order.unwrap_or(existing_order);
+    let now = database_now(&mut transaction).await?;
+    let next = current.0 + 1;
+    let result = sqlx::query(
+        "UPDATE product_composition_components SET revision=?,ingredient_id=?,salt_form_id=?,component_role=?,\
+         display_order=?,strength_presentation=?,strength_numerator_atoms=?,strength_numerator_scale=?,\
+         strength_numerator_unit_id=?,strength_denominator_atoms=?,strength_denominator_scale=?,\
+         strength_denominator_unit_id=?,updated_at_utc=? WHERE id=? AND revision=? AND status='active'",
+    )
+    .bind(next)
+    .bind(&input.ingredient_id)
+    .bind(&input.salt_form_id)
+    .bind(&input.component_role)
+    .bind(order)
+    .bind(&input.strength_presentation)
+    .bind(input.strength_numerator_atoms)
+    .bind(input.strength_numerator_scale)
+    .bind(&input.strength_numerator_unit_id)
+    .bind(input.strength_denominator_atoms)
+    .bind(input.strength_denominator_scale)
+    .bind(&input.strength_denominator_unit_id)
+    .bind(&now)
+    .bind(&id)
+    .bind(current.0)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    if result.rows_affected() != 1 {
+        return Err(CatalogError::Internal);
+    }
+    audit(
+        &mut transaction,
+        "product_composition_component",
+        &id,
+        next,
+        "updated",
+        request.reason.as_deref(),
+        &input,
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok(Json(fetch_composition(&state.pool, &id).await?))
+}
+
+async fn archive_composition(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<CompositionResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "product_composition_components",
+        "product_composition_component",
+        &id,
+        request,
+        false,
+        &actor.id,
+    )
+    .await?;
+    Ok(Json(fetch_composition(&state.pool, &id).await?))
+}
+
+async fn restore_composition(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<CompositionResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "product_composition_components",
+        "product_composition_component",
+        &id,
+        request,
+        true,
+        &actor.id,
+    )
+    .await?;
+    Ok(Json(fetch_composition(&state.pool, &id).await?))
 }
 
 async fn create_pack(
@@ -1681,6 +1949,88 @@ fn prepare_pack(mut input: PackInput) -> Result<PackInput, CatalogError> {
     Ok(input)
 }
 
+/// Validates one composition component. Strength stays exact integer atoms with an explicit scale;
+/// no binary floating point is ever accepted or produced.
+fn prepare_composition(mut input: CompositionInput) -> Result<CompositionInput, CatalogError> {
+    input.ingredient_id =
+        validate_uuid_v7(&input.ingredient_id, "ingredientId").map_err(validation_issue)?;
+    input.salt_form_id = validated_optional_uuid(input.salt_form_id, "saltFormId")?;
+    if !matches!(input.component_role.as_str(), "active" | "inactive") {
+        return Err(validation("componentRole", "must be active or inactive"));
+    }
+    if !matches!(
+        input.strength_presentation.as_str(),
+        "absolute" | "percentage"
+    ) {
+        return Err(validation(
+            "strengthPresentation",
+            "must be absolute or percentage",
+        ));
+    }
+    if input.display_order.is_some_and(|order| order < 0) {
+        return Err(validation("displayOrder", "must not be negative"));
+    }
+    if !(1..=MAX_BASE_QUANTITY_ATOMS).contains(&input.strength_numerator_atoms) {
+        return Err(validation(
+            "strengthNumeratorAtoms",
+            "must be a positive bounded integer",
+        ));
+    }
+    if !(0..=6).contains(&input.strength_numerator_scale) {
+        return Err(validation(
+            "strengthNumeratorScale",
+            "must be between 0 and 6",
+        ));
+    }
+    input.strength_numerator_unit_id =
+        validate_uuid_v7(&input.strength_numerator_unit_id, "strengthNumeratorUnitId")
+            .map_err(validation_issue)?;
+    // A concentration is all three denominator parts or none of them; a half-specified denominator
+    // has no meaning.
+    let denominator_parts = [
+        input.strength_denominator_atoms.is_some(),
+        input.strength_denominator_scale.is_some(),
+        input.strength_denominator_unit_id.is_some(),
+    ];
+    if denominator_parts.iter().any(|part| *part) && !denominator_parts.iter().all(|part| *part) {
+        return Err(validation(
+            "strengthDenominatorUnitId",
+            "requires the denominator quantity, scale, and unit together",
+        ));
+    }
+    if let Some(atoms) = input.strength_denominator_atoms
+        && !(1..=MAX_BASE_QUANTITY_ATOMS).contains(&atoms)
+    {
+        return Err(validation(
+            "strengthDenominatorAtoms",
+            "must be a positive bounded integer",
+        ));
+    }
+    if let Some(scale) = input.strength_denominator_scale
+        && !(0..=6).contains(&scale)
+    {
+        return Err(validation(
+            "strengthDenominatorScale",
+            "must be between 0 and 6",
+        ));
+    }
+    input.strength_denominator_unit_id = validated_optional_uuid(
+        input.strength_denominator_unit_id,
+        "strengthDenominatorUnitId",
+    )?;
+    // A percentage is an exact ratio out of one hundred, so the stored value stays exact.
+    if input.strength_presentation == "percentage"
+        && (input.strength_denominator_atoms != Some(100)
+            || input.strength_denominator_scale != Some(0))
+    {
+        return Err(validation(
+            "strengthDenominatorAtoms",
+            "a percentage strength must be expressed per exactly 100",
+        ));
+    }
+    Ok(input)
+}
+
 fn prepare_policy(mut input: PolicyInput) -> Result<PolicyInput, CatalogError> {
     input.store_id = validate_uuid_v7(&input.store_id, "storeId").map_err(validation_issue)?;
     if !(1..=MAX_BASE_QUANTITY_ATOMS).contains(&input.minimum_sale_increment_atoms) {
@@ -2010,6 +2360,75 @@ async fn packs_for(pool: &SqlitePool, product_id: &str) -> Result<Vec<PackRespon
     ).bind(product_id).fetch_all(pool).await.map_err(|_| CatalogError::Internal)
 }
 
+const COMPOSITION_COLUMNS: &str = "id,revision,status,product_id,ingredient_id,salt_form_id,component_role,display_order,\
+     strength_presentation,strength_numerator_atoms,strength_numerator_scale,strength_numerator_unit_id,\
+     strength_denominator_atoms,strength_denominator_scale,strength_denominator_unit_id,\
+     created_at_utc,updated_at_utc,archived_at_utc,archive_reason";
+
+async fn insert_composition_row(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    product_id: &str,
+    input: &CompositionInput,
+    display_order: i64,
+    now: &str,
+) -> Result<(), CatalogError> {
+    sqlx::query(
+        "INSERT INTO product_composition_components (id,product_id,ingredient_id,salt_form_id,component_role,\
+         display_order,strength_presentation,strength_numerator_atoms,strength_numerator_scale,\
+         strength_numerator_unit_id,strength_denominator_atoms,strength_denominator_scale,\
+         strength_denominator_unit_id,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(id)
+    .bind(product_id)
+    .bind(&input.ingredient_id)
+    .bind(&input.salt_form_id)
+    .bind(&input.component_role)
+    .bind(display_order)
+    .bind(&input.strength_presentation)
+    .bind(input.strength_numerator_atoms)
+    .bind(input.strength_numerator_scale)
+    .bind(&input.strength_numerator_unit_id)
+    .bind(input.strength_denominator_atoms)
+    .bind(input.strength_denominator_scale)
+    .bind(&input.strength_denominator_unit_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_database_error)?;
+    Ok(())
+}
+
+async fn fetch_composition(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<CompositionResponse, CatalogError> {
+    sqlx::query_as::<_, CompositionResponse>(&format!(
+        "SELECT {COMPOSITION_COLUMNS} FROM product_composition_components WHERE id=?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| CatalogError::Internal)?
+    .ok_or(CatalogError::NotFound)
+}
+
+/// Deterministic ordering even when two components share a display order.
+async fn composition_for(
+    pool: &SqlitePool,
+    product_id: &str,
+) -> Result<Vec<CompositionResponse>, CatalogError> {
+    sqlx::query_as::<_, CompositionResponse>(&format!(
+        "SELECT {COMPOSITION_COLUMNS} FROM product_composition_components WHERE product_id=? \
+         ORDER BY display_order,id"
+    ))
+    .bind(product_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| CatalogError::Internal)
+}
+
 async fn fetch_policy(pool: &SqlitePool, id: &str) -> Result<PolicyResponse, CatalogError> {
     sqlx::query_as(
         "SELECT id,store_id,product_id,pack_id,purchase_enabled,sale_enabled,whole_pack_only_purchase,fractional_sale_allowed,\
@@ -2217,6 +2636,11 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
         return CatalogError::ServiceBusy;
     }
     let message = error.to_string();
+    if message.contains("composition_component_conflict")
+        || message.contains("product_composition_components_active_uq")
+    {
+        return CatalogError::Composition;
+    }
     if message.contains("pack_conversion_conflict")
         || message.contains("product_quantity_scale_conflict")
     {
@@ -2504,17 +2928,15 @@ mod tests {
             "product_packs",
             "store_pack_policies",
             "barcodes",
+            // Phase 1C-B composition identity.
+            "ingredients",
+            "salt_forms",
+            "strength_units",
+            "product_composition_components",
         ] {
             assert!(tables.iter().any(|table| table == expected));
         }
-        for deferred in [
-            "ingredients",
-            "compositions",
-            "batches",
-            "stock",
-            "stock_ledger",
-            "prices",
-        ] {
+        for deferred in ["batches", "stock", "stock_ledger", "prices"] {
             assert!(!tables.iter().any(|table| table == deferred));
         }
         let editable_stock_columns: i64 = sqlx::query_scalar(
@@ -3398,5 +3820,438 @@ mod tests {
                 .unwrap();
         assert_eq!(authoritative_actor, owner_id);
         assert_ne!(authoritative_actor, spoofed_actor);
+    }
+
+    // ---- Phase 1C-B composition identity ----
+
+    const SALT_SODIUM: &str = "01997100-0000-7000-8000-000000000001";
+    const SU_MG: &str = "01997200-0000-7000-8000-000000000002";
+    const SU_G: &str = "01997200-0000-7000-8000-000000000003";
+    const SU_ML: &str = "01997200-0000-7000-8000-000000000004";
+
+    async fn create_reference(pool: &SqlitePool, kind: &str, attributes: Value) -> Value {
+        let (status, body) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/reference/{kind}"),
+            json!({ "attributes": attributes }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body
+    }
+
+    async fn create_ingredient(pool: &SqlitePool, code: &str, name: &str) -> String {
+        create_reference(
+            pool,
+            "ingredients",
+            json!({"canonicalCode": code, "displayName": name}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn create_medicine(pool: &SqlitePool, name: &str) -> String {
+        // Dosage-form codes are unique, so each medicine in a test gets its own. The suffix comes
+        // from the random tail of a UUIDv7, not its millisecond prefix, which collides.
+        let code = format!("tablet-{}", &Uuid::now_v7().to_string()[24..36]);
+        let form = create_reference(
+            pool,
+            "dosage-forms",
+            json!({"canonicalCode":code,"displayName":"Tablet"}),
+        )
+        .await;
+        let (status, body) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({"product":{
+                "productKind":"medicine","baseUnitId":TABLET,
+                "dosageFormId":form["id"].as_str().unwrap(),
+                "quantityScale":0,"displayName":name
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["id"].as_str().unwrap().to_owned()
+    }
+
+    fn component(ingredient: &str, atoms: i64, unit: &str) -> Value {
+        json!({
+            "ingredientId": ingredient,
+            "strengthNumeratorAtoms": atoms,
+            "strengthNumeratorScale": 0,
+            "strengthNumeratorUnitId": unit
+        })
+    }
+
+    async fn add_component(pool: &SqlitePool, product: &str, body: Value) -> (StatusCode, Value) {
+        request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{product}/composition"),
+            body,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn composition_identity_ordering_and_exact_strengths_are_enforced() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_medicine(&pool, "Combination tablet").await;
+        let paracetamol = create_ingredient(&pool, "paracetamol", "Paracetamol").await;
+        let diclofenac = create_ingredient(&pool, "diclofenac", "Diclofenac").await;
+
+        // A single-ingredient strength is per one Product base unit and needs no denominator.
+        let (status, first) =
+            add_component(&pool, &product, component(&paracetamol, 500, SU_MG)).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        assert_eq!(first["displayOrder"], 0);
+        assert_eq!(first["strengthNumeratorAtoms"], 500);
+        assert_eq!(first["strengthDenominatorAtoms"], Value::Null);
+        assert_eq!(first["componentRole"], "active");
+        assert_eq!(
+            Uuid::parse_str(first["id"].as_str().unwrap())
+                .unwrap()
+                .get_version_num(),
+            7
+        );
+
+        // A combination medicine simply carries more components, appended in order.
+        let mut second_body = component(&diclofenac, 50, SU_MG);
+        second_body["saltFormId"] = json!(SALT_SODIUM);
+        let (status, second) = add_component(&pool, &product, second_body).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        assert_eq!(second["displayOrder"], 1);
+        assert_eq!(second["saltFormId"], SALT_SODIUM);
+
+        let (status, listed) = request_json(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{product}/composition"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        assert_eq!(listed[0]["ingredientId"], paracetamol.as_str());
+        assert_eq!(listed[1]["ingredientId"], diclofenac.as_str());
+
+        // The Product detail projection carries composition in the same deterministic order.
+        let (status, detail) = request_json(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{product}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["composition"].as_array().unwrap().len(), 2);
+
+        // The same ingredient with no salt cannot be recorded twice, despite SQL NULL semantics.
+        let (status, duplicate) =
+            add_component(&pool, &product, component(&paracetamol, 250, SU_MG)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{duplicate}");
+        assert_eq!(duplicate["code"], "composition_conflict");
+
+        // The same ingredient in a different salt form is a genuinely different component.
+        let mut salted = component(&paracetamol, 250, SU_MG);
+        salted["saltFormId"] = json!(SALT_SODIUM);
+        let (status, salted_body) = add_component(&pool, &product, salted).await;
+        assert_eq!(status, StatusCode::CREATED, "{salted_body}");
+    }
+
+    #[tokio::test]
+    async fn composition_strength_shapes_reject_impossible_values() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_medicine(&pool, "Suspension").await;
+        let azithromycin = create_ingredient(&pool, "azithromycin", "Azithromycin").await;
+
+        // A concentration: 200 mg per 5 mL.
+        let mut concentration = component(&azithromycin, 200, SU_MG);
+        concentration["strengthDenominatorAtoms"] = json!(5);
+        concentration["strengthDenominatorScale"] = json!(0);
+        concentration["strengthDenominatorUnitId"] = json!(SU_ML);
+        let (status, body) = add_component(&pool, &product, concentration).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["strengthDenominatorAtoms"], 5);
+
+        // A half-specified denominator has no meaning and is refused.
+        let clotrimazole = create_ingredient(&pool, "clotrimazole", "Clotrimazole").await;
+        let mut half = component(&clotrimazole, 1, SU_G);
+        half["strengthDenominatorAtoms"] = json!(100);
+        let (status, body) = add_component(&pool, &product, half).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "strengthDenominatorUnitId");
+
+        // A percentage is stored as an exact ratio out of exactly one hundred.
+        let mut percentage = component(&clotrimazole, 1, SU_G);
+        percentage["strengthPresentation"] = json!("percentage");
+        percentage["strengthDenominatorAtoms"] = json!(100);
+        percentage["strengthDenominatorScale"] = json!(0);
+        percentage["strengthDenominatorUnitId"] = json!(SU_G);
+        let (status, body) = add_component(&pool, &product, percentage).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["strengthPresentation"], "percentage");
+        assert_eq!(body["strengthDenominatorAtoms"], 100);
+
+        let miconazole = create_ingredient(&pool, "miconazole", "Miconazole").await;
+        let mut wrong_percentage = component(&miconazole, 2, SU_G);
+        wrong_percentage["strengthPresentation"] = json!("percentage");
+        wrong_percentage["strengthDenominatorAtoms"] = json!(50);
+        wrong_percentage["strengthDenominatorScale"] = json!(0);
+        wrong_percentage["strengthDenominatorUnitId"] = json!(SU_G);
+        let (status, body) = add_component(&pool, &product, wrong_percentage).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "strengthDenominatorAtoms");
+
+        // Precision may never exceed the strength unit's allowed scale.
+        let mut too_precise = component(&miconazole, 1, SU_MG);
+        too_precise["strengthNumeratorScale"] = json!(6);
+        let (status, body) = add_component(&pool, &product, too_precise).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "composition_conflict");
+
+        // Zero and negative strengths are not strengths.
+        let (status, body) = add_component(&pool, &product, component(&miconazole, 0, SU_MG)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "strengthNumeratorAtoms");
+    }
+
+    #[tokio::test]
+    async fn composition_is_medicine_only_and_revision_archive_safe() {
+        let (_temp, pool, _) = test_pool().await;
+        let ingredient = create_ingredient(&pool, "paracetamol", "Paracetamol").await;
+
+        // A General Pharmacy Item has no composition.
+        let general = create_product(&pool, "Cotton roll").await;
+        let (status, body) = add_component(
+            &pool,
+            general["id"].as_str().unwrap(),
+            component(&ingredient, 500, SU_MG),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "composition_conflict");
+
+        let product = create_medicine(&pool, "Paracetamol tablet").await;
+        let (_, created) = add_component(&pool, &product, component(&ingredient, 500, SU_MG)).await;
+        let component_id = created["id"].as_str().unwrap();
+
+        // A stale revision never overwrites a newer component.
+        let mut updated = component(&ingredient, 650, SU_MG);
+        updated["displayOrder"] = json!(0);
+        let (status, body) = request_json(
+            pool.clone(),
+            "PUT",
+            &format!("/api/v1/composition-components/{component_id}"),
+            json!({"expectedRevision":1,"component":updated.clone()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revision"], 2);
+        assert_eq!(body["strengthNumeratorAtoms"], 650);
+
+        let (status, stale) = request_json(
+            pool.clone(),
+            "PUT",
+            &format!("/api/v1/composition-components/{component_id}"),
+            json!({"expectedRevision":1,"component":updated}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(stale["code"], "revision_conflict");
+        assert_eq!(stale["currentRevision"], 2);
+
+        // A Product may not be archived while it still carries active composition.
+        let (status, blocked) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{product}/archive"),
+            json!({"expectedRevision":1,"reason":"Duplicate entry"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
+        assert_eq!(blocked["code"], "archived_conflict");
+
+        // Archive preserves the component and its history; restore revalidates it.
+        let (status, archived) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/composition-components/{component_id}/archive"),
+            json!({"expectedRevision":2,"reason":"Recorded in error"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{archived}");
+        assert_eq!(archived["status"], "archived");
+        let still_present: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_composition_components WHERE id=?")
+                .bind(component_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_present, 1);
+
+        let (status, restored) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/composition-components/{component_id}/restore"),
+            json!({"expectedRevision":3,"reason":"Confirmed correct"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{restored}");
+        assert_eq!(restored["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn composition_access_roles_and_server_audit_actor_are_enforced() {
+        let (_temp, pool, _) = test_pool().await;
+        let product = create_medicine(&pool, "Paracetamol tablet").await;
+        let ingredient = create_ingredient(&pool, "paracetamol", "Paracetamol").await;
+
+        // The browser-supplied actor is ignored; the session user is recorded.
+        let spoofed = Uuid::now_v7().to_string();
+        let mut spoofing = component(&ingredient, 500, SU_MG);
+        spoofing["actorId"] = json!(spoofed);
+        let (status, created) = add_component(&pool, &product, spoofing).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let component_id = created["id"].as_str().unwrap();
+        let actor: String = sqlx::query_scalar(
+            "SELECT actor_id FROM master_change_events WHERE entity_type='product_composition_component' AND entity_id=?",
+        )
+        .bind(component_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let owner: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE role='owner_admin' LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actor, owner);
+        assert_ne!(actor, spoofed);
+
+        for role in ["pharmacist", "cashier"] {
+            let token = format!("{role}-composition-token");
+            insert_session(&pool, role, &token).await;
+            let (read_status, _, _) = (
+                request_json_as(
+                    pool.clone(),
+                    "GET",
+                    &format!("/api/v1/products/{product}/composition"),
+                    Value::Null,
+                    Some(&token),
+                )
+                .await
+                .0,
+                (),
+                (),
+            );
+            assert_eq!(read_status, StatusCode::OK, "{role} must read composition");
+            let (write_status, body) = request_json_as(
+                pool.clone(),
+                "POST",
+                &format!("/api/v1/products/{product}/composition"),
+                component(&ingredient, 250, SU_MG),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(write_status, StatusCode::FORBIDDEN, "{body}");
+        }
+
+        let (status, _) = request_json_as(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{product}/composition"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ingredient_and_salt_form_masters_are_distinct_and_protected() {
+        let (_temp, pool, _) = test_pool().await;
+        let diclofenac = create_ingredient(&pool, "diclofenac", "Diclofenac").await;
+
+        // Ingredient and salt form are separate identities, not synonyms.
+        let (status, salts) = request_json(
+            pool.clone(),
+            "GET",
+            "/api/v1/reference/salt-forms?search=sodium",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            salts
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|salt| { salt["attributes"]["canonicalCode"] == "sodium" })
+        );
+
+        let (status, units) = request_json(
+            pool.clone(),
+            "GET",
+            "/api/v1/reference/strength-units?search=iu",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(units[0]["attributes"]["dimension"], "activity");
+
+        // A duplicate canonical code is rejected exactly as other masters are.
+        let (status, duplicate) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/reference/ingredients",
+            json!({"attributes":{"canonicalCode":"diclofenac","displayName":"Diclofenac again"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{duplicate}");
+
+        // Archiving a referenced master is preserved, never cascaded and never blocked — the frozen
+        // Phase 1A semantic. What it must prevent is a *new* component against an archived master.
+        let product = create_medicine(&pool, "Diclofenac tablet").await;
+        let (_, created) = add_component(&pool, &product, component(&diclofenac, 50, SU_MG)).await;
+        assert_eq!(created["status"], "active");
+        let (status, archived) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/reference/ingredients/{diclofenac}/archive"),
+            json!({"expectedRevision":1,"reason":"No longer stocked"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{archived}");
+        assert_eq!(archived["status"], "archived");
+
+        // The existing component keeps its reference as history.
+        let (status, still_listed) = request_json(
+            pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{product}/composition"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(still_listed[0]["ingredientId"], diclofenac.as_str());
+
+        // The archived ingredient may not be deleted, and may not back a new component.
+        assert!(
+            sqlx::query("DELETE FROM ingredients WHERE id=?")
+                .bind(&diclofenac)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        let other = create_medicine(&pool, "Another diclofenac tablet").await;
+        let (status, rejected) =
+            add_component(&pool, &other, component(&diclofenac, 50, SU_MG)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+        assert_eq!(rejected["code"], "composition_conflict");
     }
 }

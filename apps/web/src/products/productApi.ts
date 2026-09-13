@@ -1,6 +1,7 @@
 import {
   BarcodeSchema,
   CatalogContextSchema,
+  CompositionComponentSchema,
   DuplicateCandidateSchema,
   ProductCompanyRoleSchema,
   ProductDetailSchema,
@@ -9,6 +10,8 @@ import {
   StorePackPolicySchema,
   type Barcode,
   type BarcodeLookup,
+  type CompositionComponent,
+  type CompositionComponentFields,
   type CreateProductRequest,
   type Product,
   type ProductCompanyRole,
@@ -144,6 +147,33 @@ export async function createBarcode(packId: string, barcode: BarcodeLookup & { s
 
 export async function changeBarcodeLifecycle(record: Barcode, action: "archive" | "restore", reason: string): Promise<Barcode> {
   return BarcodeSchema.parse(await localServiceRequest(`/api/v1/barcodes/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export async function listComposition(productId: string): Promise<CompositionComponent[]> {
+  return CompositionComponentSchema.array().parse(
+    await localServiceRequest(`/api/v1/products/${encodeURIComponent(productId)}/composition`)
+  );
+}
+
+export async function createComponent(productId: string, component: CompositionComponentFields): Promise<CompositionComponent> {
+  return CompositionComponentSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/composition`, {
+    method: "POST",
+    body: JSON.stringify(component)
+  }));
+}
+
+export async function updateComponent(record: CompositionComponent, component: CompositionComponentFields): Promise<CompositionComponent> {
+  return CompositionComponentSchema.parse(await localServiceRequest(`/api/v1/composition-components/${record.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: record.revision, component })
+  }));
+}
+
+export async function changeComponentLifecycle(record: CompositionComponent, action: "archive" | "restore", reason: string): Promise<CompositionComponent> {
+  return CompositionComponentSchema.parse(await localServiceRequest(`/api/v1/composition-components/${record.id}/${action}`, {
     method: "POST",
     body: JSON.stringify({ expectedRevision: record.revision, reason })
   }));

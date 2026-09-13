@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Barcode, ProductDetail, ProductPack, ReferenceKind, ReferenceMasterResponse, StorePackPolicy, UserRole } from "@aushadharth/contracts";
+import type { Barcode, CompositionComponent, ProductDetail, ProductPack, ReferenceKind, ReferenceMasterResponse, StorePackPolicy, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
 import { atomsToQuantity, quantityToAtoms } from "../products/productApi";
 
@@ -18,7 +18,14 @@ const IDs = {
   pack: "01997000-0000-7000-8000-000000000009",
   role: "01997000-0000-7000-8000-000000000010",
   policy: "01997000-0000-7000-8000-000000000011",
-  barcode: "01997000-0000-7000-8000-000000000012"
+  barcode: "01997000-0000-7000-8000-000000000012",
+  paracetamol: "01997000-0000-7000-8000-000000000013",
+  caffeine: "01997000-0000-7000-8000-000000000014",
+  sodium: "01997000-0000-7000-8000-000000000015",
+  mg: "01997000-0000-7000-8000-000000000016",
+  mlUnit: "01997000-0000-7000-8000-000000000017",
+  gUnit: "01997000-0000-7000-8000-000000000018",
+  component: "01997000-0000-7000-8000-000000000019"
 };
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
 const stamp = { createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null };
@@ -26,7 +33,10 @@ const refs: Partial<Record<ReferenceKind, ReferenceMasterResponse[]>> = {
   units: [reference("units", IDs.tablet, { canonicalCode: "tablet", displayName: "Tablet", dimension: "count", isDiscrete: true, allowedScale: 0 }), reference("units", IDs.strip, { canonicalCode: "strip", displayName: "Strip", dimension: "count", isDiscrete: true, allowedScale: 0 }), reference("units", IDs.box, { canonicalCode: "box", displayName: "Box", dimension: "count", isDiscrete: true, allowedScale: 0 })],
   "dosage-forms": [reference("dosage-forms", IDs.dosage, { canonicalCode: "tablet", displayName: "Tablet", description: null, routeHint: "oral", releaseHint: null })],
   brands: [reference("brands", IDs.brand, { displayName: "Crocin", brandOwnerCompanyId: IDs.company })],
-  companies: [reference("companies", IDs.company, { displayName: "GSK Pharma", legalName: null, city: null, state: null, countryCode: "IN" })]
+  companies: [reference("companies", IDs.company, { displayName: "GSK Pharma", legalName: null, city: null, state: null, countryCode: "IN" })],
+  ingredients: [reference("ingredients", IDs.paracetamol, { canonicalCode: "paracetamol", displayName: "Paracetamol", description: null }), reference("ingredients", IDs.caffeine, { canonicalCode: "caffeine", displayName: "Caffeine", description: null })],
+  "salt-forms": [reference("salt-forms", IDs.sodium, { canonicalCode: "sodium", displayName: "Sodium" })],
+  "strength-units": [reference("strength-units", IDs.mg, { canonicalCode: "mg", displayName: "Milligram", dimension: "mass", allowedScale: 3 }), reference("strength-units", IDs.mlUnit, { canonicalCode: "ml", displayName: "Millilitre", dimension: "volume", allowedScale: 3 }), reference("strength-units", IDs.gUnit, { canonicalCode: "g", displayName: "Gram", dimension: "mass", allowedScale: 3 })]
 };
 
 function reference(kind: ReferenceKind, id: string, attributes: Record<string, unknown>): ReferenceMasterResponse {
@@ -35,7 +45,8 @@ function reference(kind: ReferenceKind, id: string, attributes: Record<string, u
 function product(): ProductDetail {
   return { id: IDs.product, productKind: "medicine", brandId: IDs.brand, dosageFormId: IDs.dosage, baseUnitId: IDs.tablet, quantityScale: 0, displayName: "Crocin 500 mg Tablet", formulationDescriptor: "500 mg", routeDescriptor: "Oral", releaseDescriptor: null, revision: 1, status: "active", ...stamp,
     companyRoles: [{ id: IDs.role, productId: IDs.product, companyId: IDs.company, role: "manufacturer", effectiveFrom: null, effectiveTo: null, revision: 1, status: "active", ...stamp }],
-    packs: [{ id: IDs.pack, productId: IDs.product, containerUnitId: IDs.strip, baseQuantityAtoms: 15, containedPackId: null, containedPackCount: null, skuCode: "CROCIN-15", skuStoreId: IDs.store, displayLabel: "Strip of 15", revision: 1, status: "active", ...stamp }]
+    packs: [{ id: IDs.pack, productId: IDs.product, containerUnitId: IDs.strip, baseQuantityAtoms: 15, containedPackId: null, containedPackCount: null, skuCode: "CROCIN-15", skuStoreId: IDs.store, displayLabel: "Strip of 15", revision: 1, status: "active", ...stamp }],
+    composition: []
   };
 }
 function policyRecord(): StorePackPolicy {
@@ -95,6 +106,19 @@ function catalogService(options: Options = {}) {
     const hasStore = typeof pack.skuStoreId === "string" && pack.skuStoreId.length > 0;
     return hasSku === hasStore ? null : failure("validation_failed", 422, [{ field: "skuStoreId", message: "is required exactly when skuCode is present" }]);
   };
+  // Phase 1C-B: the Store Service refuses composition on a non-medicine Product, a half-specified
+  // denominator, a percentage that is not out of exactly 100, and a repeated ingredient/salt pair.
+  const compositionError = (product: ProductDetail, component: Record<string, unknown>, ignoreId: string | null) => {
+    if (product.productKind !== "medicine") return failure("composition_conflict", 409);
+    const parts = [component.strengthDenominatorAtoms, component.strengthDenominatorScale, component.strengthDenominatorUnitId].map((part) => part !== null && part !== undefined);
+    if (parts.some(Boolean) && !parts.every(Boolean)) return failure("validation_failed", 422, [{ field: "strengthDenominatorUnitId", message: "requires the denominator quantity, scale, and unit together" }]);
+    if (component.strengthPresentation === "percentage" && (component.strengthDenominatorAtoms !== 100 || component.strengthDenominatorScale !== 0)) {
+      return failure("validation_failed", 422, [{ field: "strengthDenominatorAtoms", message: "a percentage strength must be expressed per exactly 100" }]);
+    }
+    const key = `${component.ingredientId}|${component.saltFormId ?? ""}`;
+    if (product.composition.some((existing) => existing.id !== ignoreId && existing.status === "active" && `${existing.ingredientId}|${existing.saltFormId ?? ""}` === key)) return failure("composition_conflict", 409);
+    return null;
+  };
   const revisionError = (current: number, expected: unknown) =>
     current === expected ? null : failure("revision_conflict", 409, [], { expectedRevision: expected ?? null, currentRevision: current });
 
@@ -138,7 +162,7 @@ function catalogService(options: Options = {}) {
       return response(created, 201);
     }
 
-    const productMatch = /^\/api\/v1\/products\/([^/]+)(?:\/(archive|restore|company-roles|packs))?$/.exec(url.pathname);
+    const productMatch = /^\/api\/v1\/products\/([^/]+)(?:\/(archive|restore|company-roles|packs|composition))?$/.exec(url.pathname);
     if (productMatch) {
       const record = findProduct(productMatch[1]);
       const action = productMatch[2];
@@ -160,6 +184,13 @@ function catalogService(options: Options = {}) {
         record.companyRoles.push(role);
         return response(role, 201);
       }
+      if (action === "composition" && method === "GET") return response(record.composition);
+      if (action === "composition") {
+        const error = compositionError(record, body, null); if (error) return error;
+        const component: CompositionComponent = { id: `${IDs.component}-new`, productId: record.id, saltFormId: null, componentRole: "active", strengthPresentation: "absolute", strengthDenominatorAtoms: null, strengthDenominatorScale: null, strengthDenominatorUnitId: null, ...body, displayOrder: body.displayOrder ?? record.composition.length, revision: 1, status: "active", ...stamp };
+        record.composition.push(component);
+        return response(component, 201);
+      }
       if (action === "packs" && method === "GET") return response(record.packs);
       if (action === "packs") {
         const error = skuPairingError(body); if (error) return error;
@@ -177,6 +208,18 @@ function catalogService(options: Options = {}) {
       const conflict = revisionError(record.revision, body.expectedRevision); if (conflict) return conflict;
       if (roleMatch[2]) record.status = roleMatch[2] === "archive" ? "archived" : "active";
       else Object.assign(record, body.role);
+      record.revision += 1;
+      return response(record);
+    }
+
+    const componentMatch = /^\/api\/v1\/composition-components\/([^/]+)(?:\/(archive|restore))?$/.exec(url.pathname);
+    if (componentMatch) {
+      if (options.mutationError) return failure(options.mutationError, 409, [], { expectedRevision: 1, currentRevision: 2 });
+      const owner = state.products.find((item) => item.composition.some((component) => component.id === componentMatch[1]))!;
+      const record = owner.composition.find((component) => component.id === componentMatch[1])!;
+      const conflict = revisionError(record.revision, body.expectedRevision); if (conflict) return conflict;
+      if (componentMatch[2]) record.status = componentMatch[2] === "archive" ? "archived" : "active";
+      else { const error = compositionError(owner, body.component, record.id); if (error) return error; Object.assign(record, body.component, { displayOrder: body.component.displayOrder ?? record.displayOrder }); }
       record.revision += 1;
       return response(record);
     }
@@ -692,6 +735,135 @@ describe("Product Catalog UI", () => {
   it("supports lifecycle and hides all mutations from pharmacist and cashier", async () => {
     const owner = renderApp(`/app/products/${IDs.product}`); fireEvent.click(await screen.findByRole("button", { name: "Archive Product" })); expect(screen.getByRole("dialog", { name: "Archive record" })).toBeInTheDocument(); expect(screen.getByRole("button", { name: "Archive record" })).toBeDisabled(); owner.unmount();
     renderApp(`/app/products/${IDs.product}`, catalogService({ role: "cashier" })); await screen.findByRole("heading", { name: "Crocin 500 mg Tablet" }); expect(screen.queryByRole("button", { name: /Archive Product|Add Pack|Add Company Role/ })).not.toBeInTheDocument(); expect(screen.getByRole("button", { name: "Manage" })).toBeInTheDocument();
+  });
+
+  // ---- Phase 1C-B composition ----
+
+  it("shows an empty composition for a medicine and hides the section for other product kinds", async () => {
+    renderApp(`/app/products/${IDs.product}`);
+    expect(await screen.findByRole("heading", { name: "Composition" })).toBeInTheDocument();
+    expect(screen.getByText("No composition recorded.")).toBeInTheDocument();
+    // The section states its own non-clinical boundary.
+    expect(screen.getByText(/implies no clinical, generic, or substitution equivalence/)).toBeInTheDocument();
+    cleanup();
+
+    const device = product(); device.productKind = "device"; device.dosageFormId = null;
+    renderApp(`/app/products/${IDs.product}`, catalogService({ products: [device] }));
+    await screen.findByRole("heading", { name: "Crocin 500 mg Tablet" });
+    expect(screen.queryByRole("heading", { name: "Composition" })).not.toBeInTheDocument();
+  });
+
+  it("records a single-ingredient strength as exact atoms with the typed precision", async () => {
+    const app = renderApp(`/app/products/${IDs.product}`);
+    fireEvent.click(await screen.findByRole("button", { name: "Add Component" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Component" });
+    await waitFor(() => expect(within(dialog).getByRole("combobox", { name: /^Ingredient/ })).toBeEnabled());
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Ingredient/ }), { target: { value: IDs.paracetamol } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /^Strength/ }), { target: { value: "0.125" } });
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Strength unit/ }), { target: { value: IDs.mg } });
+    // The preview is generated from the stored values, never typed by the operator.
+    expect(within(dialog).getByText("0.125 mg")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      const [sent] = bodiesFor(app.fetchMock, (url, method) => /\/composition$/.test(url) && method === "POST");
+      // 0.125 is stored as 125 atoms at scale 3 — never as a binary float.
+      expect(sent).toMatchObject({ ingredientId: IDs.paracetamol, strengthNumeratorAtoms: 125, strengthNumeratorScale: 3, strengthNumeratorUnitId: IDs.mg, strengthDenominatorAtoms: null });
+    });
+    expect(await screen.findByRole("cell", { name: "Paracetamol" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "0.125 mg" })).toBeInTheDocument();
+  });
+
+  it("records a combination medicine in deterministic order and a concentration strength", async () => {
+    const detail = product();
+    detail.composition = [
+      { id: `${IDs.component}-1`, productId: IDs.product, ingredientId: IDs.paracetamol, saltFormId: null, componentRole: "active", displayOrder: 0, strengthPresentation: "absolute", strengthNumeratorAtoms: 500, strengthNumeratorScale: 0, strengthNumeratorUnitId: IDs.mg, strengthDenominatorAtoms: null, strengthDenominatorScale: null, strengthDenominatorUnitId: null, revision: 1, status: "active", ...stamp },
+      { id: `${IDs.component}-2`, productId: IDs.product, ingredientId: IDs.caffeine, saltFormId: IDs.sodium, componentRole: "active", displayOrder: 1, strengthPresentation: "absolute", strengthNumeratorAtoms: 200, strengthNumeratorScale: 0, strengthNumeratorUnitId: IDs.mg, strengthDenominatorAtoms: 5, strengthDenominatorScale: 0, strengthDenominatorUnitId: IDs.mlUnit, revision: 1, status: "active", ...stamp }
+    ];
+    renderApp(`/app/products/${IDs.product}`, catalogService({ products: [detail] }));
+    expect(await screen.findByRole("cell", { name: "Paracetamol" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "500 mg" })).toBeInTheDocument();
+    // A concentration renders numerator and denominator, and the salt stays its own column.
+    expect(screen.getByRole("cell", { name: "200 mg / 5 ml" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "Sodium" })).toBeInTheDocument();
+    const rows = screen.getAllByRole("row").filter((row) => within(row).queryByText(/Paracetamol|Caffeine/));
+    expect(within(rows[0]).getByText("Paracetamol")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Caffeine")).toBeInTheDocument();
+  });
+
+  it("stores a percentage strength as an exact ratio out of one hundred", async () => {
+    const app = renderApp(`/app/products/${IDs.product}`);
+    fireEvent.click(await screen.findByRole("button", { name: "Add Component" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Component" });
+    await waitFor(() => expect(within(dialog).getByRole("combobox", { name: /^Ingredient/ })).toBeEnabled());
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Ingredient/ }), { target: { value: IDs.paracetamol } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /^Strength/ }), { target: { value: "1" } });
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Strength unit/ }), { target: { value: IDs.gUnit } });
+    fireEvent.click(within(dialog).getByLabelText(/Percentage strength/));
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Per unit/ }), { target: { value: IDs.gUnit } });
+    // Mass over mass reads as w/w, derived from the unit dimensions rather than stored.
+    expect(within(dialog).getByText("1% w/w")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      const [sent] = bodiesFor(app.fetchMock, (url, method) => /\/composition$/.test(url) && method === "POST");
+      expect(sent).toMatchObject({ strengthPresentation: "percentage", strengthNumeratorAtoms: 1, strengthDenominatorAtoms: 100, strengthDenominatorScale: 0 });
+    });
+  });
+
+  it("refuses a duplicate ingredient and reports it without raw backend detail", async () => {
+    const detail = product();
+    detail.composition = [{ id: `${IDs.component}-1`, productId: IDs.product, ingredientId: IDs.paracetamol, saltFormId: null, componentRole: "active", displayOrder: 0, strengthPresentation: "absolute", strengthNumeratorAtoms: 500, strengthNumeratorScale: 0, strengthNumeratorUnitId: IDs.mg, strengthDenominatorAtoms: null, strengthDenominatorScale: null, strengthDenominatorUnitId: null, revision: 1, status: "active", ...stamp }];
+    renderApp(`/app/products/${IDs.product}`, catalogService({ products: [detail] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add Component" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Component" });
+    await waitFor(() => expect(within(dialog).getByRole("combobox", { name: /^Ingredient/ })).toBeEnabled());
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Ingredient/ }), { target: { value: IDs.paracetamol } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /^Strength/ }), { target: { value: "250" } });
+    fireEvent.change(within(dialog).getByRole("combobox", { name: /^Strength unit/ }), { target: { value: IDs.mg } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(/already recorded|conflicts/i);
+    expect(alert).not.toHaveTextContent("raw backend detail");
+  });
+
+  it("edits, archives, and restores a component and reloads a stale revision", async () => {
+    const detail = product();
+    detail.composition = [{ id: `${IDs.component}-1`, productId: IDs.product, ingredientId: IDs.paracetamol, saltFormId: null, componentRole: "active", displayOrder: 0, strengthPresentation: "absolute", strengthNumeratorAtoms: 500, strengthNumeratorScale: 0, strengthNumeratorUnitId: IDs.mg, strengthDenominatorAtoms: null, strengthDenominatorScale: null, strengthDenominatorUnitId: null, revision: 1, status: "active", ...stamp }];
+    const app = renderApp(`/app/products/${IDs.product}`, catalogService({ products: [detail] }));
+    await screen.findByRole("cell", { name: "Paracetamol" });
+    const componentRow = () => screen.getAllByRole("row").find((row) => within(row).queryByText("Paracetamol"))!;
+    fireEvent.click(within(componentRow()).getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit Component" });
+    await waitFor(() => expect(within(dialog).getByRole("textbox", { name: /^Strength/ })).toHaveValue("500"));
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /^Strength/ }), { target: { value: "650" } });
+
+    // Another session saves first.
+    app.state.products[0].composition[0].revision = 5;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    const notice = await within(dialog).findByRole("alert");
+    expect(notice).toHaveTextContent("changed after you opened it");
+    expect(app.state.products[0].composition[0].strengthNumeratorAtoms).toBe(500);
+    fireEvent.click(within(notice).getByRole("button", { name: "Reload latest" }));
+    await waitFor(() => expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument());
+    fireEvent.change(within(dialog).getByRole("textbox", { name: /^Strength/ }), { target: { value: "650" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => { const sent = bodiesFor(app.fetchMock, (url, method) => /\/composition-components\/[^/]+$/.test(url) && method === "PUT"); expect(sent.at(-1).expectedRevision).toBe(5); });
+    await waitFor(() => expect(app.state.products[0].composition[0].strengthNumeratorAtoms).toBe(650));
+
+    fireEvent.click(within(componentRow()).getByRole("button", { name: "Archive" }));
+    fireEvent.change(await screen.findByRole("textbox", { name: /Reason/ }), { target: { value: "Recorded in error" } });
+    fireEvent.click(screen.getByRole("button", { name: "Archive record" }));
+    await waitFor(() => expect(app.state.products[0].composition[0].status).toBe("archived"));
+    // Archive is never delete.
+    expect(app.state.products[0].composition).toHaveLength(1);
+    fireEvent.click(within(componentRow()).getByRole("button", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore record" }));
+    await waitFor(() => expect(app.state.products[0].composition[0].status).toBe("active"));
+  });
+
+  it("hides composition mutations from pharmacist and cashier", async () => {
+    renderApp(`/app/products/${IDs.product}`, catalogService({ role: "pharmacist" }));
+    expect(await screen.findByRole("heading", { name: "Composition" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Component" })).not.toBeInTheDocument();
   });
 
   it("uses exact integer quantity conversion without binary floating point", () => {

@@ -28,7 +28,10 @@ export const ReferenceKindSchema = z.enum([
   "hsn-codes",
   "tax-categories",
   "tax-rate-versions",
-  "regulatory-categories"
+  "regulatory-categories",
+  "ingredients",
+  "salt-forms",
+  "strength-units"
 ]);
 
 export const MasterStatusSchema = z.enum(["active", "archived"]);
@@ -106,6 +109,29 @@ export const RegulatoryCategoryAttributesSchema = z.object({
   verificationState: VerificationStateSchema
 });
 
+/** The active moiety, independent of any salt form or strength. */
+export const IngredientAttributesSchema = z.object({
+  canonicalCode: z.string(),
+  displayName: z.string(),
+  normalizedSearchName: z.string().optional(),
+  description: z.string().nullable().optional()
+});
+
+/** The chemical form modifier applied to an ingredient — never the ingredient itself. */
+export const SaltFormAttributesSchema = z.object({
+  canonicalCode: z.string(),
+  displayName: z.string(),
+  normalizedSearchName: z.string().optional()
+});
+
+/** Units a pharmaceutical strength may be expressed in, separate from inventory units of measure. */
+export const StrengthUnitAttributesSchema = z.object({
+  canonicalCode: z.string(),
+  displayName: z.string(),
+  dimension: z.enum(["mass", "volume", "count", "activity", "substance_equivalent"]),
+  allowedScale: z.number().int()
+});
+
 export const ReferenceAttributesSchema = z.union([
   UnitAttributesSchema,
   DosageFormAttributesSchema,
@@ -115,7 +141,10 @@ export const ReferenceAttributesSchema = z.union([
   HsnAttributesSchema,
   TaxCategoryAttributesSchema,
   TaxRateVersionAttributesSchema,
-  RegulatoryCategoryAttributesSchema
+  RegulatoryCategoryAttributesSchema,
+  IngredientAttributesSchema,
+  SaltFormAttributesSchema,
+  StrengthUnitAttributesSchema
 ]);
 
 const ReferenceMasterBaseSchema = z.object({
@@ -137,7 +166,10 @@ export const ReferenceMasterResponseSchema = z.discriminatedUnion("kind", [
   ReferenceMasterBaseSchema.extend({ kind: z.literal("hsn-codes"), attributes: HsnAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-categories"), attributes: TaxCategoryAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-rate-versions"), attributes: TaxRateVersionAttributesSchema }),
-  ReferenceMasterBaseSchema.extend({ kind: z.literal("regulatory-categories"), attributes: RegulatoryCategoryAttributesSchema })
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("regulatory-categories"), attributes: RegulatoryCategoryAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("ingredients"), attributes: IngredientAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("salt-forms"), attributes: SaltFormAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("strength-units"), attributes: StrengthUnitAttributesSchema })
 ]);
 
 export const CreateReferenceRequestSchema = z.object({
@@ -304,9 +336,46 @@ export const ProductSchema = ProductFieldsSchema.extend({
   archiveReason: z.string().nullable()
 });
 
+/**
+ * Manufacturer-stated composition of one medicine Product. Business identity only: nothing here
+ * asserts generic, therapeutic, clinical, or substitution equivalence.
+ */
+export const CompositionComponentFieldsSchema = z.object({
+  ingredientId: z.string(),
+  saltFormId: z.string().nullable().optional(),
+  componentRole: z.enum(["active", "inactive"]).default("active"),
+  displayOrder: z.number().int().nonnegative().nullable().optional(),
+  strengthPresentation: z.enum(["absolute", "percentage"]).default("absolute"),
+  strengthNumeratorAtoms: z.number().int().positive(),
+  strengthNumeratorScale: z.number().int().min(0).max(6),
+  strengthNumeratorUnitId: z.string(),
+  strengthDenominatorAtoms: z.number().int().positive().nullable().optional(),
+  strengthDenominatorScale: z.number().int().min(0).max(6).nullable().optional(),
+  strengthDenominatorUnitId: z.string().nullable().optional()
+});
+
+export const CompositionComponentSchema = CompositionComponentFieldsSchema.extend({
+  id: z.string(),
+  productId: z.string(),
+  displayOrder: z.number().int().nonnegative(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const UpdateCompositionComponentRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  component: CompositionComponentFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
 export const ProductDetailSchema = ProductSchema.extend({
   companyRoles: z.array(ProductCompanyRoleSchema),
-  packs: z.array(ProductPackSchema)
+  packs: z.array(ProductPackSchema),
+  composition: z.array(CompositionComponentSchema).default([])
 });
 
 export const AggregatePackSchema = ProductPackFieldsSchema.extend({
@@ -373,6 +442,7 @@ export const CatalogErrorResponseSchema = z.object({
     "conversion_conflict",
     "barcode_conflict",
     "default_pack_conflict",
+    "composition_conflict",
     "authentication_required",
     "session_expired",
     "authorization_denied",
@@ -393,6 +463,8 @@ export type ProductCompanyRoleFields = z.infer<typeof ProductCompanyRoleFieldsSc
 export type ProductPack = z.infer<typeof ProductPackSchema>;
 export type ProductPackFields = z.infer<typeof ProductPackFieldsSchema>;
 export type StorePackPolicy = z.infer<typeof StorePackPolicySchema>;
+export type CompositionComponent = z.infer<typeof CompositionComponentSchema>;
+export type CompositionComponentFields = z.infer<typeof CompositionComponentFieldsSchema>;
 export type StorePackPolicyFields = z.infer<typeof StorePackPolicyFieldsSchema>;
 export type Barcode = z.infer<typeof BarcodeSchema>;
 export type BarcodeLookup = z.infer<typeof BarcodeLookupSchema>;
