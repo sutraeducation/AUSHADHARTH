@@ -359,6 +359,10 @@ export const DuplicateCandidateSchema = z.object({
   explanation: z.string()
 });
 
+export const CatalogContextSchema = z.object({
+  storeId: z.string()
+});
+
 export const CatalogErrorResponseSchema = z.object({
   code: z.enum([
     "validation_failed",
@@ -369,6 +373,10 @@ export const CatalogErrorResponseSchema = z.object({
     "conversion_conflict",
     "barcode_conflict",
     "default_pack_conflict",
+    "authentication_required",
+    "session_expired",
+    "authorization_denied",
+    "service_busy",
     "internal_error"
   ]),
   message: z.string(),
@@ -381,10 +389,15 @@ export type ProductFields = z.infer<typeof ProductFieldsSchema>;
 export type Product = z.infer<typeof ProductSchema>;
 export type ProductDetail = z.infer<typeof ProductDetailSchema>;
 export type ProductCompanyRole = z.infer<typeof ProductCompanyRoleSchema>;
+export type ProductCompanyRoleFields = z.infer<typeof ProductCompanyRoleFieldsSchema>;
 export type ProductPack = z.infer<typeof ProductPackSchema>;
+export type ProductPackFields = z.infer<typeof ProductPackFieldsSchema>;
 export type StorePackPolicy = z.infer<typeof StorePackPolicySchema>;
+export type StorePackPolicyFields = z.infer<typeof StorePackPolicyFieldsSchema>;
 export type Barcode = z.infer<typeof BarcodeSchema>;
+export type BarcodeLookup = z.infer<typeof BarcodeLookupSchema>;
 export type DuplicateCandidate = z.infer<typeof DuplicateCandidateSchema>;
+export type CatalogContext = z.infer<typeof CatalogContextSchema>;
 export type CreateProductRequest = z.infer<typeof CreateProductRequestSchema>;
 export type CatalogErrorResponse = z.infer<typeof CatalogErrorResponseSchema>;
 

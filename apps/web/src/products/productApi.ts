@@ -1,0 +1,170 @@
+import {
+  BarcodeSchema,
+  CatalogContextSchema,
+  DuplicateCandidateSchema,
+  ProductCompanyRoleSchema,
+  ProductDetailSchema,
+  ProductPackSchema,
+  ProductSchema,
+  StorePackPolicySchema,
+  type Barcode,
+  type BarcodeLookup,
+  type CreateProductRequest,
+  type Product,
+  type ProductCompanyRole,
+  type ProductCompanyRoleFields,
+  type ProductDetail,
+  type ProductFields,
+  type ProductPack,
+  type ProductPackFields,
+  type StorePackPolicy,
+  type StorePackPolicyFields
+} from "@aushadharth/contracts";
+import { LocalServiceError, localServiceRequest } from "../platform/localService";
+
+export type CatalogStatusFilter = "active" | "archived" | "all";
+
+export async function getCatalogContext() {
+  return CatalogContextSchema.parse(await localServiceRequest("/api/v1/catalog/context"));
+}
+
+export async function listProducts(search = "", status: CatalogStatusFilter = "active"): Promise<Product[]> {
+  const query = new URLSearchParams({ status });
+  if (search.trim()) query.set("search", search.trim());
+  return ProductSchema.array().parse(await localServiceRequest(`/api/v1/products?${query}`));
+}
+
+export async function getProduct(id: string): Promise<ProductDetail> {
+  return ProductDetailSchema.parse(await localServiceRequest(`/api/v1/products/${encodeURIComponent(id)}`));
+}
+
+export async function findDuplicateCandidates(request: CreateProductRequest) {
+  return DuplicateCandidateSchema.array().parse(await localServiceRequest("/api/v1/products/duplicate-candidates", {
+    method: "POST",
+    body: JSON.stringify(request)
+  }));
+}
+
+export async function createProduct(request: CreateProductRequest): Promise<ProductDetail> {
+  return ProductDetailSchema.parse(await localServiceRequest("/api/v1/products", {
+    method: "POST",
+    body: JSON.stringify(request)
+  }));
+}
+
+export async function updateProduct(record: Product, product: ProductFields): Promise<ProductDetail> {
+  return ProductDetailSchema.parse(await localServiceRequest(`/api/v1/products/${record.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: record.revision, product })
+  }));
+}
+
+export async function changeProductLifecycle(record: Product, action: "archive" | "restore", reason: string): Promise<ProductDetail> {
+  return ProductDetailSchema.parse(await localServiceRequest(`/api/v1/products/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export async function createCompanyRole(productId: string, role: ProductCompanyRoleFields): Promise<ProductCompanyRole> {
+  return ProductCompanyRoleSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/company-roles`, {
+    method: "POST",
+    body: JSON.stringify(role)
+  }));
+}
+
+export async function updateCompanyRole(record: ProductCompanyRole, role: ProductCompanyRoleFields): Promise<ProductCompanyRole> {
+  return ProductCompanyRoleSchema.parse(await localServiceRequest(`/api/v1/company-roles/${record.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: record.revision, role })
+  }));
+}
+
+export async function changeCompanyRoleLifecycle(record: ProductCompanyRole, action: "archive" | "restore", reason: string): Promise<ProductCompanyRole> {
+  return ProductCompanyRoleSchema.parse(await localServiceRequest(`/api/v1/company-roles/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export async function createPack(productId: string, pack: ProductPackFields): Promise<ProductPack> {
+  return ProductPackSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/packs`, {
+    method: "POST",
+    body: JSON.stringify(pack)
+  }));
+}
+
+export async function updatePack(record: ProductPack, pack: ProductPackFields): Promise<ProductPack> {
+  return ProductPackSchema.parse(await localServiceRequest(`/api/v1/packs/${record.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: record.revision, pack })
+  }));
+}
+
+export async function changePackLifecycle(record: ProductPack, action: "archive" | "restore", reason: string): Promise<ProductPack> {
+  return ProductPackSchema.parse(await localServiceRequest(`/api/v1/packs/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export async function getPackPolicy(packId: string): Promise<StorePackPolicy | null> {
+  try {
+    return StorePackPolicySchema.parse(await localServiceRequest(`/api/v1/packs/${packId}/policy`));
+  } catch (error) {
+    if (error instanceof LocalServiceError && error.code === "not_found") return null;
+    throw error;
+  }
+}
+
+export async function savePackPolicy(packId: string, current: StorePackPolicy | null, policy: StorePackPolicyFields): Promise<StorePackPolicy> {
+  return StorePackPolicySchema.parse(await localServiceRequest(`/api/v1/packs/${packId}/policy`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision: current?.revision ?? null, policy })
+  }));
+}
+
+export async function changePackPolicyLifecycle(record: StorePackPolicy, action: "archive" | "restore", reason: string): Promise<StorePackPolicy> {
+  return StorePackPolicySchema.parse(await localServiceRequest(`/api/v1/pack-policies/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export async function listBarcodes(packId: string): Promise<Barcode[]> {
+  return BarcodeSchema.array().parse(await localServiceRequest(`/api/v1/packs/${packId}/barcodes`));
+}
+
+export async function createBarcode(packId: string, barcode: BarcodeLookup & { symbology?: string | null }): Promise<Barcode> {
+  return BarcodeSchema.parse(await localServiceRequest(`/api/v1/packs/${packId}/barcodes`, {
+    method: "POST",
+    body: JSON.stringify(barcode)
+  }));
+}
+
+export async function changeBarcodeLifecycle(record: Barcode, action: "archive" | "restore", reason: string): Promise<Barcode> {
+  return BarcodeSchema.parse(await localServiceRequest(`/api/v1/barcodes/${record.id}/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision: record.revision, reason })
+  }));
+}
+
+export function quantityToAtoms(value: string, scale: number): number | null {
+  const normalized = value.trim();
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(normalized);
+  if (!match || (match[2]?.length ?? 0) > scale) return null;
+  const factor = 10 ** scale;
+  const whole = Number.parseInt(match[1], 10);
+  const fraction = Number.parseInt((match[2] ?? "").padEnd(scale, "0") || "0", 10);
+  if (!Number.isSafeInteger(whole) || whole > Math.floor(Number.MAX_SAFE_INTEGER / factor)) return null;
+  const atoms = whole * factor + fraction;
+  return Number.isSafeInteger(atoms) && atoms > 0 ? atoms : null;
+}
+
+export function atomsToQuantity(atoms: number, scale: number): string {
+  if (scale === 0) return String(atoms);
+  const factor = 10 ** scale;
+  const whole = Math.floor(atoms / factor);
+  const fractional = String(atoms % factor).padStart(scale, "0").replace(/0+$/, "");
+  return fractional ? `${whole}.${fractional}` : String(whole);
+}

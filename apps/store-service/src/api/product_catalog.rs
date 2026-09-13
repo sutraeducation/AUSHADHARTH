@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use super::reference_masters::ReferenceState;
+use super::{
+    auth::{self, AuthError, AuthenticatedActor},
+    reference_masters::ReferenceState,
+};
 use crate::domain::catalog::{
     CatalogValidationIssue, MAX_BASE_QUANTITY_ATOMS, MAX_QUANTITY_SCALE, normalize_barcode,
     normalize_sku, normalized_search_name, optional_text, required_text, validate_date,
@@ -21,6 +24,7 @@ use crate::domain::catalog::{
 
 #[derive(Debug)]
 enum CatalogError {
+    Auth(AuthError),
     Validation(Vec<CatalogValidationIssue>),
     Duplicate,
     Revision { expected: i64, current: i64 },
@@ -29,6 +33,7 @@ enum CatalogError {
     Conversion,
     Barcode,
     DefaultPack,
+    ServiceBusy,
     Internal,
 }
 
@@ -51,6 +56,7 @@ struct ErrorIssue {
 impl IntoResponse for CatalogError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
+            Self::Auth(error) => return error.into_response(),
             Self::Validation(issues) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ErrorBody {
@@ -116,12 +122,28 @@ impl IntoResponse for CatalogError {
                     "The pack policy conflicts with another default or its enabled flags.",
                 ),
             ),
+            Self::ServiceBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorBody {
+                    code: "service_busy",
+                    message: "The local service is busy. Try again shortly.",
+                    issues: Vec::new(),
+                    expected_revision: None,
+                    current_revision: None,
+                },
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 simple_error("internal_error", "The operation could not be completed."),
             ),
         };
         (status, Json(body)).into_response()
+    }
+}
+
+impl From<AuthError> for CatalogError {
+    fn from(value: AuthError) -> Self {
+        Self::Auth(value)
     }
 }
 
@@ -394,8 +416,15 @@ struct DuplicateCandidate {
     explanation: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogContextResponse {
+    store_id: String,
+}
+
 pub fn routes() -> Router<ReferenceState> {
     Router::new()
+        .route("/api/v1/catalog/context", get(catalog_context))
         .route("/api/v1/products", get(list_products).post(create_product))
         .route(
             "/api/v1/products/duplicate-candidates",
@@ -443,10 +472,44 @@ pub fn routes() -> Router<ReferenceState> {
         .route("/api/v1/barcodes/{id}/restore", post(restore_barcode))
 }
 
+async fn require_catalog_reader(
+    state: &ReferenceState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActor, CatalogError> {
+    Ok(auth::require_authenticated_actor(&state.pool, headers).await?)
+}
+
+async fn require_catalog_admin(
+    state: &ReferenceState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActor, CatalogError> {
+    auth::validate_mutation_request(headers)?;
+    let actor = auth::require_authenticated_actor(&state.pool, headers).await?;
+    if actor.role != "owner_admin" {
+        return Err(AuthError::AuthorizationDenied.into());
+    }
+    Ok(actor)
+}
+
+async fn catalog_context(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+) -> Result<Json<CatalogContextResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    let store_id = sqlx::query_scalar("SELECT store_id FROM store_identity LIMIT 1")
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| CatalogError::Internal)?
+        .ok_or(CatalogError::NotFound)?;
+    Ok(Json(CatalogContextResponse { store_id }))
+}
+
 async fn list_products(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<ProductResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     let status = query.status.unwrap_or_else(|| "active".to_owned());
     if !matches!(status.as_str(), "active" | "archived" | "all") {
         return Err(validation("status", "must be active, archived, or all"));
@@ -485,16 +548,20 @@ async fn list_products(
 
 async fn get_product(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ProductDetailResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     Ok(Json(fetch_product_detail(&state.pool, &id).await?))
 }
 
 async fn create_product(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Json(request): Json<CreateProductRequest>,
 ) -> Result<(StatusCode, Json<ProductDetailResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     let CreateProductRequest {
         product,
         company_roles,
@@ -524,6 +591,7 @@ async fn create_product(
         "created",
         reason.as_deref(),
         &product,
+        &actor.id,
     )
     .await?;
 
@@ -538,6 +606,7 @@ async fn create_product(
             "created",
             reason.as_deref(),
             role,
+            &actor.id,
         )
         .await?;
     }
@@ -559,6 +628,7 @@ async fn create_product(
             "created",
             reason.as_deref(),
             &aggregate_pack.pack,
+            &actor.id,
         )
         .await?;
         if let Some(policy) = &aggregate_pack.policy {
@@ -580,6 +650,7 @@ async fn create_product(
                 "created",
                 reason.as_deref(),
                 policy,
+                &actor.id,
             )
             .await?;
         }
@@ -601,6 +672,7 @@ async fn create_product(
                 "created",
                 reason.as_deref(),
                 barcode,
+                &actor.id,
             )
             .await?;
         }
@@ -614,9 +686,11 @@ async fn create_product(
 
 async fn update_product(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<UpdateProductRequest>,
 ) -> Result<Json<ProductDetailResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     let product = prepare_product(request.product)?;
     let mut transaction = state
@@ -666,6 +740,7 @@ async fn update_product(
         "updated",
         request.reason.as_deref(),
         &product,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -674,18 +749,22 @@ async fn update_product(
 
 async fn archive_product(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<ProductDetailResponse>, CatalogError> {
-    lifecycle_product(&state.pool, &id, request, false).await
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_product(&state.pool, &id, request, false, &actor.id).await
 }
 
 async fn restore_product(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<ProductDetailResponse>, CatalogError> {
-    lifecycle_product(&state.pool, &id, request, true).await
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_product(&state.pool, &id, request, true, &actor.id).await
 }
 
 async fn lifecycle_product(
@@ -693,6 +772,7 @@ async fn lifecycle_product(
     id: &str,
     request: LifecycleRequest,
     restoring: bool,
+    actor_id: &str,
 ) -> Result<Json<ProductDetailResponse>, CatalogError> {
     validate_uuid_v7(id, "id").map_err(validation_issue)?;
     let reason = required_text(&request.reason, "reason", 500).map_err(validation_issue)?;
@@ -733,6 +813,7 @@ async fn lifecycle_product(
         if restoring { "restored" } else { "archived" },
         Some(&reason),
         &json!({}),
+        actor_id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -759,8 +840,10 @@ async fn fetch_product_detail(
 
 async fn list_company_roles(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(product_id): Path<String>,
 ) -> Result<Json<Vec<CompanyRoleResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
     ensure_product_exists(&state.pool, &product_id).await?;
     Ok(Json(company_roles_for(&state.pool, &product_id).await?))
@@ -768,9 +851,11 @@ async fn list_company_roles(
 
 async fn create_company_role(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(product_id): Path<String>,
     Json(input): Json<CompanyRoleInput>,
 ) -> Result<(StatusCode, Json<CompanyRoleResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
     let input = prepare_company_role(input)?;
     let mut transaction = state
@@ -793,6 +878,7 @@ async fn create_company_role(
         "created",
         None,
         &input,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -804,9 +890,11 @@ async fn create_company_role(
 
 async fn update_company_role(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<UpdateCompanyRoleRequest>,
 ) -> Result<Json<CompanyRoleResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     let input = prepare_company_role(request.role)?;
     let mut transaction = state
@@ -834,6 +922,7 @@ async fn update_company_role(
         "updated",
         request.reason.as_deref(),
         &input,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -842,9 +931,11 @@ async fn update_company_role(
 
 async fn archive_company_role(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<CompanyRoleResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     lifecycle_simple(
         &state.pool,
         "product_company_roles",
@@ -852,6 +943,7 @@ async fn archive_company_role(
         &id,
         request,
         false,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_company_role(&state.pool, &id).await?))
@@ -859,9 +951,11 @@ async fn archive_company_role(
 
 async fn restore_company_role(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<CompanyRoleResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     lifecycle_simple(
         &state.pool,
         "product_company_roles",
@@ -869,6 +963,7 @@ async fn restore_company_role(
         &id,
         request,
         true,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_company_role(&state.pool, &id).await?))
@@ -876,9 +971,11 @@ async fn restore_company_role(
 
 async fn create_pack(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(product_id): Path<String>,
     Json(input): Json<PackInput>,
 ) -> Result<(StatusCode, Json<PackResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
     let input = prepare_pack(input)?;
     let mut transaction = state
@@ -901,6 +998,7 @@ async fn create_pack(
         "created",
         None,
         &input,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -912,8 +1010,10 @@ async fn create_pack(
 
 async fn list_packs(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(product_id): Path<String>,
 ) -> Result<Json<Vec<PackResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&product_id, "id").map_err(validation_issue)?;
     ensure_product_exists(&state.pool, &product_id).await?;
     Ok(Json(packs_for(&state.pool, &product_id).await?))
@@ -921,17 +1021,21 @@ async fn list_packs(
 
 async fn get_pack(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<PackResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     Ok(Json(fetch_pack(&state.pool, &id).await?))
 }
 
 async fn update_pack(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<UpdatePackRequest>,
 ) -> Result<Json<PackResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     let input = prepare_pack(request.pack)?;
     let mut transaction = state
@@ -999,6 +1103,7 @@ async fn update_pack(
         "updated",
         request.reason.as_deref(),
         &input,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -1017,9 +1122,11 @@ async fn is_pack_conversion_locked(
 
 async fn archive_pack(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<PackResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     let mut transaction = state
         .pool
@@ -1048,6 +1155,7 @@ async fn archive_pack(
         &id,
         request,
         false,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_pack(&state.pool, &id).await?))
@@ -1055,9 +1163,11 @@ async fn archive_pack(
 
 async fn restore_pack(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<PackResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     lifecycle_simple(
         &state.pool,
         "product_packs",
@@ -1065,6 +1175,7 @@ async fn restore_pack(
         &id,
         request,
         true,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_pack(&state.pool, &id).await?))
@@ -1072,8 +1183,10 @@ async fn restore_pack(
 
 async fn get_policy(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(pack_id): Path<String>,
 ) -> Result<Json<PolicyResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
     let policy = sqlx::query_as::<_, PolicyResponse>(
         "SELECT id,store_id,product_id,pack_id,purchase_enabled,sale_enabled,whole_pack_only_purchase,\
@@ -1091,9 +1204,11 @@ async fn get_policy(
 
 async fn put_policy(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(pack_id): Path<String>,
     Json(request): Json<UpdatePolicyRequest>,
 ) -> Result<(StatusCode, Json<PolicyResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
     let policy = prepare_policy(request.policy)?;
     let mut transaction = state
@@ -1149,6 +1264,7 @@ async fn put_policy(
         action,
         request.reason.as_deref(),
         &policy,
+        &actor.id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)?;
@@ -1157,9 +1273,11 @@ async fn put_policy(
 
 async fn archive_policy(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<PolicyResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     lifecycle_simple(
         &state.pool,
         "store_pack_policies",
@@ -1167,6 +1285,7 @@ async fn archive_policy(
         &id,
         request,
         false,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_policy(&state.pool, &id).await?))
@@ -1174,9 +1293,11 @@ async fn archive_policy(
 
 async fn restore_policy(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<PolicyResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     lifecycle_simple(
         &state.pool,
         "store_pack_policies",
@@ -1184,6 +1305,7 @@ async fn restore_policy(
         &id,
         request,
         true,
+        &actor.id,
     )
     .await?;
     Ok(Json(fetch_policy(&state.pool, &id).await?))
@@ -1191,8 +1313,10 @@ async fn restore_policy(
 
 async fn list_barcodes(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(pack_id): Path<String>,
 ) -> Result<Json<Vec<BarcodeResponse>>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
     fetch_pack(&state.pool, &pack_id).await?;
     let rows = sqlx::query_as::<_, BarcodeResponse>(
@@ -1209,9 +1333,11 @@ async fn list_barcodes(
 
 async fn create_barcode(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(pack_id): Path<String>,
     Json(input): Json<BarcodeInput>,
 ) -> Result<(StatusCode, Json<BarcodeResponse>), CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
     validate_uuid_v7(&pack_id, "id").map_err(validation_issue)?;
     let input = prepare_barcode(input)?;
     let mut transaction = state
@@ -1226,7 +1352,17 @@ async fn create_barcode(
     let id = Uuid::now_v7().to_string();
     let now = database_now(&mut transaction).await?;
     insert_barcode_row(&mut transaction, &id, &pack_id, &input, &now).await?;
-    audit(&mut transaction, "barcode", &id, 1, "created", None, &input).await?;
+    audit(
+        &mut transaction,
+        "barcode",
+        &id,
+        1,
+        "created",
+        None,
+        &input,
+        &actor.id,
+    )
+    .await?;
     transaction.commit().await.map_err(map_database_error)?;
     Ok((
         StatusCode::CREATED,
@@ -1236,16 +1372,20 @@ async fn create_barcode(
 
 async fn get_barcode(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<BarcodeResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
     Ok(Json(fetch_barcode(&state.pool, &id).await?))
 }
 
 async fn resolve_barcode(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Query(query): Query<BarcodeLookupQuery>,
 ) -> Result<Json<BarcodeResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
     let normalized = prepare_barcode(BarcodeInput {
         namespace: query.namespace,
         value: query.value,
@@ -1269,26 +1409,51 @@ async fn resolve_barcode(
 
 async fn archive_barcode(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<BarcodeResponse>, CatalogError> {
-    lifecycle_simple(&state.pool, "barcodes", "barcode", &id, request, false).await?;
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "barcodes",
+        "barcode",
+        &id,
+        request,
+        false,
+        &actor.id,
+    )
+    .await?;
     Ok(Json(fetch_barcode(&state.pool, &id).await?))
 }
 
 async fn restore_barcode(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<BarcodeResponse>, CatalogError> {
-    lifecycle_simple(&state.pool, "barcodes", "barcode", &id, request, true).await?;
+    let actor = require_catalog_admin(&state, &headers).await?;
+    lifecycle_simple(
+        &state.pool,
+        "barcodes",
+        "barcode",
+        &id,
+        request,
+        true,
+        &actor.id,
+    )
+    .await?;
     Ok(Json(fetch_barcode(&state.pool, &id).await?))
 }
 
 async fn duplicate_candidates(
     State(state): State<ReferenceState>,
+    headers: HeaderMap,
     Json(request): Json<CreateProductRequest>,
 ) -> Result<Json<Vec<DuplicateCandidate>>, CatalogError> {
+    auth::validate_mutation_request(&headers)?;
+    require_catalog_reader(&state, &headers).await?;
     let product = prepare_product(request.product)?;
     let role_companies = request
         .company_roles
@@ -1921,6 +2086,7 @@ async fn lifecycle_simple(
     id: &str,
     request: LifecycleRequest,
     restoring: bool,
+    actor_id: &str,
 ) -> Result<(), CatalogError> {
     validate_uuid_v7(id, "id").map_err(validation_issue)?;
     let reason = required_text(&request.reason, "reason", 500).map_err(validation_issue)?;
@@ -1973,6 +2139,7 @@ async fn lifecycle_simple(
         if restoring { "restored" } else { "archived" },
         Some(&reason),
         &json!({}),
+        actor_id,
     )
     .await?;
     transaction.commit().await.map_err(map_database_error)
@@ -1985,6 +2152,9 @@ async fn database_now(transaction: &mut Transaction<'_, Sqlite>) -> Result<Strin
         .map_err(|_| CatalogError::Internal)
 }
 
+// The explicit audit coordinates keep every call site reviewable and prevent a
+// partially populated event from crossing this accounting boundary.
+#[allow(clippy::too_many_arguments)]
 async fn audit<T: Serialize>(
     transaction: &mut Transaction<'_, Sqlite>,
     entity_type: &str,
@@ -1993,6 +2163,7 @@ async fn audit<T: Serialize>(
     action: &str,
     reason: Option<&str>,
     payload: &T,
+    actor_id: &str,
 ) -> Result<(), CatalogError> {
     let value = serde_json::to_value(payload).map_err(|_| CatalogError::Internal)?;
     audit_value(
@@ -2003,10 +2174,12 @@ async fn audit<T: Serialize>(
         action,
         reason,
         &value,
+        actor_id,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn audit_value(
     transaction: &mut Transaction<'_, Sqlite>,
     entity_type: &str,
@@ -2015,16 +2188,34 @@ async fn audit_value(
     action: &str,
     reason: Option<&str>,
     payload: &Value,
+    actor_id: &str,
 ) -> Result<(), CatalogError> {
     sqlx::query(
-        "INSERT INTO master_change_events (event_id,entity_type,entity_id,entity_revision,action,occurred_at_utc,reason,payload_schema_version,change_payload) \
-         VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,1,?)",
+        "INSERT INTO master_change_events (event_id,entity_type,entity_id,entity_revision,action,occurred_at_utc,reason,payload_schema_version,change_payload,actor_id) \
+         VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,1,?,?)",
     ).bind(Uuid::now_v7().to_string()).bind(entity_type).bind(entity_id).bind(revision).bind(action).bind(reason)
-      .bind(payload.to_string()).execute(&mut **transaction).await.map_err(map_database_error)?;
+      .bind(payload.to_string()).bind(actor_id).execute(&mut **transaction).await.map_err(map_database_error)?;
     Ok(())
 }
 
 fn map_database_error(error: sqlx::Error) -> CatalogError {
+    let is_contention = match &error {
+        sqlx::Error::Database(database) => {
+            matches!(
+                database.code().as_deref(),
+                Some("5" | "6" | "261" | "262" | "517")
+            ) || {
+                let message = database.message().to_ascii_lowercase();
+                message.contains("database is locked")
+                    || message.contains("database table is locked")
+                    || message.contains("database is busy")
+            }
+        }
+        _ => false,
+    };
+    if is_contention {
+        return CatalogError::ServiceBusy;
+    }
     let message = error.to_string();
     if message.contains("pack_conversion_conflict")
         || message.contains("product_quantity_scale_conflict")
@@ -2053,6 +2244,8 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration as StdDuration, Instant};
+
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
@@ -2065,6 +2258,11 @@ mod tests {
     const BOX_UNIT: &str = "01997000-0000-7000-8000-000000000005";
     const ML: &str = "01997000-0000-7000-8000-000000000011";
     const LITRE: &str = "01997000-0000-7000-8000-000000000012";
+    const OWNER_TOKEN: &str = "catalog-owner-session-token";
+    /// Worst documented contention path is two sequential busy timeouts; the third allows for test
+    /// scheduling on a loaded machine without letting a deadlock or retry loop pass.
+    const CONTENTION_CEILING: StdDuration =
+        crate::infrastructure::database::BUSY_TIMEOUT.saturating_mul(3);
 
     async fn test_pool() -> (tempfile::TempDir, SqlitePool, String) {
         let temp = tempfile::tempdir().unwrap();
@@ -2080,7 +2278,115 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        insert_session(&pool, "owner_admin", OWNER_TOKEN).await;
         (temp, pool, store_id)
+    }
+
+    /// A contended write must finish on the configured busy timeout, report the typed `service_busy`
+    /// code with no database detail, leave nothing behind, and leave the pool usable.
+    ///
+    /// The wall-clock ceiling is derived from `BUSY_TIMEOUT` rather than written as a literal. A
+    /// request may wait through two busy timeouts in sequence, because the session touch in
+    /// `required_session` serialises behind the process-wide auth write lock and the holder of that
+    /// lock may itself be inside a busy wait; `CONTENTION_CEILING` therefore allows that documented
+    /// worst case plus scheduling margin, and only a deadlock or an unbounded retry can exceed it.
+    #[tokio::test]
+    async fn catalog_database_contention_is_bounded_and_maps_to_service_busy() {
+        let (_temp, pool, _) = test_pool().await;
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CONTENTION_CEILING,
+            request_json(
+                pool.clone(),
+                "POST",
+                "/api/v1/products",
+                json!({"product":product_fields("Busy Product",TABLET,0)}),
+            ),
+        )
+        .await
+        .expect("catalog contention must remain bounded");
+        let waited = started.elapsed();
+        sqlx::query("ROLLBACK")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.1["code"], "service_busy");
+        assert_no_database_detail(&response.1);
+        // The request really did wait on the contended lock rather than failing early for an
+        // unrelated reason. Scheduling can only make this slower, never faster.
+        assert!(
+            waited >= crate::infrastructure::database::BUSY_TIMEOUT / 2,
+            "contended write returned after {waited:?} without waiting on the lock"
+        );
+
+        // The abandoned attempt wrote nothing and poisoned no connection: once the lock is released
+        // the identical request succeeds and exactly one Product exists.
+        let (status, retried) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({"product":product_fields("Busy Product",TABLET,0)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{retried}");
+        let products: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            products, 1,
+            "the busy attempt must not have replayed a write"
+        );
+    }
+
+    /// The typed `code` is the only machine detail a client may see; the human-facing text must not
+    /// carry SQLite, sqlx, or Rust internals.
+    fn assert_no_database_detail(body: &Value) {
+        let rendered = format!("{} {}", body["message"], body["issues"]).to_lowercase();
+        for leak in ["sqlite", "locked", "sqlx", "panicked", "error code"] {
+            assert!(
+                !rendered.contains(leak),
+                "contention response leaked {leak:?}: {body}"
+            );
+        }
+    }
+
+    async fn insert_session(pool: &SqlitePool, role: &str, token: &str) -> String {
+        let user_id = Uuid::now_v7().to_string();
+        let login = format!("{role}-{}", &user_id[0..8]);
+        sqlx::query(
+            "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,password_hash,role,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',?,?,?)",
+        )
+        .bind(&user_id)
+        .bind(&login)
+        .bind(&login)
+        .bind(format!("{role} test user"))
+        .bind(role)
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,last_seen_at_utc) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&user_id)
+        .bind(crate::api::auth::sha256_hex(token.as_bytes()))
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2099-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
     }
 
     async fn request_json(
@@ -2089,12 +2395,27 @@ mod tests {
         uri: &str,
         body: Value,
     ) -> (StatusCode, Value) {
+        request_json_as(pool, method, uri, body, Some(OWNER_TOKEN)).await
+    }
+
+    async fn request_json_as(
+        pool: SqlitePool,
+        method: &str,
+        uri: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:47831")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("cookie", format!("aushadharth_session={token}"));
+        }
         let response = crate::api::router(pool, None)
             .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json")
+                request
                     .body(Body::from(if body.is_null() {
                         String::new()
                     } else {
@@ -2501,6 +2822,49 @@ mod tests {
         let second_id = second["id"].as_str().unwrap();
         assert_eq!(second["skuCode"], "SKU-15");
 
+        // A SKU is Store-scoped: sku_store_id must be supplied exactly when sku_code is. A client
+        // that sends a SKU without its Store is rejected on create and on update alike.
+        let (status, unscoped) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{product_id}/packs"),
+            json!({
+                "containerUnitId":BOX_UNIT,"baseQuantityAtoms":150,"skuCode":"SKU-UNSCOPED","skuStoreId":Value::Null
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unscoped}");
+        assert_eq!(unscoped["code"], "validation_failed");
+        assert_eq!(unscoped["issues"][0]["field"], "skuStoreId");
+        let (status, unscoped_update) = request_json(
+            pool.clone(),
+            "PUT",
+            &format!("/api/v1/packs/{second_id}"),
+            json!({
+                "expectedRevision":1,
+                "pack":{"containerUnitId":STRIP,"baseQuantityAtoms":15,"skuCode":"SKU-15","skuStoreId":Value::Null}
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{unscoped_update}"
+        );
+        assert_eq!(unscoped_update["issues"][0]["field"], "skuStoreId");
+        // A Store without a SKU is equally invalid: the pair is all-or-nothing.
+        let (status, orphan_store) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{product_id}/packs"),
+            json!({
+                "containerUnitId":BOX_UNIT,"baseQuantityAtoms":150,"skuStoreId":store_id
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{orphan_store}");
+        assert_eq!(orphan_store["issues"][0]["field"], "skuStoreId");
+        // Whitespace normalizes away to no SKU, so it must arrive with no Store either.
         let (status, blank) = request_json(
             pool.clone(),
             "POST",
@@ -2511,6 +2875,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{blank}");
+        assert_eq!(blank["skuCode"], Value::Null);
+        assert_eq!(blank["skuStoreId"], Value::Null);
+        let (status, blank_with_store) = request_json(
+            pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{product_id}/packs"),
+            json!({
+                "containerUnitId":BOX_UNIT,"baseQuantityAtoms":300,"skuCode":"   ","skuStoreId":store_id
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{blank_with_store}"
+        );
         let (status, duplicate_sku) = request_json(pool.clone(), "POST", &format!("/api/v1/products/{product_id}/packs"), json!({
             "containerUnitId":BOX_UNIT,"baseQuantityAtoms":300,"skuCode":"SKU-15","skuStoreId":store_id
         })).await;
@@ -2951,5 +3331,72 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "brand_match")
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_access_roles_context_and_server_audit_actor_are_enforced() {
+        let (_temp, pool, store_id) = test_pool().await;
+        let (status, _) =
+            request_json_as(pool.clone(), "GET", "/api/v1/products", Value::Null, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        for (role, token) in [
+            ("pharmacist", "catalog-pharmacist-token"),
+            ("cashier", "catalog-cashier-token"),
+        ] {
+            insert_session(&pool, role, token).await;
+            let (read_status, _) = request_json_as(
+                pool.clone(),
+                "GET",
+                "/api/v1/products",
+                Value::Null,
+                Some(token),
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::OK);
+            let (write_status, body) = request_json_as(
+                pool.clone(),
+                "POST",
+                "/api/v1/products",
+                json!({"product":product_fields(&format!("{role} product"),TABLET,0)}),
+                Some(token),
+            )
+            .await;
+            assert_eq!(write_status, StatusCode::FORBIDDEN, "{body}");
+        }
+
+        let (context_status, context) =
+            request_json(pool.clone(), "GET", "/api/v1/catalog/context", Value::Null).await;
+        assert_eq!(context_status, StatusCode::OK);
+        assert_eq!(context["storeId"], store_id);
+
+        let spoofed_actor = Uuid::now_v7().to_string();
+        let (create_status, product) = request_json(
+            pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({
+                "actorId": spoofed_actor,
+                "product": product_fields("Authenticated catalog product", TABLET, 0),
+                "packs": [{"clientKey":"base","containerUnitId":TABLET,"baseQuantityAtoms":1}]
+            }),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED, "{product}");
+        let product_id = product["id"].as_str().unwrap();
+        let authoritative_actor: String = sqlx::query_scalar(
+            "SELECT actor_id FROM master_change_events WHERE entity_type='product' AND entity_id=?",
+        )
+        .bind(product_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let owner_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE role='owner_admin' LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(authoritative_actor, owner_id);
+        assert_ne!(authoritative_actor, spoofed_actor);
     }
 }

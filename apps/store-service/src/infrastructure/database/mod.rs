@@ -8,6 +8,11 @@ use sqlx::{
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// How long a statement waits for a contended SQLite write lock before SQLite reports BUSY. This is
+/// the single bound every request's lock wait is measured against, so tests derive their limits from
+/// it instead of restating a wall-clock literal.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn connect(database_path: &Path) -> anyhow::Result<SqlitePool> {
     let parent = database_path
         .parent()
@@ -20,7 +25,7 @@ pub async fn connect(database_path: &Path) -> anyhow::Result<SqlitePool> {
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Full)
-        .busy_timeout(Duration::from_secs(5))
+        .busy_timeout(BUSY_TIMEOUT)
         .disable_statement_logging();
 
     let pool = SqlitePoolOptions::new()

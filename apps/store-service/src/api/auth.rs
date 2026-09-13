@@ -940,6 +940,11 @@ mod tests {
 
     use super::*;
 
+    /// Worst documented contention path is two sequential busy timeouts; the third allows for test
+    /// scheduling on a loaded machine without letting a deadlock or retry loop pass.
+    const CONTENTION_CEILING: StdDuration =
+        crate::infrastructure::database::BUSY_TIMEOUT.saturating_mul(3);
+
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let temp = tempfile::tempdir().unwrap();
         let pool = crate::infrastructure::database::connect(&temp.path().join("auth.sqlite3"))
@@ -1779,6 +1784,14 @@ mod tests {
             .unwrap();
     }
 
+    /// A contended authentication write must finish on the configured busy timeout, report the typed
+    /// `service_busy` code with no database detail, and never surface as `internal_error`.
+    ///
+    /// The ceiling is derived from `BUSY_TIMEOUT` rather than written as a literal. A request may
+    /// wait through two busy timeouts in sequence, because every auth write serialises behind the
+    /// process-wide `AUTH_WRITE_LOCK` and its holder may itself be inside a busy wait;
+    /// `CONTENTION_CEILING` allows that documented worst case plus scheduling margin, so only a
+    /// deadlock or an unbounded retry can exceed it.
     #[tokio::test]
     async fn sqlite_contention_is_bounded_and_never_reported_as_internal_error() {
         let (_temp, pool) = test_pool().await;
@@ -1797,7 +1810,7 @@ mod tests {
             .unwrap();
         let started = Instant::now();
         let response = tokio::time::timeout(
-            StdDuration::from_secs(8),
+            CONTENTION_CEILING,
             request(
                 pool.clone(),
                 "POST",
@@ -1808,13 +1821,45 @@ mod tests {
         )
         .await
         .expect("authentication contention must remain bounded");
+        let waited = started.elapsed();
         sqlx::query("ROLLBACK")
             .execute(&mut *blocker)
             .await
             .unwrap();
         assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.2["code"], "service_busy");
-        assert!(started.elapsed() < StdDuration::from_secs(8));
+        assert_ne!(response.2["code"], "internal_error");
+        assert_no_database_detail(&response.2);
+        // The request really did wait on the contended lock rather than failing early for an
+        // unrelated reason. Scheduling can only make this slower, never faster.
+        assert!(
+            waited >= crate::infrastructure::database::BUSY_TIMEOUT / 2,
+            "contended authentication returned after {waited:?} without waiting on the lock"
+        );
+
+        // Releasing the lock leaves authentication fully usable: no poisoned connection, and the
+        // abandoned attempt neither consumed nor corrupted the rate-limit state.
+        let (status, _, body) = request(
+            pool.clone(),
+            "POST",
+            "/api/v1/auth/login",
+            json!({"loginIdentifier":"owner.admin","password":"Strong-Password-42"}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The typed `code` is the only machine detail a client may see; the human-facing text must not
+    /// carry SQLite, sqlx, or Rust internals.
+    fn assert_no_database_detail(body: &Value) {
+        let rendered = format!("{} {}", body["message"], body["issues"]).to_lowercase();
+        for leak in ["sqlite", "locked", "sqlx", "panicked", "error code"] {
+            assert!(
+                !rendered.contains(leak),
+                "contention response leaked {leak:?}: {body}"
+            );
+        }
     }
 
     #[tokio::test]

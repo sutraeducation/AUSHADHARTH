@@ -31,6 +31,8 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+const STARTUP_QUERY_KEY = ["app", "startup"] as const;
+
 class CompatibilityFailure extends Error {}
 
 async function fetchStartup(): Promise<AuthStatusResponse> {
@@ -53,7 +55,7 @@ async function fetchStartup(): Promise<AuthStatusResponse> {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const startup = useQuery({
-    queryKey: ["app", "startup"],
+    queryKey: STARTUP_QUERY_KEY,
     queryFn: fetchStartup,
     retry: false,
     staleTime: 15_000,
@@ -72,8 +74,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           ? "AUTHENTICATED"
           : "AUTH_REQUIRED";
 
+  // Every cached query other than startup holds authenticated business or reference data belonging
+  // to the session being replaced. Removing them by exclusion — rather than by an enumerated prefix
+  // list that silently misses new query keys — keeps the invariant that no prior-session record can
+  // be served to the next session.
+  const clearSessionScopedQueries = () => {
+    queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== STARTUP_QUERY_KEY[0] });
+  };
+
   const setAuthenticated = (session: SessionResponse) => {
-    queryClient.setQueryData<AuthStatusResponse>(["app", "startup"], {
+    clearSessionScopedQueries();
+    queryClient.setQueryData<AuthStatusResponse>(STARTUP_QUERY_KEY, {
       setupRequired: false,
       authenticated: true,
       user: session.user,
@@ -82,14 +93,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const markSignedOut = () => {
-    queryClient.setQueryData<AuthStatusResponse>(["app", "startup"], (current) => ({
+    queryClient.setQueryData<AuthStatusResponse>(STARTUP_QUERY_KEY, (current) => ({
       setupRequired: false,
       authenticated: false,
       user: null,
       storeDisplayName: current?.storeDisplayName ?? null
     }));
-    queryClient.removeQueries({ queryKey: ["dashboard"] });
-    queryClient.removeQueries({ queryKey: ["reference"] });
+    clearSessionScopedQueries();
   };
 
   const value: AuthContextValue = {
