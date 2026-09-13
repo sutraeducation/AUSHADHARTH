@@ -86,6 +86,9 @@ function safeErrorMessage(code?: string): string {
     case "batch_conflict": return "This batch conflicts with the pack's current status.";
     case "insufficient_stock": return "This posting would leave a negative stock balance.";
     case "batch_pack_mismatch": return "That batch does not belong to the selected pack.";
+    case "party_conflict": return "The tax registration does not agree with the selected State.";
+    case "party_role_conflict": return "This role conflicts with the party's current status.";
+    case "party_address_conflict": return "This address conflicts with the party's or the State's current status.";
     case "validation_failed": return "Check the highlighted information and try again.";
     default: return "AUSHADHARTH could not complete that request. Try again.";
   }

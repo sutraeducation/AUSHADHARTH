@@ -18,6 +18,7 @@ pub enum MasterKind {
     Ingredient,
     SaltForm,
     StrengthUnit,
+    StateCode,
 }
 
 impl MasterKind {
@@ -35,6 +36,7 @@ impl MasterKind {
             Self::Ingredient => "ingredients",
             Self::SaltForm => "salt-forms",
             Self::StrengthUnit => "strength-units",
+            Self::StateCode => "state-codes",
         }
     }
 
@@ -52,6 +54,7 @@ impl MasterKind {
             Self::Ingredient => "ingredients",
             Self::SaltForm => "salt_forms",
             Self::StrengthUnit => "strength_units",
+            Self::StateCode => "state_codes",
         }
     }
 
@@ -69,6 +72,7 @@ impl MasterKind {
             Self::Ingredient => "ingredient",
             Self::SaltForm => "salt_form",
             Self::StrengthUnit => "strength_unit",
+            Self::StateCode => "state_code",
         }
     }
 
@@ -110,6 +114,9 @@ impl MasterKind {
             Self::StrengthUnit => {
                 "json_object('canonicalCode',canonical_code,'displayName',display_name,'dimension',dimension,'allowedScale',allowed_scale)"
             }
+            Self::StateCode => {
+                "json_object('jurisdiction',jurisdiction,'stateCode',state_code,'displayName',display_name)"
+            }
         }
     }
 
@@ -130,6 +137,7 @@ impl MasterKind {
                 "canonical_code || ' ' || normalized_search_name || ' ' || display_name"
             }
             Self::StrengthUnit => "canonical_code || ' ' || display_name",
+            Self::StateCode => "jurisdiction || ' ' || state_code || ' ' || display_name",
         }
     }
 }
@@ -151,6 +159,7 @@ impl FromStr for MasterKind {
             Self::Ingredient,
             Self::SaltForm,
             Self::StrengthUnit,
+            Self::StateCode,
         ]
         .into_iter()
         .find(|kind| kind.path() == value)
@@ -192,8 +201,29 @@ pub fn validate_attributes(
         MasterKind::Ingredient => validate_ingredient(object),
         MasterKind::SaltForm => validate_salt_form(object),
         MasterKind::StrengthUnit => validate_strength_unit(object),
+        MasterKind::StateCode => validate_state_code(object),
     };
     result.map_err(|error| vec![error])
+}
+
+/// A jurisdiction's State, used as the place of supply and on postal addresses. The code is the one
+/// a GSTIN carries in its first two positions, which is why it is compared rather than the name.
+fn validate_state_code(object: &Map<String, Value>) -> Result<ValidatedFields, ValidationIssue> {
+    let code = required_text(object, "stateCode", 2)?.to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(issue(
+            "stateCode",
+            "must be exactly two letters or digits, as a GSTIN carries it",
+        ));
+    }
+    fields([
+        ("jurisdiction", DbValue::Text(Some(jurisdiction(object)?))),
+        ("state_code", DbValue::Text(Some(code))),
+        (
+            "display_name",
+            DbValue::Text(Some(required_text(object, "displayName", 100)?)),
+        ),
+    ])
 }
 
 /// The active moiety. Deliberately carries no salt, no strength, and no clinical attribute.

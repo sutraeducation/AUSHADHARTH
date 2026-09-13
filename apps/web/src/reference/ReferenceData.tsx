@@ -36,7 +36,8 @@ const SECTIONS = [
   { slug: "regulatory", kind: "regulatory-categories", title: "Regulatory References", short: "Regulatory", description: "Verified reference metadata without legal enforcement." },
   { slug: "ingredients", kind: "ingredients", title: "Ingredients", short: "Ingredients", description: "Active moieties used in medicine composition, independent of salt form." },
   { slug: "salt-forms", kind: "salt-forms", title: "Salt Forms", short: "Salt Forms", description: "Chemical form modifiers applied to an ingredient." },
-  { slug: "strength-units", kind: "strength-units", title: "Strength Units", short: "Strength Units", description: "Units a stated strength may use. Separate from inventory units of measure." }
+  { slug: "strength-units", kind: "strength-units", title: "Strength Units", short: "Strength Units", description: "Units a stated strength may use. Separate from inventory units of measure." },
+  { slug: "states", kind: "state-codes", title: "States", short: "States", description: "Jurisdiction State codes used as the place of supply and on addresses." }
 ] as const;
 
 type Section = (typeof SECTIONS)[number];
@@ -265,7 +266,7 @@ function StatusBadge({ status }: { status: string }) { return <span className={`
 function useDebouncedValue(value: string, milliseconds: number) { const [debounced, setDebounced] = useState(value); useEffect(() => { const timer = window.setTimeout(() => setDebounced(value), milliseconds); return () => window.clearTimeout(timer); }, [value, milliseconds]); return debounced; }
 class ClientValidationError extends Error {}
 
-function singular(kind: ReferenceKind): string { return ({ units: "unit", "dosage-forms": "dosage form", companies: "company", "company-identifiers": "identifier", brands: "brand", "hsn-codes": "HSN code", "tax-categories": "tax category", "tax-rate-versions": "tax rate version", "regulatory-categories": "regulatory reference", ingredients: "ingredient", "salt-forms": "salt form", "strength-units": "strength unit" })[kind]; }
+function singular(kind: ReferenceKind): string { return ({ units: "unit", "dosage-forms": "dosage form", companies: "company", "company-identifiers": "identifier", brands: "brand", "hsn-codes": "HSN code", "tax-categories": "tax category", "tax-rate-versions": "tax rate version", "regulatory-categories": "regulatory reference", ingredients: "ingredient", "salt-forms": "salt form", "strength-units": "strength unit", "state-codes": "State" })[kind]; }
 function attrs(record: ReferenceMasterResponse): Attributes { return record.attributes as unknown as Attributes; }
 function primaryName(record: ReferenceMasterResponse): string { const value = attrs(record); return String(value.displayName ?? value.canonicalCode ?? value.hsnCode ?? value.categoryCode ?? value.normalizedValue ?? "Reference record"); }
 
@@ -282,7 +283,8 @@ function columnsFor(kind: ReferenceKind): Array<{ key: string; label: string }> 
     "regulatory-categories": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "categorySystem", label: "System" }, { key: "categoryCode", label: "Code" }, { key: "displayName", label: "Name" }, { key: "verificationState", label: "Verification" }],
     ingredients: [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Ingredient" }, { key: "description", label: "Description" }],
     "salt-forms": [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Salt / Form" }],
-    "strength-units": [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Name" }, { key: "dimension", label: "Dimension" }, { key: "allowedScale", label: "Scale" }]
+    "strength-units": [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Name" }, { key: "dimension", label: "Dimension" }, { key: "allowedScale", label: "Scale" }],
+    "state-codes": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "stateCode", label: "Code" }, { key: "displayName", label: "State" }]
   })[kind];
 }
 
@@ -312,7 +314,8 @@ function initialValues(kind: ReferenceKind, record?: ReferenceMasterResponse, pa
     "regulatory-categories": { jurisdiction: "IN", categorySystem: "", categoryCode: "", displayName: "", effectiveFrom: "", effectiveTo: "", sourceReference: "", verificationState: "unverified" },
     ingredients: { canonicalCode: "", displayName: "", description: "" },
     "salt-forms": { canonicalCode: "", displayName: "" },
-    "strength-units": { canonicalCode: "", displayName: "", dimension: "mass", allowedScale: "3" }
+    "strength-units": { canonicalCode: "", displayName: "", dimension: "mass", allowedScale: "3" },
+    "state-codes": { jurisdiction: "IN", stateCode: "", displayName: "" }
   };
   const value = { ...defaults[kind], ...existing } as FormValues;
   if (kind === "tax-rate-versions" && record) {
@@ -323,7 +326,7 @@ function initialValues(kind: ReferenceKind, record?: ReferenceMasterResponse, pa
 
 function validateForm(kind: ReferenceKind, values: FormValues): Record<string, string> {
   const errors: Record<string, string> = {};
-  const required: Partial<Record<ReferenceKind, string[]>> = { units: ["canonicalCode", "displayName", "allowedScale"], "dosage-forms": ["canonicalCode", "displayName"], companies: ["displayName"], "company-identifiers": ["namespace", "normalizedValue"], brands: ["displayName"], "hsn-codes": ["jurisdiction", "hsnCode", "description"], "tax-categories": ["jurisdiction", "categoryCode", "displayName"], "tax-rate-versions": ["effectiveFrom", "cgstPercent", "sgstPercent", "igstPercent", "cessPercent"], "regulatory-categories": ["jurisdiction", "categorySystem", "categoryCode", "displayName"], ingredients: ["canonicalCode", "displayName"], "salt-forms": ["canonicalCode", "displayName"], "strength-units": ["canonicalCode", "displayName", "allowedScale"] };
+  const required: Partial<Record<ReferenceKind, string[]>> = { units: ["canonicalCode", "displayName", "allowedScale"], "dosage-forms": ["canonicalCode", "displayName"], companies: ["displayName"], "company-identifiers": ["namespace", "normalizedValue"], brands: ["displayName"], "hsn-codes": ["jurisdiction", "hsnCode", "description"], "tax-categories": ["jurisdiction", "categoryCode", "displayName"], "tax-rate-versions": ["effectiveFrom", "cgstPercent", "sgstPercent", "igstPercent", "cessPercent"], "regulatory-categories": ["jurisdiction", "categorySystem", "categoryCode", "displayName"], ingredients: ["canonicalCode", "displayName"], "salt-forms": ["canonicalCode", "displayName"], "strength-units": ["canonicalCode", "displayName", "allowedScale"], "state-codes": ["jurisdiction", "stateCode", "displayName"] };
   for (const field of required[kind] ?? []) if (!String(values[field] ?? "").trim()) errors[field] = "This field is required.";
   if (kind === "units") { const scale = Number(values.allowedScale); if (!Number.isInteger(scale) || scale < 0 || scale > 6 || (values.isDiscrete && scale !== 0)) errors.allowedScale = values.isDiscrete ? "Discrete units must use scale 0." : "Use an integer from 0 to 6."; }
   if (kind === "companies" && values.countryCode && !/^[A-Za-z]{2}$/.test(String(values.countryCode))) errors.countryCode = "Use a two-letter country code.";
@@ -347,5 +350,6 @@ function toAttributes(kind: ReferenceKind, values: FormValues, parentId?: string
     case "ingredients": return { canonicalCode: values.canonicalCode, displayName: values.displayName, description: nullable("description") };
     case "salt-forms": return { canonicalCode: values.canonicalCode, displayName: values.displayName };
     case "strength-units": return { canonicalCode: values.canonicalCode, displayName: values.displayName, dimension: values.dimension, allowedScale: Number(values.allowedScale) };
+    case "state-codes": return { jurisdiction: values.jurisdiction, stateCode: values.stateCode, displayName: values.displayName };
   }
 }

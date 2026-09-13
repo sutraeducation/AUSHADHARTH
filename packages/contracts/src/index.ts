@@ -31,7 +31,8 @@ export const ReferenceKindSchema = z.enum([
   "regulatory-categories",
   "ingredients",
   "salt-forms",
-  "strength-units"
+  "strength-units",
+  "state-codes"
 ]);
 
 export const MasterStatusSchema = z.enum(["active", "archived"]);
@@ -132,6 +133,16 @@ export const StrengthUnitAttributesSchema = z.object({
   allowedScale: z.number().int()
 });
 
+/**
+ * A jurisdiction's State. The code is the one a GSTIN carries in its first two positions, which is
+ * what place-of-supply agreement is checked against.
+ */
+export const StateCodeAttributesSchema = z.object({
+  jurisdiction: z.string(),
+  stateCode: z.string(),
+  displayName: z.string()
+});
+
 export const ReferenceAttributesSchema = z.union([
   UnitAttributesSchema,
   DosageFormAttributesSchema,
@@ -144,7 +155,8 @@ export const ReferenceAttributesSchema = z.union([
   RegulatoryCategoryAttributesSchema,
   IngredientAttributesSchema,
   SaltFormAttributesSchema,
-  StrengthUnitAttributesSchema
+  StrengthUnitAttributesSchema,
+  StateCodeAttributesSchema
 ]);
 
 const ReferenceMasterBaseSchema = z.object({
@@ -169,7 +181,8 @@ export const ReferenceMasterResponseSchema = z.discriminatedUnion("kind", [
   ReferenceMasterBaseSchema.extend({ kind: z.literal("regulatory-categories"), attributes: RegulatoryCategoryAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("ingredients"), attributes: IngredientAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("salt-forms"), attributes: SaltFormAttributesSchema }),
-  ReferenceMasterBaseSchema.extend({ kind: z.literal("strength-units"), attributes: StrengthUnitAttributesSchema })
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("strength-units"), attributes: StrengthUnitAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("state-codes"), attributes: StateCodeAttributesSchema })
 ]);
 
 export const CreateReferenceRequestSchema = z.object({
@@ -569,6 +582,142 @@ export type InventoryMovement = z.infer<typeof InventoryMovementSchema>;
 export type PostMovementRequest = z.infer<typeof PostMovementRequestSchema>;
 export type StockBalance = z.infer<typeof StockBalanceSchema>;
 export type InventoryErrorResponse = z.infer<typeof InventoryErrorResponseSchema>;
+
+/**
+ * Phase 1E party identity.
+ *
+ * A Party is an identity, never an account. Nothing here carries a balance, an outstanding amount,
+ * or a credit limit, and nothing may be added that does: a future accounting ledger will reference
+ * the Party and derive every figure from its own postings, exactly as the inventory ledger is the
+ * sole authority for quantity.
+ */
+export const PartyRoleNameSchema = z.enum(["supplier", "customer"]);
+export const GstRegistrationStatusSchema = z.enum(["registered", "unregistered", "unknown"]);
+export const AddressRoleSchema = z.enum(["billing", "shipping"]);
+
+export const PartyFieldsSchema = z.object({
+  displayName: z.string(),
+  legalName: z.string().nullable().optional(),
+  /** `unregistered` asserts there is no GSTIN; `unknown` means none has been captured yet. */
+  gstRegistrationStatus: GstRegistrationStatusSchema.default("unknown"),
+  gstin: z.string().nullable().optional(),
+  pan: z.string().nullable().optional(),
+  placeOfSupplyStateId: z.string().nullable().optional(),
+  primaryPhone: z.string().nullable().optional(),
+  primaryEmail: z.string().nullable().optional(),
+  /** The licence string exactly as printed; nothing reads it programmatically. */
+  drugLicenceNumber: z.string().nullable().optional(),
+  drugLicenceValidUpto: z.string().nullable().optional()
+});
+
+const PartyLifecycleSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: MasterStatusSchema,
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  archivedAtUtc: z.string().nullable(),
+  archiveReason: z.string().nullable()
+});
+
+export const PartySchema = PartyFieldsSchema.extend({
+  normalizedSearchName: z.string(),
+  normalizedGstin: z.string().nullable(),
+  normalizedPan: z.string().nullable()
+}).merge(PartyLifecycleSchema);
+
+export const PartyRoleFieldsSchema = z.object({ role: PartyRoleNameSchema });
+
+export const PartyRoleSchema = PartyRoleFieldsSchema.extend({ partyId: z.string() }).merge(
+  PartyLifecycleSchema
+);
+
+export const PartyAddressFieldsSchema = z.object({
+  addressRole: AddressRoleSchema,
+  line1: z.string(),
+  line2: z.string().nullable().optional(),
+  city: z.string().nullable().optional(),
+  stateId: z.string().nullable().optional(),
+  postalCode: z.string().nullable().optional(),
+  countryCode: z.string().default("IN"),
+  isPrimary: z.boolean().default(false)
+});
+
+export const PartyAddressSchema = PartyAddressFieldsSchema.extend({
+  partyId: z.string()
+}).merge(PartyLifecycleSchema);
+
+export const PartyDetailSchema = PartySchema.extend({
+  roles: z.array(PartyRoleSchema).default([]),
+  addresses: z.array(PartyAddressSchema).default([])
+});
+
+export const CreatePartyRequestSchema = z.object({
+  party: PartyFieldsSchema,
+  roles: z.array(PartyRoleFieldsSchema).default([]),
+  addresses: z.array(PartyAddressFieldsSchema).default([]),
+  reason: z.string().nullable().optional()
+});
+
+export const UpdatePartyRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  party: PartyFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const UpdatePartyRoleRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  role: PartyRoleFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const UpdatePartyAddressRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  address: PartyAddressFieldsSchema,
+  reason: z.string().nullable().optional()
+});
+
+export const PartyLifecycleRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  reason: z.string()
+});
+
+export const PartyErrorResponseSchema = z.object({
+  code: z.enum([
+    "validation_failed",
+    "duplicate_conflict",
+    "revision_conflict",
+    "not_found",
+    "archived_conflict",
+    "party_conflict",
+    "party_role_conflict",
+    "party_address_conflict",
+    "authentication_required",
+    "session_expired",
+    "authorization_denied",
+    "service_busy",
+    "internal_error"
+  ]),
+  message: z.string(),
+  issues: z.array(z.object({ field: z.string(), message: z.string() })),
+  expectedRevision: z.number().int().nullable(),
+  currentRevision: z.number().int().nullable()
+});
+
+export type PartyRoleName = z.infer<typeof PartyRoleNameSchema>;
+export type GstRegistrationStatus = z.infer<typeof GstRegistrationStatusSchema>;
+export type AddressRole = z.infer<typeof AddressRoleSchema>;
+export type PartyFields = z.infer<typeof PartyFieldsSchema>;
+export type Party = z.infer<typeof PartySchema>;
+export type PartyDetail = z.infer<typeof PartyDetailSchema>;
+export type PartyRole = z.infer<typeof PartyRoleSchema>;
+export type PartyRoleFields = z.infer<typeof PartyRoleFieldsSchema>;
+export type PartyAddress = z.infer<typeof PartyAddressSchema>;
+export type PartyAddressFields = z.infer<typeof PartyAddressFieldsSchema>;
+export type CreatePartyRequest = z.infer<typeof CreatePartyRequestSchema>;
+export type UpdatePartyRequest = z.infer<typeof UpdatePartyRequestSchema>;
+export type PartyErrorResponse = z.infer<typeof PartyErrorResponseSchema>;
+export type StateCodeAttributes = z.infer<typeof StateCodeAttributesSchema>;
 
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
 

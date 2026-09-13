@@ -315,3 +315,137 @@ async fn the_gate_never_touches_the_real_customer_database() {
     )
     .expect("temporary database must satisfy the frozen path policy");
 }
+
+/// Party identity across the same real boundary: a real socket, a real session, the real GSTIN
+/// checksum, and the real trigger that binds a registration to its State.
+#[tokio::test]
+async fn real_service_creates_a_supplier_and_enforces_its_tax_identity_over_http() {
+    let service = start().await;
+    let setup = call(
+        &service,
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({
+            "storeDisplayName": "Integration Pharmacy",
+            "ownerDisplayName": "Integration Owner",
+            "loginIdentifier": "integration.owner",
+            "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, 201, "{:?}", setup.body);
+    let cookie = session_cookie(&setup.headers);
+
+    let maharashtra = "01997300-0000-7000-8000-000000000027";
+    let karnataka = "01997300-0000-7000-8000-000000000029";
+    // A genuine published GSTIN, so the check digit is really exercised.
+    let gstin = "27AAPFU0939F1ZV";
+    let supplier = |gstin: &str, state: &str| {
+        json!({
+            "party": {
+                "displayName": "Sharma Medicals",
+                "gstRegistrationStatus": "registered",
+                "gstin": gstin,
+                "placeOfSupplyStateId": state
+            },
+            "roles": [{ "role": "supplier" }],
+            "addresses": [{
+                "addressRole": "billing", "line1": "12 Market Road",
+                "city": "Pune", "stateId": state, "postalCode": "411001", "isPrimary": true
+            }]
+        })
+    };
+
+    // An unauthenticated caller is refused by the real auth layer.
+    let anonymous = call(&service, "GET", "/api/v1/parties", None, None).await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body["code"], "authentication_required");
+
+    // A mistyped GSTIN that is well-shaped is caught only by the checksum.
+    let bad = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(supplier("27AAPFU0939F1ZX", maharashtra)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(bad.status, 422, "{:?}", bad.body);
+    assert_eq!(bad.body["code"], "validation_failed");
+    assert_eq!(bad.body["issues"][0]["field"], "gstin");
+
+    // A Maharashtra registration cannot claim a Karnataka place of supply.
+    let mismatched = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(supplier(gstin, karnataka)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(mismatched.status, 409, "{:?}", mismatched.body);
+    assert_eq!(mismatched.body["code"], "party_conflict");
+
+    let created = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(supplier(gstin, maharashtra)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let party_id = created.body["id"].as_str().expect("party id").to_owned();
+    assert_eq!(created.body["normalizedGstin"], gstin);
+    assert_eq!(created.body["roles"][0]["role"], "supplier");
+    assert_eq!(created.body["addresses"][0]["isPrimary"], true);
+
+    // The same active GSTIN cannot be held twice.
+    let duplicate = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(supplier(gstin, maharashtra)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 409, "{:?}", duplicate.body);
+    assert_eq!(duplicate.body["code"], "duplicate_conflict");
+
+    // Searching by the tax number finds it without knowing the name.
+    let found = call(
+        &service,
+        "GET",
+        "/api/v1/parties?search=27aapfu0939f1zv",
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(found.status, 200);
+    assert_eq!(found.body.as_array().expect("parties").len(), 1);
+    assert_eq!(found.body[0]["id"], party_id.as_str());
+
+    // The disposable database holds exactly one party, and it carries no accounting column.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let parties: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parties")
+        .fetch_one(&pool)
+        .await
+        .expect("count parties");
+    assert_eq!(parties, 1, "the refused attempts must not have written");
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('parties')")
+        .fetch_all(&pool)
+        .await
+        .expect("read columns");
+    for column in &columns {
+        for forbidden in ["balance", "outstanding", "credit", "amount", "paise"] {
+            assert!(
+                !column.contains(forbidden),
+                "a Party is an identity, never an account; found {column}"
+            );
+        }
+    }
+    pool.close().await;
+}

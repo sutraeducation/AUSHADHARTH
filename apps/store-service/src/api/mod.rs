@@ -9,6 +9,7 @@ use crate::{API_VERSION, APPLICATION_VERSION};
 
 pub mod auth;
 pub mod inventory;
+pub mod parties;
 pub mod product_catalog;
 pub mod reference_masters;
 
@@ -44,6 +45,7 @@ pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
         .merge(reference_masters::routes())
         .merge(product_catalog::routes())
         .merge(inventory::routes())
+        .merge(parties::routes())
         .with_state(reference_masters::ReferenceState { pool });
 
     if let Some(dist) = web_dist {
