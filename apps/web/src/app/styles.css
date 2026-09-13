@@ -320,3 +320,8 @@ button, input { font: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+.inventory-tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+.inventory-tab { padding: 9px 14px; border-bottom: 2px solid transparent; color: var(--ink-500); font-size: .73rem; font-weight: 700; text-decoration: none; }
+.inventory-tab--active { border-bottom-color: var(--primary-700); color: var(--primary-700); }
+.ledger-in { color: var(--primary-700); font-weight: 800; }
+.ledger-out { color: var(--danger-700); font-weight: 800; }

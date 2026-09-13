@@ -506,6 +506,70 @@ export type CatalogContext = z.infer<typeof CatalogContextSchema>;
 export type CreateProductRequest = z.infer<typeof CreateProductRequestSchema>;
 export type CatalogErrorResponse = z.infer<typeof CatalogErrorResponseSchema>;
 
+/**
+ * Phase 1D inventory ledger. Quantity authority is exact integer atoms in the Product's base unit;
+ * a balance is always derived by summing movements and is never stored anywhere.
+ */
+export const MovementTypeSchema = z.enum(["opening_stock", "adjustment"]);
+
+export const PostMovementRequestSchema = z.object({
+  idempotencyKey: z.string(),
+  movementType: MovementTypeSchema,
+  productPackId: z.string(),
+  batchId: z.string().nullable().optional(),
+  quantityDeltaAtoms: z.number().int(),
+  occurredOn: z.string(),
+  reason: z.string().nullable().optional(),
+  reversesMovementId: z.string().nullable().optional()
+});
+
+export const InventoryMovementSchema = z.object({
+  id: z.string(),
+  storeId: z.string(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string().nullable(),
+  movementType: MovementTypeSchema,
+  quantityDeltaAtoms: z.number().int(),
+  occurredOn: z.string(),
+  reason: z.string().nullable(),
+  reversesMovementId: z.string().nullable(),
+  idempotencyKey: z.string(),
+  postedByUserId: z.string(),
+  postedAtUtc: z.string()
+});
+
+export const StockBalanceSchema = z.object({
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string().nullable(),
+  balanceAtoms: z.number().int()
+});
+
+export const InventoryErrorResponseSchema = z.object({
+  code: z.enum([
+    "validation_failed",
+    "not_found",
+    "archived_conflict",
+    "batch_pack_mismatch",
+    "insufficient_stock",
+    "authentication_required",
+    "session_expired",
+    "authorization_denied",
+    "service_busy",
+    "internal_error"
+  ]),
+  message: z.string(),
+  issues: z.array(z.object({ field: z.string(), message: z.string() })),
+  availableAtoms: z.number().int().nullable()
+});
+
+export type MovementType = z.infer<typeof MovementTypeSchema>;
+export type InventoryMovement = z.infer<typeof InventoryMovementSchema>;
+export type PostMovementRequest = z.infer<typeof PostMovementRequestSchema>;
+export type StockBalance = z.infer<typeof StockBalanceSchema>;
+export type InventoryErrorResponse = z.infer<typeof InventoryErrorResponseSchema>;
+
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
 
 export const SafeUserSchema = z.object({
