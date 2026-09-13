@@ -532,9 +532,9 @@ fn prepare_party(fields: PartyFields) -> Result<PreparedParty, PartyError> {
     }
 
     let place_of_supply_state_id = match blank_to_none(fields.place_of_supply_state_id.as_deref()) {
-        Some(value) => Some(
-            validate_uuid_v7(value, "placeOfSupplyStateId").map_err(validation_issue)?,
-        ),
+        Some(value) => {
+            Some(validate_uuid_v7(value, "placeOfSupplyStateId").map_err(validation_issue)?)
+        }
         None => None,
     };
     if normalized_gstin.is_some() && place_of_supply_state_id.is_none() {
@@ -904,8 +904,17 @@ async fn party_lifecycle(
     }
     let next = current.0 + 1;
     let now = database_now(&mut transaction).await?;
-    lifecycle_update(&mut transaction, "parties", id, current.0, next, &now, &reason, restoring)
-        .await?;
+    lifecycle_update(
+        &mut transaction,
+        "parties",
+        id,
+        current.0,
+        next,
+        &now,
+        &reason,
+        restoring,
+    )
+    .await?;
     audit(
         &mut transaction,
         "party",
@@ -1013,7 +1022,16 @@ async fn archive_role(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<RoleResponse>, PartyError> {
     let actor = require_admin(&state, &headers).await?;
-    child_lifecycle(&state, "party_roles", "party_role", &id, request, false, &actor.id).await?;
+    child_lifecycle(
+        &state,
+        "party_roles",
+        "party_role",
+        &id,
+        request,
+        false,
+        &actor.id,
+    )
+    .await?;
     Ok(Json(fetch_role(&state.pool, &id).await?))
 }
 
@@ -1024,7 +1042,16 @@ async fn restore_role(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<RoleResponse>, PartyError> {
     let actor = require_admin(&state, &headers).await?;
-    child_lifecycle(&state, "party_roles", "party_role", &id, request, true, &actor.id).await?;
+    child_lifecycle(
+        &state,
+        "party_roles",
+        "party_role",
+        &id,
+        request,
+        true,
+        &actor.id,
+    )
+    .await?;
     Ok(Json(fetch_role(&state.pool, &id).await?))
 }
 
@@ -1185,7 +1212,17 @@ async fn child_lifecycle(
     }
     let next = current.0 + 1;
     let now = database_now(&mut transaction).await?;
-    lifecycle_update(&mut transaction, table, id, current.0, next, &now, &reason, restoring).await?;
+    lifecycle_update(
+        &mut transaction,
+        table,
+        id,
+        current.0,
+        next,
+        &now,
+        &reason,
+        restoring,
+    )
+    .await?;
     audit(
         &mut transaction,
         entity_type,
@@ -1230,7 +1267,8 @@ async fn duplicate_candidates(
         let mut score = 0_i64;
         let mut reasons: Vec<&'static str> = Vec::new();
         // A GSTIN identifies exactly one registration, so a match is decisive rather than advisory.
-        if party.normalized_gstin.is_some() && party.normalized_gstin == candidate.normalized_gstin {
+        if party.normalized_gstin.is_some() && party.normalized_gstin == candidate.normalized_gstin
+        {
             score += 100;
             reasons.push("gstin_match");
         }
@@ -1977,8 +2015,7 @@ mod tests {
             },
             "reason": "Name corrected from the certificate"
         });
-        let (status, updated) =
-            request_json(f.pool.clone(), "PUT", &uri, renamed.clone()).await;
+        let (status, updated) = request_json(f.pool.clone(), "PUT", &uri, renamed.clone()).await;
         assert_eq!(status, StatusCode::OK, "{updated}");
         assert_eq!(updated["revision"], 2);
         assert_eq!(updated["displayName"], "Sharma Medicals & Sons");

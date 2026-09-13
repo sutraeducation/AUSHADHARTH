@@ -325,3 +325,15 @@ button, input { font: inherit; }
 .inventory-tab--active { border-bottom-color: var(--primary-700); color: var(--primary-700); }
 .ledger-in { color: var(--primary-700); font-weight: 800; }
 .ledger-out { color: var(--danger-700); font-weight: 800; }
+
+/* Supplier detail panels (Phase 1E). */
+.panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 17px 19px 0; }
+.panel-header h2 { margin: 0 0 4px; font-size: .82rem; }
+.panel-header p { margin: 0; color: var(--ink-500); font-size: .7rem; max-width: 62ch; }
+.panel-note { margin: 12px 19px 17px; color: var(--ink-500); font-size: .68rem; }
+.header-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+.row-subtext { display: block; color: var(--ink-500); font-size: .64rem; }
+.detail-grid { display: grid; gap: 14px 22px; margin: 0; padding: 17px 19px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.detail-grid > div { min-width: 0; }
+.detail-grid dt { margin-bottom: 3px; color: var(--ink-500); font-size: .62rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.detail-grid dd { margin: 0; font-size: .76rem; overflow-wrap: anywhere; }

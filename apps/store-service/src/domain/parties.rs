@@ -105,7 +105,10 @@ pub fn normalize_pan(value: &str) -> Result<(String, String), CatalogValidationI
         || !bytes[5..9].iter().all(u8::is_ascii_digit)
         || !bytes[9].is_ascii_uppercase()
     {
-        return Err(issue("pan", "must be five letters, four digits, then a letter"));
+        return Err(issue(
+            "pan",
+            "must be five letters, four digits, then a letter",
+        ));
     }
     Ok((display.to_owned(), normalized))
 }
@@ -223,13 +226,13 @@ mod tests {
     #[test]
     fn malformed_gstins_are_rejected_before_the_checksum() {
         for value in [
-            "27AAPFU0939F1Z",          // too short
-            "27AAPFU0939F1ZVV",        // too long
-            "2AAAPFU0939F1ZV",         // state code is not two digits
-            "27AAPFU0939F1YV",         // the fourteenth character must be Z
-            "27AAPFU0939F0ZV",         // entity number may not be zero
-            "27AAPF10939F1ZV",         // PAN block must be letters
-            "27AAPFU09X9F1ZV",         // PAN digits block must be digits
+            "27AAPFU0939F1Z",   // too short
+            "27AAPFU0939F1ZVV", // too long
+            "2AAAPFU0939F1ZV",  // state code is not two digits
+            "27AAPFU0939F1YV",  // the fourteenth character must be Z
+            "27AAPFU0939F0ZV",  // entity number may not be zero
+            "27AAPF10939F1ZV",  // PAN block must be letters
+            "27AAPFU09X9F1ZV",  // PAN digits block must be digits
             "",
         ] {
             assert!(normalize_gstin(value).is_err(), "accepted {value}");
@@ -267,7 +270,16 @@ mod tests {
             normalize_email(" Sales@Sharma-Medicals.CO.IN ").unwrap(),
             "sales@sharma-medicals.co.in"
         );
-        for value in ["", "sales", "sales@", "@example.com", "a@b", "a b@c.com", "a@@b.com", "a@b..c"] {
+        for value in [
+            "",
+            "sales",
+            "sales@",
+            "@example.com",
+            "a@b",
+            "a b@c.com",
+            "a@@b.com",
+            "a@b..c",
+        ] {
             assert!(normalize_email(value).is_err(), "accepted {value}");
         }
     }

@@ -358,7 +358,7 @@ function SelectField({ label, name, value, onChange, options, disabled, required
   const id = `party-${name}`; const help = error || hint ? `${id}-help` : undefined;
   return <div className="field"><label htmlFor={id}>{label}{required && <span aria-hidden="true"> *</span>}</label><select id={id} name={name} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} aria-invalid={Boolean(error)} aria-describedby={help}>{options.map(([option, text]) => <option key={option} value={option}>{text}</option>)}</select>{help && <small id={help} className={error ? "field-error" : ""}>{error || hint}</small>}</div>;
 }
-function Status({ value }: { value: string }) { return <span className={`status-chip status-chip--${value}`}>{value === "active" ? "Active" : "Archived"}</span>; }
+function Status({ value }: { value: string }) { return <span className={`status-badge status-badge--${value}`}>{value === "active" ? "Active" : "Archived"}</span>; }
 function Loading({ label }: { label: string }) { return <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>{label}</b></div>; }
 function QueryError({ label, onRetry }: { label: string; onRetry: () => void }) { return <div className="empty-state" role="alert"><h3>{label}</h3><p>The Local Store Service did not complete this request.</p><button className="button button--secondary" type="button" onClick={onRetry}>Retry</button></div>; }
 function InlineQueryError({ label, onRetry }: { label: string; onRetry: () => void }) { return <div className="catalog-inline-error" role="alert"><span>{label}</span><button className="button button--secondary" type="button" onClick={onRetry}>Retry</button></div>; }
