@@ -16,10 +16,13 @@ use super::{
     auth::{self, AuthError, AuthenticatedActor},
     reference_masters::ReferenceState,
 };
-use crate::domain::catalog::{
-    CatalogValidationIssue, MAX_BASE_QUANTITY_ATOMS, MAX_MRP_PAISE, MAX_QUANTITY_SCALE,
-    normalize_barcode, normalize_batch_number, normalize_sku, normalized_search_name,
-    optional_text, required_text, validate_date, validate_uuid_v7,
+use crate::domain::{
+    catalog::{
+        CatalogValidationIssue, MAX_BASE_QUANTITY_ATOMS, MAX_MRP_PAISE, MAX_QUANTITY_SCALE,
+        normalize_barcode, normalize_batch_number, normalize_sku, normalized_search_name,
+        optional_text, required_text, validate_date, validate_uuid_v7,
+    },
+    taxation,
 };
 
 #[derive(Debug)]
@@ -331,6 +334,9 @@ struct ProductResponse {
     route_descriptor: Option<String>,
     release_descriptor: Option<String>,
     display_name: String,
+    // Phase 1F tax classification. Identity only: no rate is stored on a Product.
+    hsn_code_id: Option<String>,
+    tax_category_id: Option<String>,
     created_at_utc: String,
     updated_at_utc: String,
     archived_at_utc: Option<String>,
@@ -551,6 +557,10 @@ pub fn routes() -> Router<ReferenceState> {
         .route("/api/v1/products/{id}/archive", post(archive_product))
         .route("/api/v1/products/{id}/restore", post(restore_product))
         .route(
+            "/api/v1/products/{id}/tax-classification",
+            get(get_tax_classification).put(put_tax_classification),
+        )
+        .route(
             "/api/v1/products/{id}/company-roles",
             get(list_company_roles).post(create_company_role),
         )
@@ -656,7 +666,8 @@ async fn list_products(
     let rows = sqlx::query_as::<_, ProductResponse>(
         "SELECT DISTINCT p.id,p.revision,p.status,p.product_kind,p.brand_id,p.dosage_form_id,\
          p.base_unit_id,p.quantity_scale,p.formulation_descriptor,p.route_descriptor,\
-         p.release_descriptor,p.display_name,p.created_at_utc,p.updated_at_utc,p.archived_at_utc,p.archive_reason \
+         p.release_descriptor,p.display_name,p.hsn_code_id,p.tax_category_id,\
+         p.created_at_utc,p.updated_at_utc,p.archived_at_utc,p.archive_reason \
          FROM products p \
          LEFT JOIN brands b ON b.id=p.brand_id \
          LEFT JOIN product_company_roles role ON role.product_id=p.id AND role.status='active' \
@@ -965,7 +976,8 @@ async fn fetch_product_detail(
 ) -> Result<ProductDetailResponse, CatalogError> {
     let product = sqlx::query_as::<_, ProductResponse>(
         "SELECT id,revision,status,product_kind,brand_id,dosage_form_id,base_unit_id,quantity_scale,\
-         formulation_descriptor,route_descriptor,release_descriptor,display_name,created_at_utc,updated_at_utc,archived_at_utc,archive_reason \
+         formulation_descriptor,route_descriptor,release_descriptor,display_name,hsn_code_id,tax_category_id,\
+         created_at_utc,updated_at_utc,archived_at_utc,archive_reason \
          FROM products WHERE id=?",
     ).bind(id).fetch_optional(pool).await.map_err(|_| CatalogError::Internal)?.ok_or(CatalogError::NotFound)?;
     let company_roles = company_roles_for(pool, id).await?;
@@ -2937,6 +2949,11 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
     if message.contains("product_batch_conflict") {
         return CatalogError::Batch;
     }
+    // The tax-classification trigger is the database-level backstop for an inactive or missing
+    // reference; the service checks first so the client gets the more precise message.
+    if message.contains("product_tax_conflict") {
+        return CatalogError::Archived;
+    }
     if message.contains("pack_conversion_conflict")
         || message.contains("product_quantity_scale_conflict")
     {
@@ -2962,6 +2979,254 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Phase 1F — Product tax classification
+//
+// A Product identifies its HSN and Tax Category. It never stores a rate: the rate in force is
+// resolved from tax_rate_versions by date, and a future posted document snapshots what it applied.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaxClassificationQuery {
+    as_of: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTaxClassificationRequest {
+    expected_revision: i64,
+    hsn_code_id: Option<String>,
+    tax_category_id: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicableRateResponse {
+    tax_rate_version_id: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    cgst_basis_points: i64,
+    sgst_basis_points: i64,
+    igst_basis_points: i64,
+    cess_basis_points: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaxClassificationResponse {
+    product_id: String,
+    revision: i64,
+    hsn_code_id: Option<String>,
+    tax_category_id: Option<String>,
+    /// True once the Product can be taxed on a document. Optional in this phase; Phase 1G is where
+    /// an incomplete classification actually blocks something.
+    complete: bool,
+    /// The date the rate below was resolved for, echoed so a caller can never mistake the rate for
+    /// permanent Product metadata.
+    as_of: String,
+    applicable_rate: Option<ApplicableRateResponse>,
+}
+
+async fn get_tax_classification(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<TaxClassificationQuery>,
+) -> Result<Json<TaxClassificationResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let as_of = match query
+        .as_of
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => taxation::validate_calendar_date(value)
+            .map_err(|_| validation("asOf", "must be a valid YYYY-MM-DD date"))?,
+        None => business_today(&state.pool).await?,
+    };
+    fetch_tax_classification(&state.pool, &id, &as_of)
+        .await
+        .map(Json)
+}
+
+async fn put_tax_classification(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateTaxClassificationRequest>,
+) -> Result<Json<TaxClassificationResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let hsn_code_id = validated_optional_uuid(request.hsn_code_id, "hsnCodeId")?;
+    let tax_category_id = validated_optional_uuid(request.tax_category_id, "taxCategoryId")?;
+    let reason =
+        optional_text(request.reason.as_deref(), "reason", 500).map_err(validation_issue)?;
+
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let current: Option<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT revision,status,hsn_code_id,tax_category_id FROM products WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (revision, status, previous_hsn, previous_category) =
+        current.ok_or(CatalogError::NotFound)?;
+    if revision != request.expected_revision {
+        return Err(CatalogError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+    if status != "active" {
+        return Err(CatalogError::Archived);
+    }
+
+    // Only a reference that actually changes is validated, matching the trigger. Re-checking an
+    // unchanged value would trap a Product whose assigned master was archived after the fact.
+    if hsn_code_id != previous_hsn
+        && let Some(candidate) = hsn_code_id.as_deref()
+    {
+        require_assignable(&mut transaction, "hsn_codes", candidate, "hsnCodeId").await?;
+    }
+    if tax_category_id != previous_category
+        && let Some(candidate) = tax_category_id.as_deref()
+    {
+        require_assignable(
+            &mut transaction,
+            "tax_categories",
+            candidate,
+            "taxCategoryId",
+        )
+        .await?;
+    }
+
+    let next = revision + 1;
+    let now = database_now(&mut transaction).await?;
+    sqlx::query(
+        "UPDATE products SET hsn_code_id=?,tax_category_id=?,revision=?,updated_at_utc=? \
+         WHERE id=? AND revision=? AND status='active'",
+    )
+    .bind(&hsn_code_id)
+    .bind(&tax_category_id)
+    .bind(next)
+    .bind(&now)
+    .bind(&id)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    // The audit answers which Product, from what, to what, by whom, and when. It is deliberately
+    // not a tax snapshot: no rate is recorded here, because no rate was decided here.
+    audit_value(
+        &mut transaction,
+        "product",
+        &id,
+        next,
+        "updated",
+        reason.as_deref(),
+        &json!({
+            "change": "tax_classification",
+            "previous": { "hsnCodeId": previous_hsn, "taxCategoryId": previous_category },
+            "next": { "hsnCodeId": hsn_code_id, "taxCategoryId": tax_category_id },
+        }),
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+
+    let as_of = business_today(&state.pool).await?;
+    fetch_tax_classification(&state.pool, &id, &as_of)
+        .await
+        .map(Json)
+}
+
+/// A newly assigned reference must exist and be active.
+///
+/// Missing and archived are reported differently because they are different mistakes: one is a bad
+/// identifier, the other a deliberate lifecycle state the operator can see and undo.
+async fn require_assignable(
+    transaction: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    id: &str,
+    field: &str,
+) -> Result<(), CatalogError> {
+    let status: Option<String> =
+        sqlx::query_scalar(&format!("SELECT status FROM {table} WHERE id=?"))
+            .bind(id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(map_database_error)?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        Some(_) => Err(CatalogError::Archived),
+        None => Err(validation(field, "references a master that does not exist")),
+    }
+}
+
+/// The fallback date used when a caller supplies none: the service's own clock, which is UTC.
+///
+/// This is only ever a *display* default. `asOf` selects which historical rate is shown and is
+/// never persisted, so a caller choosing a date is a feature rather than a risk — the UI passes
+/// the workstation's business date, because UTC runs a day behind India for the first hours of
+/// each business day.
+async fn business_today(pool: &SqlitePool) -> Result<String, CatalogError> {
+    sqlx::query_scalar("SELECT strftime('%Y-%m-%d','now')")
+        .fetch_one(pool)
+        .await
+        .map_err(map_database_error)
+}
+
+async fn fetch_tax_classification(
+    pool: &SqlitePool,
+    id: &str,
+    as_of: &str,
+) -> Result<TaxClassificationResponse, CatalogError> {
+    let row: Option<(i64, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT revision,hsn_code_id,tax_category_id FROM products WHERE id=?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_database_error)?;
+    let (revision, hsn_code_id, tax_category_id) = row.ok_or(CatalogError::NotFound)?;
+    let applicable_rate = match tax_category_id.as_deref() {
+        Some(category) => taxation::resolve_tax_rate(pool, category, as_of)
+            .await
+            .map_err(|error| match error {
+                taxation::TaxResolutionError::InvalidDate => {
+                    validation("asOf", "must be a valid YYYY-MM-DD date")
+                }
+                taxation::TaxResolutionError::Database(_) => CatalogError::Internal,
+            })?
+            .map(|rate| ApplicableRateResponse {
+                tax_rate_version_id: rate.id,
+                effective_from: rate.effective_from,
+                effective_to: rate.effective_to,
+                cgst_basis_points: rate.cgst_basis_points,
+                sgst_basis_points: rate.sgst_basis_points,
+                igst_basis_points: rate.igst_basis_points,
+                cess_basis_points: rate.cess_basis_points,
+            }),
+        None => None,
+    };
+    Ok(TaxClassificationResponse {
+        product_id: id.to_owned(),
+        revision,
+        complete: hsn_code_id.is_some() && tax_category_id.is_some(),
+        hsn_code_id,
+        tax_category_id,
+        as_of: as_of.to_owned(),
+        applicable_rate,
+    })
+}
 #[cfg(test)]
 mod tests {
     use std::time::{Duration as StdDuration, Instant};
@@ -4864,5 +5129,738 @@ mod tests {
             add_component(&pool, &other, component(&diclofenac, 50, SU_MG)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
         assert_eq!(rejected["code"], "composition_conflict");
+    }
+}
+
+/// Phase 1F Product tax classification.
+///
+/// Self-contained so it exercises the classification surface without depending on the Phase 1B/1C
+/// catalog fixtures, which carry state these tests do not need.
+#[cfg(test)]
+mod tax_classification_tests {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const TABLET: &str = "01997000-0000-7000-8000-000000000001";
+    const OWNER_TOKEN: &str = "tax-owner-session-token";
+    const CASHIER_TOKEN: &str = "tax-cashier-session-token";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        pool: SqlitePool,
+        owner_id: String,
+        product_id: String,
+        hsn_id: String,
+        category_id: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = crate::infrastructure::database::connect(&temp.path().join("tax.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO store_identity (store_id,display_name,business_time_zone,created_at_utc) \
+             VALUES (?,'Test Store','Asia/Kolkata',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let owner_id = insert_tax_session(&pool, "owner_admin", OWNER_TOKEN).await;
+        insert_tax_session(&pool, "cashier", CASHIER_TOKEN).await;
+
+        let (status, product) = request_tax(
+            pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({"product":{"productKind":"general_pharmacy_item","baseUnitId":TABLET,
+                "quantityScale":0,"displayName":"Taxable item"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{product}");
+
+        let hsn_id = insert_hsn(&pool, "30049099").await;
+        let category_id = insert_category(&pool, "gst-12").await;
+        insert_rate(&pool, &category_id, "2020-01-01", None, 600).await;
+
+        Fixture {
+            _temp: temp,
+            pool,
+            owner_id,
+            product_id: product["id"].as_str().unwrap().to_owned(),
+            hsn_id,
+            category_id,
+        }
+    }
+
+    async fn insert_hsn(pool: &SqlitePool, code: &str) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO hsn_codes (id,jurisdiction,hsn_code,description,created_at_utc,updated_at_utc) \
+             VALUES (?,'IN',?,'Medicaments',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(code)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_category(pool: &SqlitePool, code: &str) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO tax_categories (id,jurisdiction,category_code,display_name,tax_treatment,\
+             created_at_utc,updated_at_utc) VALUES (?,'IN',?,'GST 12%','taxable',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(code)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_rate(
+        pool: &SqlitePool,
+        category_id: &str,
+        from: &str,
+        to: Option<&str>,
+        half: i64,
+    ) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO tax_rate_versions (id,tax_category_id,effective_from,effective_to,\
+             cgst_basis_points,sgst_basis_points,igst_basis_points,cess_basis_points,\
+             created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,0,\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(category_id)
+        .bind(from)
+        .bind(to)
+        .bind(half)
+        .bind(half)
+        .bind(half * 2)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn archive_reference(pool: &SqlitePool, table: &str, id: &str) {
+        sqlx::query(&format!(
+            "UPDATE {table} SET status='archived',revision=revision+1,\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='no longer used' \
+             WHERE id=?"
+        ))
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn classification_uri(product_id: &str) -> String {
+        format!("/api/v1/products/{product_id}/tax-classification")
+    }
+
+    async fn assign(
+        pool: &SqlitePool,
+        product_id: &str,
+        revision: i64,
+        hsn: Option<&str>,
+        category: Option<&str>,
+    ) -> (StatusCode, Value) {
+        request_tax(
+            pool.clone(),
+            "PUT",
+            &classification_uri(product_id),
+            json!({
+                "expectedRevision": revision,
+                "hsnCodeId": hsn,
+                "taxCategoryId": category,
+                "reason": "Classified from the supplier invoice"
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_product_reads_normally_and_reports_itself_incomplete() {
+        let f = fixture().await;
+        let (status, body) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hsnCodeId"], Value::Null);
+        assert_eq!(body["taxCategoryId"], Value::Null);
+        assert_eq!(body["complete"], false);
+        // No category means no rate to resolve — not an error.
+        assert_eq!(body["applicableRate"], Value::Null);
+
+        // The Product itself is unaffected: an unclassified Product is a normal Product.
+        let (status, product) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{}", f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{product}");
+        assert_eq!(product["hsnCodeId"], Value::Null);
+        assert_eq!(product["taxCategoryId"], Value::Null);
+        assert_eq!(product["revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn assigning_a_classification_bumps_the_product_revision_and_resolves_a_rate() {
+        let f = fixture().await;
+        let (status, assigned) = assign(
+            &f.pool,
+            &f.product_id,
+            1,
+            Some(&f.hsn_id),
+            Some(&f.category_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{assigned}");
+        assert_eq!(assigned["hsnCodeId"], f.hsn_id.as_str());
+        assert_eq!(assigned["taxCategoryId"], f.category_id.as_str());
+        assert_eq!(assigned["complete"], true);
+        // Classification is intrinsic Product metadata, so it moves the Product's own revision.
+        assert_eq!(assigned["revision"], 2);
+
+        // The rate is resolved for a date, never stored on the Product.
+        assert_eq!(assigned["applicableRate"]["cgstBasisPoints"], 600);
+        assert_eq!(assigned["applicableRate"]["sgstBasisPoints"], 600);
+        assert_eq!(assigned["applicableRate"]["igstBasisPoints"], 1200);
+        assert_eq!(assigned["applicableRate"]["cessBasisPoints"], 0);
+        assert!(assigned["asOf"].as_str().unwrap().len() == 10);
+
+        // The Product detail carries the same identity.
+        let (_, product) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{}", f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(product["taxCategoryId"], f.category_id.as_str());
+        assert_eq!(product["revision"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_product_table_never_gains_a_rate_column() {
+        let f = fixture().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('products')")
+                .fetch_all(&f.pool)
+                .await
+                .unwrap();
+        for column in &columns {
+            for forbidden in [
+                "rate",
+                "basis_points",
+                "percent",
+                "gst",
+                "cgst",
+                "sgst",
+                "igst",
+                "cess",
+                "paise",
+            ] {
+                assert!(
+                    !column.contains(forbidden),
+                    "a Product identifies its classification and never stores a rate; found {column}"
+                );
+            }
+        }
+        assert!(columns.iter().any(|column| column == "hsn_code_id"));
+        assert!(columns.iter().any(|column| column == "tax_category_id"));
+    }
+
+    #[tokio::test]
+    async fn either_reference_may_be_assigned_alone_and_the_pair_may_be_cleared() {
+        let f = fixture().await;
+        // HSN alone is a legitimate partial classification.
+        let (status, hsn_only) = assign(&f.pool, &f.product_id, 1, Some(&f.hsn_id), None).await;
+        assert_eq!(status, StatusCode::OK, "{hsn_only}");
+        assert_eq!(hsn_only["complete"], false);
+        assert_eq!(hsn_only["applicableRate"], Value::Null);
+
+        // Category alone resolves a rate even without an HSN.
+        let (status, category_only) =
+            assign(&f.pool, &f.product_id, 2, None, Some(&f.category_id)).await;
+        assert_eq!(status, StatusCode::OK, "{category_only}");
+        assert_eq!(category_only["hsnCodeId"], Value::Null);
+        assert_eq!(category_only["complete"], false);
+        assert_eq!(category_only["applicableRate"]["cgstBasisPoints"], 600);
+
+        // Clearing both is allowed and leaves an ordinary unclassified Product.
+        let (status, cleared) = assign(&f.pool, &f.product_id, 3, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{cleared}");
+        assert_eq!(cleared["hsnCodeId"], Value::Null);
+        assert_eq!(cleared["taxCategoryId"], Value::Null);
+        assert_eq!(cleared["complete"], false);
+        assert_eq!(cleared["revision"], 4);
+    }
+
+    #[tokio::test]
+    async fn an_archived_reference_cannot_be_newly_assigned() {
+        let f = fixture().await;
+        let archived_hsn = insert_hsn(&f.pool, "99999999").await;
+        let archived_category = insert_category(&f.pool, "gst-old").await;
+        archive_reference(&f.pool, "hsn_codes", &archived_hsn).await;
+        archive_reference(&f.pool, "tax_categories", &archived_category).await;
+
+        let (status, refused) = assign(&f.pool, &f.product_id, 1, Some(&archived_hsn), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "archived_conflict");
+
+        let (status, refused) =
+            assign(&f.pool, &f.product_id, 1, None, Some(&archived_category)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "archived_conflict");
+
+        // Nothing was written: the revision is untouched.
+        let (_, unchanged) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(unchanged["revision"], 1);
+
+        // The database refuses it independently, so the guarantee does not rest on the service.
+        let direct = sqlx::query("UPDATE products SET hsn_code_id=? WHERE id=?")
+            .bind(&archived_hsn)
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await;
+        assert!(direct.is_err(), "the trigger must refuse an archived HSN");
+    }
+
+    #[tokio::test]
+    async fn a_reference_archived_after_assignment_stays_readable_and_never_traps_the_product() {
+        let f = fixture().await;
+        assign(
+            &f.pool,
+            &f.product_id,
+            1,
+            Some(&f.hsn_id),
+            Some(&f.category_id),
+        )
+        .await;
+        archive_reference(&f.pool, "hsn_codes", &f.hsn_id).await;
+
+        // Still readable: archiving a master is not retroactive deletion.
+        let (status, body) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hsnCodeId"], f.hsn_id.as_str());
+
+        // The trap this guards against: clearing only the Tax Category rewrites both columns, so a
+        // rule that re-validated the unchanged archived HSN would leave the Product uneditable.
+        let (status, cleared) = assign(&f.pool, &f.product_id, 2, Some(&f.hsn_id), None).await;
+        assert_eq!(status, StatusCode::OK, "{cleared}");
+        assert_eq!(cleared["hsnCodeId"], f.hsn_id.as_str());
+        assert_eq!(cleared["taxCategoryId"], Value::Null);
+
+        // An ordinary Product edit is likewise unaffected by the archived reference.
+        let (status, edited) = request_tax(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/products/{}", f.product_id),
+            json!({"expectedRevision":3,"product":{"productKind":"general_pharmacy_item",
+                "baseUnitId":TABLET,"quantityScale":0,"displayName":"Renamed item"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["displayName"], "Renamed item");
+        assert_eq!(edited["hsnCodeId"], f.hsn_id.as_str(), "edit preserved it");
+    }
+
+    #[tokio::test]
+    async fn classification_never_blocks_product_archive_and_survives_restore() {
+        let f = fixture().await;
+        assign(
+            &f.pool,
+            &f.product_id,
+            1,
+            Some(&f.hsn_id),
+            Some(&f.category_id),
+        )
+        .await;
+        // Classification is intrinsic metadata, not an active child row, so it cannot deadlock the
+        // Product lifecycle the way an active Pack or role does.
+        let (status, archived) = request_tax(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{}/archive", f.product_id),
+            json!({"expectedRevision":2,"reason":"Discontinued"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{archived}");
+        assert_eq!(archived["status"], "archived");
+        assert_eq!(archived["taxCategoryId"], f.category_id.as_str());
+
+        let (status, restored) = request_tax(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/products/{}/restore", f.product_id),
+            json!({"expectedRevision":3,"reason":"Stocked again"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{restored}");
+        assert_eq!(restored["hsnCodeId"], f.hsn_id.as_str());
+        assert_eq!(restored["taxCategoryId"], f.category_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_stale_revision_cannot_overwrite_a_newer_classification() {
+        let f = fixture().await;
+        assign(&f.pool, &f.product_id, 1, Some(&f.hsn_id), None).await;
+        let (status, conflict) =
+            assign(&f.pool, &f.product_id, 1, None, Some(&f.category_id)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["code"], "revision_conflict");
+        assert_eq!(conflict["expectedRevision"], 1);
+        assert_eq!(conflict["currentRevision"], 2);
+
+        // The stale write changed nothing.
+        let (_, current) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(current["hsnCodeId"], f.hsn_id.as_str());
+        assert_eq!(current["taxCategoryId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn the_applicable_rate_follows_the_requested_date_across_a_boundary() {
+        let f = fixture().await;
+        let category = insert_category(&f.pool, "gst-stepped").await;
+        // 2.50% each side until 2026-01-01, then 9.00% each side open-ended.
+        insert_rate(&f.pool, &category, "2025-01-01", Some("2026-01-01"), 250).await;
+        insert_rate(&f.pool, &category, "2026-01-01", None, 900).await;
+        assign(&f.pool, &f.product_id, 1, None, Some(&category)).await;
+
+        let rate_on = async |date: &str| {
+            request_tax(
+                f.pool.clone(),
+                "GET",
+                &format!("{}?asOf={date}", classification_uri(&f.product_id)),
+                Value::Null,
+            )
+            .await
+            .1
+        };
+
+        assert_eq!(rate_on("2024-12-31").await["applicableRate"], Value::Null);
+        assert_eq!(
+            rate_on("2025-01-01").await["applicableRate"]["cgstBasisPoints"],
+            250
+        );
+        assert_eq!(
+            rate_on("2025-12-31").await["applicableRate"]["cgstBasisPoints"],
+            250
+        );
+        // Half-open: the end date belongs to the next version.
+        assert_eq!(
+            rate_on("2026-01-01").await["applicableRate"]["cgstBasisPoints"],
+            900
+        );
+        assert_eq!(
+            rate_on("2030-06-01").await["applicableRate"]["cgstBasisPoints"],
+            900
+        );
+        // The echoed date makes it impossible to mistake the rate for Product metadata.
+        assert_eq!(rate_on("2030-06-01").await["asOf"], "2030-06-01");
+
+        let (status, bad) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-13-01", classification_uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        assert_eq!(bad["issues"][0]["field"], "asOf");
+    }
+
+    #[tokio::test]
+    async fn the_resolver_reports_components_without_choosing_a_tax_treatment() {
+        let f = fixture().await;
+        assign(&f.pool, &f.product_id, 1, None, Some(&f.category_id)).await;
+        let (_, body) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+        )
+        .await;
+        let rate = &body["applicableRate"];
+        // Both the intra-state pair and the inter-state figure are present, and nothing in this
+        // response selects between them: that is transaction context, which Phase 1G supplies.
+        assert!(rate["cgstBasisPoints"].is_i64());
+        assert!(rate["sgstBasisPoints"].is_i64());
+        assert!(rate["igstBasisPoints"].is_i64());
+        assert!(rate.get("appliedTreatment").is_none());
+        assert!(rate.get("totalBasisPoints").is_none());
+        assert!(rate.get("isInterState").is_none());
+        // Integers, never a decimal fraction.
+        for component in [
+            "cgstBasisPoints",
+            "sgstBasisPoints",
+            "igstBasisPoints",
+            "cessBasisPoints",
+        ] {
+            assert!(rate[component].as_f64().is_some());
+            assert!(rate[component].is_i64(), "{component} must be an integer");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_records_the_previous_and_next_classification_and_the_session_actor() {
+        let f = fixture().await;
+        assign(&f.pool, &f.product_id, 1, Some(&f.hsn_id), None).await;
+        assign(
+            &f.pool,
+            &f.product_id,
+            2,
+            Some(&f.hsn_id),
+            Some(&f.category_id),
+        )
+        .await;
+
+        let events: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT change_payload,COALESCE(actor_id,''),action FROM master_change_events \
+             WHERE entity_type='product' AND entity_id=? AND entity_revision>1 \
+             ORDER BY entity_revision",
+        )
+        .bind(&f.product_id)
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 2);
+
+        let second: Value = serde_json::from_str(&events[1].0).unwrap();
+        assert_eq!(second["change"], "tax_classification");
+        assert_eq!(second["previous"]["hsnCodeId"], f.hsn_id.as_str());
+        assert_eq!(second["previous"]["taxCategoryId"], Value::Null);
+        assert_eq!(second["next"]["taxCategoryId"], f.category_id.as_str());
+        // The actor is the validated server session user, never a browser-supplied value.
+        assert_eq!(events[1].1, f.owner_id);
+        assert_eq!(events[1].2, "updated");
+        // The audit records identity only; it is not a tax snapshot and claims no rate.
+        assert!(second.get("cgstBasisPoints").is_none());
+        assert!(second.get("applicableRate").is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_need_a_session_and_writes_need_owner_admin() {
+        let f = fixture().await;
+        let (status, anonymous) = request_tax_as(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{anonymous}");
+        assert_eq!(anonymous["code"], "authentication_required");
+
+        // A read-only role may look.
+        let (status, readable) = request_tax_as(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&f.product_id),
+            Value::Null,
+            Some(CASHIER_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{readable}");
+
+        // But never write, and a spoofed actor in the body changes nothing.
+        let (status, denied) = request_tax_as(
+            f.pool.clone(),
+            "PUT",
+            &classification_uri(&f.product_id),
+            json!({"expectedRevision":1,"hsnCodeId":f.hsn_id,"taxCategoryId":f.category_id,
+                "actorId":f.owner_id,"actor":"owner_admin"}),
+            Some(CASHIER_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["code"], "authorization_denied");
+        let written: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM products WHERE id=? AND tax_category_id IS NOT NULL",
+        )
+        .bind(&f.product_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(written, 0, "a spoofed actor must not grant a write");
+    }
+
+    #[tokio::test]
+    async fn unknown_products_and_malformed_ids_stay_safe_and_typed() {
+        let f = fixture().await;
+        let missing = Uuid::now_v7().to_string();
+        let (status, not_found) = request_tax(
+            f.pool.clone(),
+            "GET",
+            &classification_uri(&missing),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{not_found}");
+        assert_eq!(not_found["code"], "not_found");
+
+        let (status, invalid) = request_tax(
+            f.pool.clone(),
+            "GET",
+            "/api/v1/products/not-a-uuid/tax-classification",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+
+        // A bad reference id is a validation failure, not a leak.
+        let (status, bad_ref) = request_tax(
+            f.pool.clone(),
+            "PUT",
+            &classification_uri(&f.product_id),
+            json!({"expectedRevision":1,"hsnCodeId":"not-a-uuid"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad_ref}");
+
+        // A well-formed id that does not exist is refused by referential integrity, safely.
+        let (status, dangling) = assign(
+            &f.pool,
+            &f.product_id,
+            1,
+            Some(&Uuid::now_v7().to_string()),
+            None,
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "a dangling reference must be refused: {dangling}"
+        );
+
+        for body in [not_found, invalid, bad_ref, dangling] {
+            let text = body.to_string().to_ascii_lowercase();
+            for leak in [
+                "sqlite",
+                "constraint failed",
+                "insert into",
+                "raise(",
+                "trigger",
+            ] {
+                assert!(!text.contains(leak), "leaked {leak} in {text}");
+            }
+        }
+    }
+
+    async fn insert_tax_session(pool: &SqlitePool, role: &str, token: &str) -> String {
+        let user_id = Uuid::now_v7().to_string();
+        let login = format!("{role}-{}", &user_id[24..32]);
+        sqlx::query(
+            "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,\
+             password_hash,role,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?,'$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',?,?,?)",
+        )
+        .bind(&user_id)
+        .bind(&login)
+        .bind(&login)
+        .bind(format!("{role} tax user"))
+        .bind(role)
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,\
+             last_seen_at_utc) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&user_id)
+        .bind(crate::api::auth::sha256_hex(token.as_bytes()))
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2099-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
+    }
+
+    async fn request_tax(
+        pool: SqlitePool,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        request_tax_as(pool, method, uri, body, Some(OWNER_TOKEN)).await
+    }
+
+    async fn request_tax_as(
+        pool: SqlitePool,
+        method: &str,
+        uri: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:47831")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("cookie", format!("aushadharth_session={token}"));
+        }
+        let response = crate::api::router(pool, None)
+            .oneshot(
+                request
+                    .body(Body::from(if body.is_null() {
+                        String::new()
+                    } else {
+                        body.to_string()
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
     }
 }

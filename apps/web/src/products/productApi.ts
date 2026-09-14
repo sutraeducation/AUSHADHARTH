@@ -8,7 +8,9 @@ import {
   ProductDetailSchema,
   ProductPackSchema,
   ProductSchema,
+  ProductTaxClassificationSchema,
   StorePackPolicySchema,
+  type ProductTaxClassification,
   type Barcode,
   type BarcodeLookup,
   type Batch,
@@ -242,4 +244,35 @@ export function atomsToQuantity(atoms: number, scale: number): string {
   const whole = Math.floor(atoms / factor);
   const fractional = String(atoms % factor).padStart(scale, "0").replace(/0+$/, "");
   return fractional ? `${whole}.${fractional}` : String(whole);
+}
+
+/**
+ * Phase 1F tax classification.
+ *
+ * The Product identifies its HSN and Tax Category; the rate is resolved by the Store Service for a
+ * date and is never stored on the Product. `asOf` is echoed back so the caller can always say which
+ * date a displayed rate belongs to.
+ */
+export async function getTaxClassification(productId: string, asOf?: string): Promise<ProductTaxClassification> {
+  const suffix = asOf ? `?asOf=${encodeURIComponent(asOf)}` : "";
+  return ProductTaxClassificationSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/tax-classification${suffix}`));
+}
+
+export async function updateTaxClassification(
+  productId: string,
+  expectedRevision: number,
+  fields: { hsnCodeId: string | null; taxCategoryId: string | null },
+  reason?: string
+): Promise<ProductTaxClassification> {
+  return ProductTaxClassificationSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/tax-classification`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision, ...fields, reason: reason ?? null })
+  }));
+}
+
+/** Exact integer basis points to a display percentage. 100 basis points is 1.00%. */
+export function basisPointsToPercentText(value: number): string {
+  const whole = Math.trunc(value / 100);
+  const fraction = Math.abs(value % 100);
+  return `${whole}.${String(fraction).padStart(2, "0")}`;
 }

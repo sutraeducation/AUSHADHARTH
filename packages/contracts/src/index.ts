@@ -339,10 +339,49 @@ export const BarcodeSchema = z.object({
   archiveReason: z.string().nullable()
 });
 
+/**
+ * Phase 1F tax classification. A Product identifies *which* HSN and Tax Category apply; it never
+ * carries a rate. The rate in force is resolved from the Tax Category's effective-dated versions,
+ * and a future posted document snapshots what it actually applied.
+ */
+export const ProductTaxClassificationFieldsSchema = z.object({
+  hsnCodeId: z.string().nullable().optional(),
+  taxCategoryId: z.string().nullable().optional()
+});
+
+/** Every component is exact integer basis points: 100 = 1.00%. Never a floating-point value. */
+export const ApplicableTaxRateSchema = z.object({
+  taxRateVersionId: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  cgstBasisPoints: z.number().int(),
+  sgstBasisPoints: z.number().int(),
+  igstBasisPoints: z.number().int(),
+  cessBasisPoints: z.number().int()
+});
+
+export const ProductTaxClassificationSchema = ProductTaxClassificationFieldsSchema.extend({
+  productId: z.string(),
+  revision: z.number().int().positive(),
+  complete: z.boolean(),
+  /** The date the rate was resolved for, so it can never be mistaken for Product metadata. */
+  asOf: z.string(),
+  applicableRate: ApplicableTaxRateSchema.nullable()
+});
+
+export const UpdateProductTaxClassificationRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  hsnCodeId: z.string().nullable(),
+  taxCategoryId: z.string().nullable(),
+  reason: z.string().nullable().optional()
+});
+
 export const ProductSchema = ProductFieldsSchema.extend({
   id: z.string(),
   revision: z.number().int().positive(),
   status: MasterStatusSchema,
+  hsnCodeId: z.string().nullable().optional(),
+  taxCategoryId: z.string().nullable().optional(),
   createdAtUtc: z.string(),
   updatedAtUtc: z.string(),
   archivedAtUtc: z.string().nullable(),
@@ -518,6 +557,12 @@ export type DuplicateCandidate = z.infer<typeof DuplicateCandidateSchema>;
 export type CatalogContext = z.infer<typeof CatalogContextSchema>;
 export type CreateProductRequest = z.infer<typeof CreateProductRequestSchema>;
 export type CatalogErrorResponse = z.infer<typeof CatalogErrorResponseSchema>;
+export type ProductTaxClassification = z.infer<typeof ProductTaxClassificationSchema>;
+export type ProductTaxClassificationFields = z.infer<typeof ProductTaxClassificationFieldsSchema>;
+export type ApplicableTaxRate = z.infer<typeof ApplicableTaxRateSchema>;
+export type UpdateProductTaxClassificationRequest = z.infer<
+  typeof UpdateProductTaxClassificationRequestSchema
+>;
 
 /**
  * Phase 1D inventory ledger. Quantity authority is exact integer atoms in the Product's base unit;

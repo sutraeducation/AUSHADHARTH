@@ -449,3 +449,219 @@ async fn real_service_creates_a_supplier_and_enforces_its_tax_identity_over_http
     }
     pool.close().await;
 }
+
+/// Product tax classification across the real boundary: a real socket, a real session, the real
+/// reference masters, and the real effective-date resolver reading real migrated SQLite.
+#[tokio::test]
+async fn real_service_classifies_a_product_and_resolves_its_rate_by_date_over_http() {
+    let service = start().await;
+    let setup = call(
+        &service,
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({
+            "storeDisplayName": "Integration Pharmacy",
+            "ownerDisplayName": "Integration Owner",
+            "loginIdentifier": "integration.owner",
+            "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, 201, "{:?}", setup.body);
+    let cookie = session_cookie(&setup.headers);
+
+    let reference = async |kind: &str, attributes: Value| {
+        let reply = call(
+            &service,
+            "POST",
+            &format!("/api/v1/reference/{kind}"),
+            Some(json!({ "attributes": attributes })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 201, "{kind}: {:?}", reply.body);
+        reply.body["id"].as_str().expect("reference id").to_owned()
+    };
+
+    let hsn = reference(
+        "hsn-codes",
+        json!({ "jurisdiction": "IN", "hsnCode": "30049099", "description": "Medicaments" }),
+    )
+    .await;
+    let category = reference(
+        "tax-categories",
+        json!({
+            "jurisdiction": "IN", "categoryCode": "gst-12",
+            "displayName": "GST 12%", "taxTreatment": "taxable"
+        }),
+    )
+    .await;
+    // Two adjoining periods, so the half-open boundary is genuinely exercised end to end.
+    reference(
+        "tax-rate-versions",
+        json!({
+            "taxCategoryId": category, "effectiveFrom": "2025-01-01", "effectiveTo": "2026-01-01",
+            "cgstBasisPoints": 250, "sgstBasisPoints": 250, "igstBasisPoints": 500
+        }),
+    )
+    .await;
+    reference(
+        "tax-rate-versions",
+        json!({
+            "taxCategoryId": category, "effectiveFrom": "2026-01-01", "effectiveTo": null,
+            "cgstBasisPoints": 600, "sgstBasisPoints": 600, "igstBasisPoints": 1200
+        }),
+    )
+    .await;
+
+    let tablet = "01997000-0000-7000-8000-000000000001";
+    let product = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":tablet,
+            "quantityScale":0,"displayName":"Classified item"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(product.status, 201, "{:?}", product.body);
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+    let classification_uri = format!("/api/v1/products/{product_id}/tax-classification");
+
+    // An unclassified Product reads normally and says so honestly.
+    let initial = call(&service, "GET", &classification_uri, None, Some(&cookie)).await;
+    assert_eq!(initial.status, 200, "{:?}", initial.body);
+    assert_eq!(initial.body["complete"], false);
+    assert_eq!(initial.body["applicableRate"], Value::Null);
+
+    let assigned = call(
+        &service,
+        "PUT",
+        &classification_uri,
+        Some(json!({
+            "expectedRevision": 1, "hsnCodeId": hsn, "taxCategoryId": category,
+            "reason": "Classified from the supplier invoice"
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(assigned.status, 200, "{:?}", assigned.body);
+    assert_eq!(assigned.body["complete"], true);
+    assert_eq!(assigned.body["revision"], 2);
+
+    // The classification survives a round trip through the socket.
+    let read_back = call(&service, "GET", &classification_uri, None, Some(&cookie)).await;
+    assert_eq!(read_back.body["hsnCodeId"], hsn.as_str());
+    assert_eq!(read_back.body["taxCategoryId"], category.as_str());
+
+    // The resolver honours half-open periods across a real boundary.
+    let rate_on = async |date: &str| {
+        call(
+            &service,
+            "GET",
+            &format!("{classification_uri}?asOf={date}"),
+            None,
+            Some(&cookie),
+        )
+        .await
+        .body
+    };
+    assert_eq!(rate_on("2024-12-31").await["applicableRate"], Value::Null);
+    assert_eq!(
+        rate_on("2025-06-01").await["applicableRate"]["cgstBasisPoints"],
+        250
+    );
+    assert_eq!(
+        rate_on("2025-12-31").await["applicableRate"]["cgstBasisPoints"],
+        250
+    );
+    // The end date belongs to the next version.
+    assert_eq!(
+        rate_on("2026-01-01").await["applicableRate"]["cgstBasisPoints"],
+        600
+    );
+    assert_eq!(
+        rate_on("2026-01-01").await["applicableRate"]["igstBasisPoints"],
+        1200
+    );
+    assert_eq!(rate_on("2026-01-01").await["asOf"], "2026-01-01");
+
+    // A read-only caller may look; an anonymous one may not.
+    let anonymous = call(&service, "GET", &classification_uri, None, None).await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body["code"], "authentication_required");
+
+    // Archiving the HSN must not retroactively break the Product, but must block reassignment.
+    let archive = call(
+        &service,
+        "POST",
+        &format!("/api/v1/reference/hsn-codes/{hsn}/archive"),
+        Some(json!({ "expectedRevision": 1, "reason": "Withdrawn heading" })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(archive.status, 200, "{:?}", archive.body);
+    let still_readable = call(&service, "GET", &classification_uri, None, Some(&cookie)).await;
+    assert_eq!(still_readable.body["hsnCodeId"], hsn.as_str());
+
+    let second_product = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":tablet,
+            "quantityScale":0,"displayName":"Second item"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    let second_id = second_product.body["id"].as_str().expect("id").to_owned();
+    let refused = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/products/{second_id}/tax-classification"),
+        Some(json!({ "expectedRevision": 1, "hsnCodeId": hsn, "taxCategoryId": category })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "archived_conflict");
+
+    // Real SQLite enforces the model independently of the service, and stores no rate on a Product.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let direct = sqlx::query("UPDATE products SET hsn_code_id=? WHERE id=?")
+        .bind(&hsn)
+        .bind(&second_id)
+        .execute(&pool)
+        .await;
+    assert!(direct.is_err(), "the trigger must refuse an archived HSN");
+
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('products')")
+        .fetch_all(&pool)
+        .await
+        .expect("read columns");
+    for column in &columns {
+        for forbidden in [
+            "rate",
+            "basis_points",
+            "percent",
+            "cgst",
+            "sgst",
+            "igst",
+            "cess",
+        ] {
+            assert!(
+                !column.contains(forbidden),
+                "a Product identifies its classification and never stores a rate; found {column}"
+            );
+        }
+    }
+    assert!(columns.iter().any(|column| column == "hsn_code_id"));
+    assert!(columns.iter().any(|column| column == "tax_category_id"));
+    pool.close().await;
+}

@@ -328,6 +328,15 @@ function catalogService(options: Options = {}) {
       return response(state.barcodes[packId].find((item) => item.id === barcodeLifecycle[1]));
     }
 
+    // Phase 1F: Product Detail now reads tax classification. Identity only — the double never
+    // returns a rate stored against the Product, because the service never stores one.
+    if (/\/tax-classification$/.test(url.pathname)) {
+      return response({
+        productId: IDs.product, revision: 1, hsnCodeId: null, taxCategoryId: null,
+        complete: false, asOf: "2026-09-13", applicableRate: null
+      });
+    }
+
     throw new Error(`Unexpected request: ${method} ${url.pathname}`);
   });
 

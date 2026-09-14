@@ -340,3 +340,10 @@ button, input { font: inherit; }
 /* A panel may lead with a bare heading instead of a .panel-header row; it must still match its
    siblings. Every other such heading in the app is .sr-only, which stays clipped regardless. */
 .master-panel > h2:not(.sr-only) { margin: 17px 19px 0; font-size: .82rem; }
+
+/* Product tax classification (Phase 1F). A resolved rate is always shown with the date it belongs
+   to, never as permanent Product metadata. */
+.tax-rate-note { margin: 0 19px 17px; padding: 13px 15px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-soft); }
+.tax-rate-note strong { display: block; font-size: .72rem; }
+.tax-rate-note ul { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 9px 0; padding: 0; list-style: none; font-size: .72rem; font-weight: 700; }
+.tax-rate-note small { display: block; color: var(--ink-500); font-size: .66rem; }
