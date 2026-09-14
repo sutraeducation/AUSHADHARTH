@@ -81,8 +81,18 @@ function LedgerRow({ movement, productName }: { movement: InventoryMovement; pro
   const detail = useQuery({ queryKey: ["product", movement.productId], queryFn: () => getProduct(movement.productId), retry: false });
   const scale = detail.data?.quantityScale ?? 0;
   const signed = `${movement.quantityDeltaAtoms > 0 ? "+" : "−"}${atomsToQuantity(Math.abs(movement.quantityDeltaAtoms), scale)}`;
-  return <tr><td data-label="Date">{movement.occurredOn}</td><td data-label="Type">{movement.movementType === "opening_stock" ? "Opening stock" : "Adjustment"}</td><td data-label="Product">{productName}</td><td data-label="Quantity"><span className={movement.quantityDeltaAtoms > 0 ? "ledger-in" : "ledger-out"}>{signed}</span></td><td data-label="Reason">{movement.reason || "—"}</td></tr>;
+  return <tr><td data-label="Date">{movement.occurredOn}</td><td data-label="Type">{MOVEMENT_LABELS[movement.movementType]}</td><td data-label="Product">{productName}</td><td data-label="Quantity"><span className={movement.quantityDeltaAtoms > 0 ? "ledger-in" : "ledger-out"}>{signed}</span></td><td data-label="Reason">{movement.purchaseLineId ? <span>Purchase inward<small className="row-subtext">Recorded by posting a purchase</small></span> : movement.reason || "—"}</td></tr>;
 }
+
+/**
+ * Every movement type must name itself. A purchase inward shown as "Adjustment" would tell an
+ * auditor that someone corrected the stock by hand when a supplier invoice was in fact posted.
+ */
+const MOVEMENT_LABELS: Record<InventoryMovement["movementType"], string> = {
+  opening_stock: "Opening stock",
+  adjustment: "Adjustment",
+  purchase: "Purchase"
+};
 
 function PostMovementDialog({ onClose, onPosted }: { onClose: () => void; onPosted: () => void }) {
   const [productId, setProductId] = useState("");

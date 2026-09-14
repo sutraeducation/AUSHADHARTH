@@ -568,7 +568,12 @@ export type UpdateProductTaxClassificationRequest = z.infer<
  * Phase 1D inventory ledger. Quantity authority is exact integer atoms in the Product's base unit;
  * a balance is always derived by summing movements and is never stored anywhere.
  */
-export const MovementTypeSchema = z.enum(["opening_stock", "adjustment"]);
+/**
+ * `purchase` is written only by posting a purchase document, never by the movement endpoint, but it
+ * must be listed here: the ledger returns it like any other movement, and an enum that omits it
+ * fails to parse the whole page.
+ */
+export const MovementTypeSchema = z.enum(["opening_stock", "adjustment", "purchase"]);
 
 export const PostMovementRequestSchema = z.object({
   idempotencyKey: z.string(),
@@ -592,6 +597,8 @@ export const InventoryMovementSchema = z.object({
   occurredOn: z.string(),
   reason: z.string().nullable(),
   reversesMovementId: z.string().nullable(),
+  /** The purchase line that caused this inward, when one did. */
+  purchaseLineId: z.string().nullable(),
   idempotencyKey: z.string(),
   postedByUserId: z.string(),
   postedAtUtc: z.string()
@@ -792,6 +799,155 @@ export const UpdateStoreTaxIdentityRequestSchema = z.object({
 
 export type StoreTaxIdentity = z.infer<typeof StoreTaxIdentitySchema>;
 export type UpdateStoreTaxIdentityRequest = z.infer<typeof UpdateStoreTaxIdentityRequestSchema>;
+
+/**
+ * Phase 1G purchase inward.
+ *
+ * A draft carries only commercial intent. Every tax figure, the inventory atoms, the Store, and the
+ * actor are derived by the Store Service — a value for any of them in a request body is ignored, so
+ * the draft input schemas deliberately cannot express them.
+ */
+export const PurchaseStatusSchema = z.enum(["draft", "posted"]);
+export const PurchaseTaxTreatmentSchema = z.enum(["intra_state", "inter_state"]);
+export const PurchaseLineTaxKindSchema = z.enum(["taxable", "exempt", "nil_rated", "non_gst"]);
+
+/** Server-owned header facts. Snapshot fields are null until the document is posted. */
+export const PurchaseSchema = z.object({
+  id: z.string(),
+  storeId: z.string(),
+  supplierPartyId: z.string(),
+  supplierInvoiceNumber: z.string(),
+  normalizedSupplierInvoiceNumber: z.string(),
+  invoiceDate: z.string(),
+  status: PurchaseStatusSchema,
+  revision: z.number().int().positive(),
+  supplierDisplayName: z.string().nullable(),
+  supplierGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  supplierNormalizedGstin: z.string().nullable(),
+  supplierPlaceOfSupplyStateId: z.string().nullable(),
+  supplierStateCode: z.string().nullable(),
+  storeGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  storeNormalizedGstin: z.string().nullable(),
+  storePlaceOfSupplyStateId: z.string().nullable(),
+  storeStateCode: z.string().nullable(),
+  taxTreatment: PurchaseTaxTreatmentSchema.nullable(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  grandTotalPaise: z.number().int(),
+  createdByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  postedByUserId: z.string().nullable(),
+  postedAtUtc: z.string().nullable()
+});
+
+/**
+ * A line as the server returns it. `quantityAtoms` and every paise and basis-point field are
+ * derived; they appear here because the UI displays them, never because it supplies them.
+ */
+export const PurchaseLineSchema = z.object({
+  id: z.string(),
+  purchaseDocumentId: z.string(),
+  lineNumber: z.number().int().positive(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string().nullable(),
+  newBatchNumber: z.string().nullable(),
+  newBatchExpiresOn: z.string().nullable(),
+  newBatchMrpPaise: z.number().int().nullable(),
+  quantityPacks: z.number().int().positive(),
+  ratePerPackPaise: z.number().int(),
+  quantityAtoms: z.number().int(),
+  taxableValuePaise: z.number().int(),
+  hsnCodeId: z.string().nullable(),
+  hsnCode: z.string().nullable(),
+  taxCategoryId: z.string().nullable(),
+  taxTreatmentKind: PurchaseLineTaxKindSchema.nullable(),
+  taxRateVersionId: z.string().nullable(),
+  cgstBasisPoints: z.number().int(),
+  sgstBasisPoints: z.number().int(),
+  igstBasisPoints: z.number().int(),
+  cessBasisPoints: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int()
+});
+
+export const PurchaseDetailSchema = PurchaseSchema.extend({
+  lines: z.array(PurchaseLineSchema).default([])
+});
+
+/** The only header facts a browser may supply. */
+export const PurchaseDraftInputSchema = z.object({
+  supplierPartyId: z.string(),
+  supplierInvoiceNumber: z.string(),
+  invoiceDate: z.string()
+});
+
+export const UpdatePurchaseDraftRequestSchema = PurchaseDraftInputSchema.extend({
+  expectedRevision: z.number().int().positive()
+});
+
+/**
+ * The only line facts a browser may supply: what was bought, in what pack, at what price, and
+ * either an existing batch or a proposal for a new one — never both.
+ */
+export const PurchaseLineInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string().nullable().optional(),
+  newBatchNumber: z.string().nullable().optional(),
+  newBatchExpiresOn: z.string().nullable().optional(),
+  newBatchMrpPaise: z.number().int().positive().nullable().optional(),
+  quantityPacks: z.number().int().positive(),
+  ratePerPackPaise: z.number().int().nonnegative()
+});
+
+export const PostPurchaseRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string()
+});
+
+/** Every code the purchase API can return, mirroring `api::purchases::PurchaseError`. */
+export const PurchaseErrorCodeSchema = z.enum([
+  "validation_failed",
+  "purchase_not_found",
+  "purchase_not_draft",
+  "revision_conflict",
+  "duplicate_supplier_invoice",
+  "supplier_not_eligible",
+  "store_tax_profile_incomplete",
+  "supplier_tax_profile_incomplete",
+  "product_tax_classification_incomplete",
+  "tax_rate_not_found",
+  "product_pack_mismatch",
+  "batch_pack_mismatch",
+  "batch_conflict",
+  "arithmetic_overflow",
+  "idempotency_conflict",
+  "posting_conflict",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied",
+  "service_busy",
+  "internal_error"
+]);
+
+export type PurchaseStatus = z.infer<typeof PurchaseStatusSchema>;
+export type PurchaseTaxTreatment = z.infer<typeof PurchaseTaxTreatmentSchema>;
+export type PurchaseLineTaxKind = z.infer<typeof PurchaseLineTaxKindSchema>;
+export type Purchase = z.infer<typeof PurchaseSchema>;
+export type PurchaseLine = z.infer<typeof PurchaseLineSchema>;
+export type PurchaseDetail = z.infer<typeof PurchaseDetailSchema>;
+export type PurchaseDraftInput = z.infer<typeof PurchaseDraftInputSchema>;
+export type PurchaseLineInput = z.infer<typeof PurchaseLineInputSchema>;
+export type PurchaseErrorCode = z.infer<typeof PurchaseErrorCodeSchema>;
 
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
 

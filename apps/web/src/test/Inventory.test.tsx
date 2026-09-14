@@ -92,7 +92,7 @@ function inventoryService(options: Options = {}) {
       const replay = state.seenKeys.get(String(body.idempotencyKey));
       if (replay) return response(replay);
       if (options.postError) return failure(options.postError.code, options.postError.status, options.postError.extra);
-      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
+      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
       state.movements.push(movement);
       state.seenKeys.set(movement.idempotencyKey, movement);
       return response(movement, 201);
@@ -111,7 +111,7 @@ function bodiesFor(fetchMock: ReturnType<typeof inventoryService>["fetchMock"], 
   return fetchMock.mock.calls.filter(([input, init]) => predicate(String(input), init?.method ?? "GET")).map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
 }
 function movement(overrides: Partial<InventoryMovement> = {}): InventoryMovement {
-  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
+  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, purchaseLineId: null, idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
 }
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -147,6 +147,23 @@ describe("Inventory ledger UI", () => {
     expect(await screen.findByRole("cell", { name: "AB-123" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "30" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "20" })).toBeInTheDocument();
+  });
+
+  it("names a purchase inward as a purchase and shows where it came from", async () => {
+    // Both halves of this were real defects: the ledger parsed only two movement types, so a page
+    // containing a purchase threw, and the surviving rows called every non-opening movement an
+    // "Adjustment" — telling an auditor someone corrected the stock by hand.
+    renderApp("/app/inventory/ledger", inventoryService({
+      movements: [movement({
+        movementType: "purchase",
+        quantityDeltaAtoms: 100,
+        purchaseLineId: "01997a00-0000-7000-8000-000000000050"
+      })]
+    }));
+    expect(await screen.findByRole("cell", { name: "Purchase" })).toBeInTheDocument();
+    expect(screen.queryByRole("cell", { name: "Adjustment" })).not.toBeInTheDocument();
+    expect(screen.getByText("Purchase inward")).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "+100" })).toBeInTheDocument();
   });
 
   it("renders the ledger with signed quantities and its own error state", async () => {

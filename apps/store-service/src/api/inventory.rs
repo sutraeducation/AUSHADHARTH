@@ -183,6 +183,10 @@ struct MovementResponse {
     occurred_on: String,
     reason: Option<String>,
     reverses_movement_id: Option<String>,
+    /// The purchase line that caused this inward, when one did. Provenance is recorded on the
+    /// movement, so it must be readable from it — otherwise the ledger can show a receipt with no
+    /// way back to the document that explains it.
+    purchase_line_id: Option<String>,
     idempotency_key: String,
     posted_by_user_id: String,
     posted_at_utc: String,
@@ -538,7 +542,7 @@ fn optional_uuid(value: Option<String>, field: &str) -> Result<Option<String>, I
 }
 
 const MOVEMENT_COLUMNS: &str = "id,store_id,product_id,product_pack_id,batch_id,movement_type,quantity_delta_atoms,\
-     occurred_on,reason,reverses_movement_id,idempotency_key,posted_by_user_id,posted_at_utc";
+     occurred_on,reason,reverses_movement_id,purchase_line_id,idempotency_key,posted_by_user_id,posted_at_utc";
 
 async fn fetch_movement(pool: &SqlitePool, id: &str) -> Result<MovementResponse, InventoryError> {
     sqlx::query_as::<_, MovementResponse>(&format!(

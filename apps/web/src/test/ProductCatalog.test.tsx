@@ -406,7 +406,7 @@ describe("Product Catalog UI", () => {
   it("renders detail, company role, Pack/SKU containment and policy/barcode workspace", async () => {
     renderApp(`/app/products/${IDs.product}`, catalogService({ policy: true, barcode: true }));
     expect(await screen.findByRole("heading", { name: "Crocin 500 mg Tablet" })).toBeInTheDocument(); expect(screen.getByRole("cell", { name: "GSK Pharma" })).toBeInTheDocument(); expect(screen.getByRole("cell", { name: "CROCIN-15" })).toBeInTheDocument(); expect(screen.getByRole("cell", { name: "Direct" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Manage" })); expect(await screen.findByText("8901234567890")).toBeInTheDocument(); expect(screen.getByText(/Purchase/).closest("section")).toHaveTextContent("Default"); expect(screen.getByRole("button", { name: "Archive Policy" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Manage" })); expect(await screen.findByText("8901234567890")).toBeInTheDocument(); expect(screen.getByText("Purchase", { exact: true }).closest("section")).toHaveTextContent("Default"); expect(screen.getByRole("button", { name: "Archive Policy" })).toBeInTheDocument();
   });
 
   it("validates Pack containment exactly and scopes an added SKU to the authenticated Store", async () => {

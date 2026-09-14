@@ -800,3 +800,1107 @@ async fn real_service_records_the_store_place_of_supply_over_http() {
     assert_eq!(audited, 1, "the refused attempts must not have audited");
     pool.close().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1G — GST-aware purchase inward
+// ---------------------------------------------------------------------------------------------
+
+/// Everything a purchase needs before it can be posted, created over real HTTP in the order a
+/// pharmacy would: the store's own registration, a supplier, a product and its pack, the product's
+/// tax classification, and a rate version in force on the invoice date.
+struct PurchaseWorld {
+    cookie: String,
+    supplier: String,
+    product: String,
+    pack: String,
+    category: String,
+}
+
+const MAHARASHTRA: &str = "01997300-0000-7000-8000-000000000027";
+const KARNATAKA: &str = "01997300-0000-7000-8000-000000000029";
+/// Genuine check digits, so the real GSTIN validator is exercised rather than bypassed.
+const STORE_GSTIN: &str = "27AAPFU0939F1ZV";
+const TABLET: &str = "01997000-0000-7000-8000-000000000001";
+const STRIP: &str = "01997000-0000-7000-8000-000000000004";
+
+async fn owner_cookie(service: &Service) -> String {
+    let setup = call(
+        service,
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({
+            "storeDisplayName": "Integration Pharmacy",
+            "ownerDisplayName": "Integration Owner",
+            "loginIdentifier": "integration.owner",
+            "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, 201, "{:?}", setup.body);
+    session_cookie(&setup.headers)
+}
+
+/// Creates a supplier whose GSTIN really belongs to `state`, so the treatment comparison is made
+/// from persisted facts rather than from a hand-written state code.
+async fn create_supplier(service: &Service, cookie: &str, name: &str, state: &str) -> String {
+    let gstin = gstin_for(state);
+    let reply = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": {
+                "displayName": name, "gstRegistrationStatus": "registered",
+                "gstin": gstin, "placeOfSupplyStateId": state
+            },
+            "roles": [{ "role": "supplier" }],
+            "addresses": []
+        })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 201, "{:?}", reply.body);
+    reply.body["id"].as_str().expect("supplier id").to_owned()
+}
+
+/// A valid GSTIN for one of the two States these tests use. The check digit is computed rather than
+/// hardcoded so the real validator cannot be satisfied by a lucky literal.
+fn gstin_for(state: &str) -> String {
+    let code = if state == KARNATAKA { "29" } else { "27" };
+    let body = format!("{code}AAACS1234A1Z");
+    let alphabet: Vec<char> = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
+    let mut sum = 0usize;
+    for (index, character) in body.chars().enumerate() {
+        let value = alphabet
+            .iter()
+            .position(|item| *item == character)
+            .expect("gstin alphabet");
+        let factor = if index % 2 == 0 { 1 } else { 2 };
+        let product = value * factor;
+        sum += product / 36 + product % 36;
+    }
+    let checksum = (36 - (sum % 36)) % 36;
+    format!("{body}{}", alphabet[checksum])
+}
+
+async fn seed_purchase_world(
+    service: &Service,
+    supplier_state: &str,
+    treatment: &str,
+) -> PurchaseWorld {
+    let cookie = owner_cookie(service).await;
+
+    // The store's own place of supply — one half of the treatment decision.
+    let store = call(
+        service,
+        "PUT",
+        "/api/v1/store/tax-identity",
+        Some(json!({
+            "expectedRevision": 1, "gstRegistrationStatus": "registered",
+            "gstin": STORE_GSTIN, "placeOfSupplyStateId": MAHARASHTRA
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(store.status, 200, "{:?}", store.body);
+
+    let supplier_id = create_supplier(service, &cookie, "Sharma Medicals", supplier_state).await;
+
+    let reference = async |kind: &str, attributes: Value| {
+        let reply = call(
+            service,
+            "POST",
+            &format!("/api/v1/reference/{kind}"),
+            Some(json!({ "attributes": attributes })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 201, "{kind}: {:?}", reply.body);
+        reply.body["id"].as_str().expect("reference id").to_owned()
+    };
+
+    let hsn = reference(
+        "hsn-codes",
+        json!({ "jurisdiction": "IN", "hsnCode": "30049099", "description": "Medicaments" }),
+    )
+    .await;
+    let category = reference(
+        "tax-categories",
+        json!({
+            "jurisdiction": "IN", "categoryCode": "gst-12",
+            "displayName": "GST 12%", "taxTreatment": treatment
+        }),
+    )
+    .await;
+    // A rate in force on the invoice date these tests use. Exempt, nil-rated and non-GST
+    // categories carry a zero-component version, which is a different thing from having no rate.
+    let taxable = treatment == "taxable";
+    reference(
+        "tax-rate-versions",
+        json!({
+            "taxCategoryId": category, "effectiveFrom": "2026-01-01", "effectiveTo": null,
+            "cgstBasisPoints": if taxable { 600 } else { 0 },
+            "sgstBasisPoints": if taxable { 600 } else { 0 },
+            "igstBasisPoints": if taxable { 1200 } else { 0 }
+        }),
+    )
+    .await;
+
+    let product = call(
+        service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":TABLET,
+            "quantityScale":0,"displayName":"Crocin 500 mg Tablet"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(product.status, 201, "{:?}", product.body);
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+
+    let pack = call(
+        service,
+        "POST",
+        &format!("/api/v1/products/{product_id}/packs"),
+        Some(json!({
+            "containerUnitId": STRIP, "baseQuantityAtoms": 10, "displayLabel": "Strip of 10"
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(pack.status, 201, "{:?}", pack.body);
+    let pack_id = pack.body["id"].as_str().expect("pack id").to_owned();
+
+    let classified = call(
+        service,
+        "PUT",
+        &format!("/api/v1/products/{product_id}/tax-classification"),
+        Some(json!({ "expectedRevision": 1, "hsnCodeId": hsn, "taxCategoryId": category })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(classified.status, 200, "{:?}", classified.body);
+
+    PurchaseWorld {
+        cookie,
+        supplier: supplier_id,
+        product: product_id,
+        pack: pack_id,
+        category,
+    }
+}
+
+async fn create_draft(service: &Service, world: &PurchaseWorld, invoice: &str) -> Value {
+    let draft = call(
+        service,
+        "POST",
+        "/api/v1/purchases",
+        Some(json!({
+            "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": invoice,
+            "invoiceDate": "2026-09-10"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    draft.body
+}
+
+/// The whole Phase 1G workflow across a real socket: a draft becomes a posted GST document, a
+/// proposed lot becomes a real batch, and the ledger gains exactly one inward movement.
+#[tokio::test]
+async fn real_service_posts_a_gst_purchase_and_moves_stock_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    let draft = create_draft(&service, &world, "INV-4471").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    assert_eq!(draft["status"], "draft");
+    assert_eq!(draft["taxTreatment"], Value::Null);
+    assert_eq!(draft["grandTotalPaise"], 0);
+
+    // One line proposing a batch that does not exist yet.
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "newBatchNumber": "B-2601",
+            "newBatchExpiresOn": "2028-03-31",
+            "newBatchMrpPaise": 4500,
+            "quantityPacks": 10,
+            "ratePerPackPaise": 3000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    assert_eq!(with_line.body["lines"][0]["taxableValuePaise"], 30_000);
+    assert_eq!(with_line.body["lines"][0]["quantityAtoms"], 100);
+    // A draft line carries no tax at all; it is resolved only at posting.
+    assert_eq!(with_line.body["lines"][0]["cgstPaise"], 0);
+    assert_eq!(with_line.body["lines"][0]["taxRateVersionId"], Value::Null);
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+
+    let key = "01997a00-0000-7000-8000-0000000000a1";
+    let posted = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({ "expectedRevision": revision, "idempotencyKey": key })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["status"], "posted");
+
+    // The snapshots and the treatment, refetched rather than trusted from the write response.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    assert_eq!(detail.body["status"], "posted");
+    assert_eq!(detail.body["supplierDisplayName"], "Sharma Medicals");
+    assert_eq!(
+        detail.body["supplierNormalizedGstin"],
+        gstin_for(MAHARASHTRA)
+    );
+    assert_eq!(detail.body["supplierStateCode"], "27");
+    assert_eq!(detail.body["storeNormalizedGstin"], STORE_GSTIN);
+    assert_eq!(detail.body["storeStateCode"], "27");
+    // Both places of supply are Maharashtra, so the tax splits.
+    assert_eq!(detail.body["taxTreatment"], "intra_state");
+    assert_eq!(detail.body["taxableValuePaise"], 30_000);
+    assert_eq!(detail.body["cgstPaise"], 1_800);
+    assert_eq!(detail.body["sgstPaise"], 1_800);
+    assert_eq!(detail.body["igstPaise"], 0);
+    assert_eq!(detail.body["grandTotalPaise"], 33_600);
+    assert!(detail.body["postedAtUtc"].is_string());
+
+    let line = &detail.body["lines"][0];
+    assert_eq!(line["hsnCode"], "30049099");
+    assert_eq!(line["taxTreatmentKind"], "taxable");
+    assert_eq!(line["cgstBasisPoints"], 600);
+    assert_eq!(line["igstBasisPoints"], 1_200);
+    assert_eq!(line["lineTotalPaise"], 33_600);
+    // The proposal became a real lot, and the scaffolding was cleared.
+    let batch_id = line["batchId"]
+        .as_str()
+        .expect("materialised batch")
+        .to_owned();
+    assert_eq!(line["newBatchNumber"], Value::Null);
+    assert_eq!(line["newBatchExpiresOn"], Value::Null);
+    assert_eq!(line["newBatchMrpPaise"], Value::Null);
+
+    let batches = call(
+        &service,
+        "GET",
+        &format!("/api/v1/packs/{}/batches", world.pack),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(batches.status, 200, "{:?}", batches.body);
+    assert_eq!(batches.body.as_array().expect("batches").len(), 1);
+    assert_eq!(batches.body[0]["id"], batch_id.as_str());
+    assert_eq!(batches.body[0]["batchNumber"], "B-2601");
+    assert_eq!(batches.body[0]["expiresOn"], "2028-03-31");
+    assert_eq!(batches.body[0]["mrpPaise"], 4_500);
+
+    // The ledger, with provenance back to the line that caused it.
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(movements.status, 200, "{:?}", movements.body);
+    let rows = movements.body.as_array().expect("movements");
+    assert_eq!(rows.len(), 1, "one line must post exactly one movement");
+    assert_eq!(rows[0]["movementType"], "purchase");
+    assert_eq!(rows[0]["quantityDeltaAtoms"], 100);
+    assert_eq!(rows[0]["batchId"], batch_id.as_str());
+    assert_eq!(rows[0]["purchaseLineId"], line["id"]);
+
+    // The balance is still derived by summing the ledger, never stored on the pack.
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.status, 200, "{:?}", stock.body);
+    assert_eq!(stock.body.as_array().expect("balances").len(), 1);
+    assert_eq!(stock.body[0]["balanceAtoms"], 100);
+    assert_eq!(stock.body[0]["productPackId"], world.pack.as_str());
+}
+
+/// A supplier in another State is charged IGST alone. The treatment is never taken from the
+/// request; it comes from the two persisted State codes.
+#[tokio::test]
+async fn real_service_charges_igst_for_an_interstate_purchase_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, KARNATAKA, "taxable").await;
+
+    let draft = create_draft(&service, &world, "KL-77").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+            "newBatchNumber": "K-9001", "quantityPacks": 10, "ratePerPackPaise": 3000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+
+    let posted = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000b1"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["taxTreatment"], "inter_state");
+    assert_eq!(posted.body["storeStateCode"], "27");
+    assert_eq!(posted.body["supplierStateCode"], "29");
+    assert_eq!(posted.body["igstPaise"], 3_600);
+    assert_eq!(posted.body["cgstPaise"], 0);
+    assert_eq!(posted.body["sgstPaise"], 0);
+    assert_eq!(posted.body["grandTotalPaise"], 33_600);
+    // The line snapshots the rate version as published — the 12% slab is 6 + 6 or 12 — while the
+    // amounts record what was actually charged. A CGST rate beside a zero CGST amount is the
+    // honest reading of "this slab, charged as IGST because the States differ".
+    assert_eq!(posted.body["lines"][0]["igstBasisPoints"], 1_200);
+    assert_eq!(posted.body["lines"][0]["igstPaise"], 3_600);
+    assert_eq!(posted.body["lines"][0]["cgstPaise"], 0);
+    assert_eq!(posted.body["lines"][0]["sgstPaise"], 0);
+}
+
+/// Replaying one logical posting must not post the invoice twice, create a second lot, or move the
+/// stock again — across the real transport, not a doubled service.
+#[tokio::test]
+async fn real_service_replays_a_posting_without_duplicating_its_effects_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    let draft = create_draft(&service, &world, "INV-9001").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+            "newBatchNumber": "B-7001", "quantityPacks": 4, "ratePerPackPaise": 2500
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+    let key = "01997a00-0000-7000-8000-0000000000c1";
+    let posting = json!({ "expectedRevision": revision, "idempotencyKey": key });
+
+    let first = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(posting.clone()),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert_eq!(first.body["status"], "posted");
+
+    // The same key and the same facts: the original document comes back.
+    let replay = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(posting),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(replay.status, 200, "{:?}", replay.body);
+    assert_eq!(replay.body["id"], first.body["id"]);
+    assert_eq!(replay.body["revision"], first.body["revision"]);
+    assert_eq!(replay.body["postedAtUtc"], first.body["postedAtUtc"]);
+    assert_eq!(
+        replay.body["grandTotalPaise"],
+        first.body["grandTotalPaise"]
+    );
+
+    // Nothing happened twice.
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(
+        movements.body.as_array().expect("movements").len(),
+        1,
+        "the replay must not have moved stock again"
+    );
+    let batches = call(
+        &service,
+        "GET",
+        &format!("/api/v1/packs/{}/batches", world.pack),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(
+        batches.body.as_array().expect("batches").len(),
+        1,
+        "the replay must not have created a second lot"
+    );
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.body[0]["balanceAtoms"], 40);
+
+    // A posted document refuses further change regardless of the key.
+    let again = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000c2"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(again.status, 409, "{:?}", again.body);
+    assert_eq!(again.body["code"], "purchase_not_draft");
+}
+
+/// The same posting key offered for a different invoice is a conflict about the key, and must say
+/// so — telling the operator to check the invoice number would send them to the wrong problem.
+#[tokio::test]
+async fn real_service_refuses_a_reused_posting_key_on_another_invoice_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    let key = "01997a00-0000-7000-8000-0000000000d1";
+
+    let post_one = async |invoice: &str, batch: &str| {
+        let draft = create_draft(&service, &world, invoice).await;
+        let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+        let with_line = call(
+            &service,
+            "POST",
+            &format!("/api/v1/purchases/{purchase_id}/lines"),
+            Some(json!({
+                "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+                "newBatchNumber": batch, "quantityPacks": 2, "ratePerPackPaise": 1000
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+        call(
+            &service,
+            "POST",
+            &format!("/api/v1/purchases/{purchase_id}/post"),
+            Some(json!({
+                "expectedRevision": with_line.body["revision"], "idempotencyKey": key
+            })),
+            Some(&world.cookie),
+        )
+        .await
+    };
+
+    let first = post_one("INV-A", "B-A1").await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+
+    let second = post_one("INV-B", "B-B1").await;
+    assert_eq!(second.status, 409, "{:?}", second.body);
+    assert_eq!(
+        second.body["code"], "idempotency_conflict",
+        "a reused posting key is a key conflict, not a duplicate invoice number"
+    );
+
+    // The refused posting left nothing behind.
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(movements.body.as_array().expect("movements").len(), 1);
+}
+
+/// A posting that fails partway must leave nothing: no lot from the line that succeeded, no
+/// movement, no snapshot, and the document still a draft.
+///
+/// The failure is produced by a real constraint rather than a test-only hook: two lines on the same
+/// pack propose the same batch number, so the second materialisation collides with the first inside
+/// the same transaction.
+#[tokio::test]
+async fn real_service_leaves_no_residue_when_a_posting_fails_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    let draft = create_draft(&service, &world, "INV-ROLLBACK").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+
+    let mut revision = 1;
+    for _ in 0..2 {
+        let reply = call(
+            &service,
+            "POST",
+            &format!("/api/v1/purchases/{purchase_id}/lines"),
+            Some(json!({
+                "expectedRevision": revision, "productId": world.product,
+                "productPackId": world.pack, "newBatchNumber": "B-COLLIDE",
+                "quantityPacks": 3, "ratePerPackPaise": 2000
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 201, "{:?}", reply.body);
+        revision = reply.body["revision"].as_i64().expect("revision");
+    }
+
+    let failed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000e1"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(failed.status, 409, "{:?}", failed.body);
+    assert_eq!(failed.body["code"], "batch_conflict");
+
+    // The document is untouched.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["revision"], revision);
+    assert_eq!(detail.body["taxTreatment"], Value::Null);
+    assert_eq!(detail.body["grandTotalPaise"], 0);
+    assert_eq!(detail.body["postedAtUtc"], Value::Null);
+    for line in detail.body["lines"].as_array().expect("lines") {
+        assert_eq!(line["batchId"], Value::Null, "no line may hold a lot");
+        assert_eq!(line["newBatchNumber"], "B-COLLIDE");
+        assert_eq!(line["taxRateVersionId"], Value::Null);
+        assert_eq!(line["lineTotalPaise"], 0);
+    }
+
+    // The first line's lot was rolled back with everything else.
+    let batches = call(
+        &service,
+        "GET",
+        &format!("/api/v1/packs/{}/batches", world.pack),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(
+        batches.body.as_array().expect("batches").len(),
+        0,
+        "a failed posting must not leave an orphan lot"
+    );
+
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(
+        movements.body.as_array().expect("movements").len(),
+        0,
+        "a failed posting must not move stock"
+    );
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.body.as_array().expect("balances").len(), 0);
+}
+
+/// The typed failure matrix across the real transport. Every refusal must carry a safe code and a
+/// safe message: no SQLite text, no SQL fragment, no Rust type name.
+#[tokio::test]
+async fn real_service_refuses_ineligible_purchases_with_safe_codes_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    let assert_safe = |reply: &Reply, code: &str| {
+        assert_eq!(reply.body["code"], code, "{:?}", reply.body);
+        let message = reply.body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for leak in [
+            "sqlite",
+            "constraint failed",
+            "select ",
+            "insert ",
+            "update ",
+            "rusqlite",
+            "sqlx",
+            "panicked",
+            "purchaseerror",
+            "unwrap",
+            "no such column",
+        ] {
+            assert!(!message.contains(leak), "{code} leaked {leak:?}: {message}");
+        }
+    };
+
+    // An anonymous caller never reaches the purchase API at all.
+    let anonymous = call(&service, "GET", "/api/v1/purchases", None, None).await;
+    assert_eq!(anonymous.status, 401);
+    assert_safe(&anonymous, "authentication_required");
+
+    let draft = create_draft(&service, &world, "INV-MATRIX").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+
+    // The same supplier cannot be invoiced twice under the same number.
+    let duplicate = call(
+        &service,
+        "POST",
+        "/api/v1/purchases",
+        Some(json!({
+            "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": "  inv-matrix  ",
+            "invoiceDate": "2026-09-11"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 409, "{:?}", duplicate.body);
+    assert_safe(&duplicate, "duplicate_supplier_invoice");
+
+    // Punctuation is part of the number: these are two different invoices, not one.
+    for invoice in ["INV/2026/001", "INV-2026-001"] {
+        let distinct = call(
+            &service,
+            "POST",
+            "/api/v1/purchases",
+            Some(json!({
+                "supplierPartyId": world.supplier,
+                "supplierInvoiceNumber": invoice,
+                "invoiceDate": "2026-09-11"
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(
+            distinct.status, 201,
+            "{invoice} must be its own document: {:?}",
+            distinct.body
+        );
+    }
+
+    // A stale revision is refused with the current one, never applied.
+    let stale = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        Some(json!({
+            "expectedRevision": 99, "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": "INV-MATRIX", "invoiceDate": "2026-09-12"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert_safe(&stale, "revision_conflict");
+    assert_eq!(stale.body["currentRevision"], 1);
+
+    // A pack that belongs to another product cannot be put on a line.
+    let other = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":TABLET,
+            "quantityScale":0,"displayName":"Unrelated item"
+        }})),
+        Some(&world.cookie),
+    )
+    .await;
+    let other_id = other.body["id"].as_str().expect("product id").to_owned();
+    let mismatch = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": other_id, "productPackId": world.pack,
+            "newBatchNumber": "B-X", "quantityPacks": 1, "ratePerPackPaise": 100
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(mismatch.status, 409, "{:?}", mismatch.body);
+    assert_safe(&mismatch, "product_pack_mismatch");
+
+    // A line for a product with no classification cannot be priced for tax.
+    let unclassified_pack = call(
+        &service,
+        "POST",
+        &format!("/api/v1/products/{other_id}/packs"),
+        Some(json!({"containerUnitId": STRIP, "baseQuantityAtoms": 10})),
+        Some(&world.cookie),
+    )
+    .await;
+    let unclassified_pack_id = unclassified_pack.body["id"]
+        .as_str()
+        .expect("pack id")
+        .to_owned();
+    let added = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": other_id, "productPackId": unclassified_pack_id,
+            "newBatchNumber": "B-Y", "quantityPacks": 1, "ratePerPackPaise": 100
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(added.status, 201, "{:?}", added.body);
+    let unclassified_posting = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": added.body["revision"],
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000f1"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(
+        unclassified_posting.status, 409,
+        "{:?}",
+        unclassified_posting.body
+    );
+    assert_safe(
+        &unclassified_posting,
+        "product_tax_classification_incomplete",
+    );
+
+    // A classified product with no rate in force on the invoice date is a different refusal
+    // entirely, and must never be treated as a zero rate.
+    let dated = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        Some(json!({
+            "expectedRevision": added.body["revision"], "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": "INV-MATRIX", "invoiceDate": "2025-06-01"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(dated.status, 200, "{:?}", dated.body);
+    let classified = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/products/{other_id}/tax-classification"),
+        Some(json!({ "expectedRevision": 1, "taxCategoryId": world.category })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(classified.status, 200, "{:?}", classified.body);
+    let before_rate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": dated.body["revision"],
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000f2"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(before_rate.status, 409, "{:?}", before_rate.body);
+    assert_safe(&before_rate, "tax_rate_not_found");
+}
+
+/// A purchase cannot be posted while either place of supply is unknown. Guessing "same State"
+/// would silently invent CGST + SGST on a document that might be interstate.
+#[tokio::test]
+async fn real_service_refuses_to_post_without_both_places_of_supply_over_http() {
+    let service = start().await;
+    let cookie = owner_cookie(&service).await;
+
+    // A supplier with no place of supply at all.
+    let supplier = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Unregistered Trader", "gstRegistrationStatus": "unregistered" },
+            "roles": [{ "role": "supplier" }],
+            "addresses": []
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(supplier.status, 201, "{:?}", supplier.body);
+    let supplier_id = supplier.body["id"]
+        .as_str()
+        .expect("supplier id")
+        .to_owned();
+
+    let product = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":TABLET,
+            "quantityScale":0,"displayName":"Anything"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+    let pack = call(
+        &service,
+        "POST",
+        &format!("/api/v1/products/{product_id}/packs"),
+        Some(json!({"containerUnitId": STRIP, "baseQuantityAtoms": 10})),
+        Some(&cookie),
+    )
+    .await;
+    let pack_id = pack.body["id"].as_str().expect("pack id").to_owned();
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/purchases",
+        Some(json!({
+            "supplierPartyId": supplier_id, "supplierInvoiceNumber": "NO-STATE",
+            "invoiceDate": "2026-09-10"
+        })),
+        Some(&cookie),
+    )
+    .await;
+    let purchase_id = draft.body["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": product_id, "productPackId": pack_id,
+            "newBatchNumber": "B-1", "quantityPacks": 1, "ratePerPackPaise": 100
+        })),
+        Some(&cookie),
+    )
+    .await;
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+
+    // The store has no place of supply yet, so that is the first thing missing.
+    let no_store = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-000000000101"
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(no_store.status, 409, "{:?}", no_store.body);
+    assert_eq!(no_store.body["code"], "store_tax_profile_incomplete");
+
+    // With the store recorded, the supplier's missing State is now what blocks it.
+    let store = call(
+        &service,
+        "PUT",
+        "/api/v1/store/tax-identity",
+        Some(json!({
+            "expectedRevision": 1, "gstRegistrationStatus": "registered",
+            "gstin": STORE_GSTIN, "placeOfSupplyStateId": MAHARASHTRA
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(store.status, 200, "{:?}", store.body);
+    let no_supplier = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-000000000102"
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(no_supplier.status, 409, "{:?}", no_supplier.body);
+    assert_eq!(no_supplier.body["code"], "supplier_tax_profile_incomplete");
+
+    // Nothing was posted by either refusal.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(movements.body.as_array().expect("movements").len(), 0);
+}
+
+/// Purchase entry is an Owner/Admin action. A reader may look; a reader may not write.
+#[tokio::test]
+async fn real_service_denies_purchase_mutation_to_a_non_admin_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    let draft = create_draft(&service, &world, "INV-ROLE").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+
+    // There is no user-management API yet, so the reader is seeded directly into the disposable
+    // database. Everything under test — the login, the session, the role check — still happens
+    // over the real transport against the real service.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let owner_hash: String = sqlx::query_scalar("SELECT password_hash FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("owner hash");
+    sqlx::query(
+        "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,\
+         password_hash,role,created_at_utc,updated_at_utc) \
+         VALUES (?,?,?,?,?, 'pharmacist', strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind("01997a00-0000-7000-8000-000000000201")
+    .bind("counter.pharmacist")
+    .bind("counter.pharmacist")
+    .bind("Counter Pharmacist")
+    // The same verifier as the owner, so the real Argon2 path is exercised by the login below.
+    .bind(&owner_hash)
+    .execute(&pool)
+    .await
+    .expect("seed a reader");
+    pool.close().await;
+
+    let login = call(
+        &service,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({
+            "loginIdentifier": "counter.pharmacist", "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(login.status, 200, "{:?}", login.body);
+    let reader = session_cookie(&login.headers);
+
+    // Reading is allowed.
+    let list = call(&service, "GET", "/api/v1/purchases", None, Some(&reader)).await;
+    assert_eq!(list.status, 200, "{:?}", list.body);
+
+    // Writing is not, at every mutating entry point.
+    let attempts = [
+        (
+            "POST",
+            "/api/v1/purchases".to_owned(),
+            json!({
+                "supplierPartyId": world.supplier, "supplierInvoiceNumber": "SNEAK",
+                "invoiceDate": "2026-09-10"
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/purchases/{purchase_id}/lines"),
+            json!({
+                "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+                "newBatchNumber": "B-Z", "quantityPacks": 1, "ratePerPackPaise": 100
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/purchases/{purchase_id}/post"),
+            json!({
+                "expectedRevision": 1, "idempotencyKey": "01997a00-0000-7000-8000-000000000111"
+            }),
+        ),
+    ];
+    for (method, path, body) in attempts {
+        let denied = call(&service, method, &path, Some(body), Some(&reader)).await;
+        assert_eq!(denied.status, 403, "{method} {path}: {:?}", denied.body);
+        assert_eq!(denied.body["code"], "authorization_denied");
+    }
+
+    // And nothing leaked through.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["lines"].as_array().expect("lines").len(), 0);
+}

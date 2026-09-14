@@ -89,6 +89,10 @@ button, input { font: inherit; }
 .password-rule, .privacy-note, .recovery-note { color: var(--ink-500); font-size: .7rem; line-height: 1.5; }
 .password-rule { margin: -6px 0 4px; }
 .button { min-height: 42px; padding: 9px 16px; border: 1px solid transparent; border-radius: var(--radius-sm); font-weight: 750; cursor: pointer; }
+/* A link that is presented as a button must look like one. Without this an <a class="button">
+   inherits the underline and the block display of a plain link, so every page whose primary action
+   navigates — Add Product, New Supplier, New Purchase — drew an underlined full-width bar. */
+a.button { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .button--primary { color: white; background: var(--primary-800); }
 .button--primary:hover:not(:disabled) { background: var(--primary-900); }
 .button--secondary { border-color: var(--line-strong); color: var(--ink-700); background: white; }
@@ -347,3 +351,30 @@ button, input { font: inherit; }
 .tax-rate-note strong, .panel-callout strong { display: block; font-size: .72rem; }
 .tax-rate-note ul, .panel-callout ul { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 9px 0; padding: 0; list-style: none; font-size: .72rem; font-weight: 700; }
 .tax-rate-note small, .panel-callout small { display: block; color: var(--ink-500); font-size: .66rem; }
+
+/* Phase 1G purchase presentation. Money and quantities are read down a column, so they are right
+   aligned and tabular; a proportional font makes two totals of different width hard to compare. */
+.data-table th.numeric, .data-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.data-table tfoot th, .data-table tfoot td { padding: 11px 14px; border-top: 1px solid var(--line); background: #f6f8f7; font-size: .73rem; }
+.data-table tfoot th { text-align: right; color: var(--ink-500); font-weight: 700; }
+/* The two batch modes are mutually exclusive, so they read as one choice rather than two fields. */
+.choice-row { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 4px 0 6px; }
+/* The text is an anonymous flex item, so without this it shrinks and a three-word option wraps to
+   three lines inside its own row. The row still wraps as a whole when the dialog is narrow. */
+.choice-row label { display: flex; align-items: center; gap: 7px; font-size: .74rem; font-weight: 600; white-space: nowrap; }
+.choice-row input { margin: 0; }
+/* Each tax component keeps its own rate beside its own amount: a posted line must never leave the
+   reader guessing which percentage produced which figure. */
+.tax-breakdown { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.tax-breakdown li { display: flex; justify-content: space-between; gap: 14px; font-size: .7rem; white-space: nowrap; }
+.tax-breakdown span { color: var(--ink-500); }
+.tax-breakdown b { font-variant-numeric: tabular-nums; font-weight: 700; }
+.totals-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.totals-grid dd.numeric { font-variant-numeric: tabular-nums; }
+.totals-grand dt { color: var(--primary-700); }
+.totals-grand dd { font-size: .92rem; }
+/* The running taxable value, kept beside Add Line so a ten-line invoice can be reconciled against
+   the supplier's printed total without scrolling to the table footer. */
+.running-total { display: flex; align-items: baseline; gap: 9px; margin: 0; }
+.running-total span { color: var(--ink-500); font-size: .64rem; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+.running-total strong { font-size: .86rem; font-variant-numeric: tabular-nums; }

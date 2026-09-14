@@ -26,7 +26,7 @@ use crate::domain::{
 };
 
 #[derive(Debug)]
-enum CatalogError {
+pub(crate) enum CatalogError {
     Auth(AuthError),
     Validation(Vec<CatalogValidationIssue>),
     Duplicate,
@@ -424,11 +424,11 @@ struct UpdateCompositionRequest {
 /// no quantity, balance, or stock figure, and recording a batch is never a stock receipt.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BatchInput {
-    batch_number: String,
-    manufactured_on: Option<String>,
-    expires_on: Option<String>,
-    mrp_paise: Option<i64>,
+pub(crate) struct BatchInput {
+    pub(crate) batch_number: String,
+    pub(crate) manufactured_on: Option<String>,
+    pub(crate) expires_on: Option<String>,
+    pub(crate) mrp_paise: Option<i64>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -2169,7 +2169,7 @@ fn prepare_pack(mut input: PackInput) -> Result<PackInput, CatalogError> {
 
 /// Validates one batch. Dates stay calendar-domain values that are really parsed, and MRP stays an
 /// exact integer paise value — binary floating point is never accepted.
-fn prepare_batch(mut input: BatchInput) -> Result<(BatchInput, String), CatalogError> {
+pub(crate) fn prepare_batch(mut input: BatchInput) -> Result<(BatchInput, String), CatalogError> {
     let (display, normalized) =
         normalize_batch_number(&input.batch_number).map_err(validation_issue)?;
     input.batch_number = display;
@@ -2612,7 +2612,7 @@ async fn packs_for(pool: &SqlitePool, product_id: &str) -> Result<Vec<PackRespon
 const BATCH_COLUMNS: &str = "id,revision,status,product_pack_id,batch_number,normalized_batch_number,manufactured_on,\
      expires_on,mrp_paise,created_at_utc,updated_at_utc,archived_at_utc,archive_reason";
 
-async fn insert_batch_row(
+pub(crate) async fn insert_batch_row(
     transaction: &mut Transaction<'_, Sqlite>,
     id: &str,
     pack_id: &str,

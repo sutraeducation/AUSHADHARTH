@@ -65,7 +65,7 @@ export async function localServiceRequest(
   return body;
 }
 
-function safeErrorMessage(code?: string): string {
+export function safeErrorMessage(code?: string): string {
   switch (code) {
     case "invalid_credentials": return "The login ID or password is incorrect.";
     case "rate_limited": return "Too many attempts. Wait briefly and try again.";
@@ -88,6 +88,18 @@ function safeErrorMessage(code?: string): string {
     case "batch_pack_mismatch": return "That batch does not belong to the selected pack.";
     case "party_conflict": return "The tax registration does not agree with the selected State.";
     case "store_tax_conflict": return "This store's GSTIN does not agree with the selected State.";
+    case "purchase_not_found": return "This purchase no longer exists.";
+    case "purchase_not_draft": return "A posted purchase cannot be changed. Correct it with a later document.";
+    case "duplicate_supplier_invoice": return "This supplier invoice number is already recorded.";
+    case "supplier_not_eligible": return "That party is not an active supplier.";
+    case "store_tax_profile_incomplete": return "Record this store's place of supply in Store Profile before posting.";
+    case "supplier_tax_profile_incomplete": return "Record the supplier's place of supply before posting.";
+    case "product_tax_classification_incomplete": return "A product on this purchase has no Tax Category yet.";
+    case "tax_rate_not_found": return "No tax rate is in force on the invoice date for a product's Tax Category.";
+    case "product_pack_mismatch": return "That pack does not belong to the selected product.";
+    case "arithmetic_overflow": return "The amounts on this purchase are too large to record.";
+    case "idempotency_conflict": return "This posting was already attempted with different details. Reload and try again.";
+    case "posting_conflict": return "This purchase was already posted.";
     case "party_role_conflict": return "This role conflicts with the party's current status.";
     case "party_address_conflict": return "This address conflicts with the party's or the State's current status.";
     case "validation_failed": return "Check the highlighted information and try again.";
