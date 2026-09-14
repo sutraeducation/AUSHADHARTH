@@ -217,12 +217,13 @@ async fn list(
     let parent_column = match kind {
         MasterKind::CompanyIdentifier => Some("company_id"),
         MasterKind::TaxRateVersion => Some("tax_category_id"),
+        MasterKind::PriceControlVersion => Some("controlled_formulation_id"),
         _ => None,
     };
     if query.parent_id.is_some() && parent_column.is_none() {
         return Err(validation(
             "parentId",
-            "is supported only for company identifiers and tax rate versions",
+            "is supported only for company identifiers, tax rate versions and ceiling price versions",
         ));
     }
     let parent_expression = parent_column.unwrap_or("id");
@@ -669,8 +670,20 @@ impl StoredRow {
 
 fn map_database_error(error: sqlx::Error) -> ReferenceError {
     let message = error.to_string();
-    if message.contains("tax_rate_effective_period_overlap") {
+    // Every effective-period trigger in the schema raises its own typed abort. A new one that is
+    // not listed here would surface as a raw 500, which is the defect class Phase 1E, 1G-0 and 1G
+    // each hit in turn.
+    if message.contains("tax_rate_effective_period_overlap")
+        || message.contains("price_control_effective_period_overlap")
+    {
         ReferenceError::EffectiveDateOverlap
+    } else if message.contains("controlled_formulation_conflict")
+        || message.contains("price_control_conflict")
+    {
+        validation(
+            "attributes",
+            "references a master that is missing or archived",
+        )
     } else if message.contains("UNIQUE constraint failed") {
         ReferenceError::Duplicate
     } else if message.contains("FOREIGN KEY constraint failed")

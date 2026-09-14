@@ -8,8 +8,11 @@ import {
   ProductDetailSchema,
   ProductPackSchema,
   ProductSchema,
+  ProductPriceControlSchema,
   ProductTaxClassificationSchema,
   StorePackPolicySchema,
+  type PriceControlStatus,
+  type ProductPriceControl,
   type ProductTaxClassification,
   type Barcode,
   type BarcodeLookup,
@@ -275,4 +278,25 @@ export function basisPointsToPercentText(value: number): string {
   const whole = Math.trunc(value / 100);
   const fraction = Math.abs(value % 100);
   return `${whole}.${String(fraction).padStart(2, "0")}`;
+}
+
+export async function getPriceControl(productId: string, asOf?: string): Promise<ProductPriceControl> {
+  const suffix = asOf ? `?asOf=${encodeURIComponent(asOf)}` : "";
+  return ProductPriceControlSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/price-control${suffix}`));
+}
+
+/**
+ * Asserting applicability is not the same as recording a price: no ceiling is sent here, because no
+ * ceiling is decided here. The server resolves the ceiling from the formulation and the date.
+ */
+export async function updatePriceControl(
+  productId: string,
+  expectedRevision: number,
+  fields: { priceControlStatus: PriceControlStatus; controlledFormulationId: string | null },
+  reason?: string
+): Promise<ProductPriceControl> {
+  return ProductPriceControlSchema.parse(await localServiceRequest(`/api/v1/products/${productId}/price-control`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision, ...fields, reason: reason ?? null })
+  }));
 }

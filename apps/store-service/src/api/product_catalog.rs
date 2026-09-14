@@ -22,7 +22,7 @@ use crate::domain::{
         normalize_barcode, normalize_batch_number, normalize_sku, normalized_search_name,
         optional_text, required_text, validate_date, validate_uuid_v7,
     },
-    taxation,
+    price_control, taxation,
 };
 
 #[derive(Debug)]
@@ -559,6 +559,10 @@ pub fn routes() -> Router<ReferenceState> {
         .route(
             "/api/v1/products/{id}/tax-classification",
             get(get_tax_classification).put(put_tax_classification),
+        )
+        .route(
+            "/api/v1/products/{id}/price-control",
+            get(get_price_control).put(put_price_control),
         )
         .route(
             "/api/v1/products/{id}/company-roles",
@@ -2951,6 +2955,11 @@ fn map_database_error(error: sqlx::Error) -> CatalogError {
     }
     // The tax-classification trigger is the database-level backstop for an inactive or missing
     // reference; the service checks first so the client gets the more precise message.
+    // Same backstop role for the price-control pairing trigger. Without this line the trigger's
+    // typed abort would surface as a raw 500 — the defect class Phase 1E, 1G-0 and 1G each hit.
+    if message.contains("product_price_control_conflict") {
+        return CatalogError::Archived;
+    }
     if message.contains("product_tax_conflict") {
         return CatalogError::Archived;
     }
@@ -3227,6 +3236,262 @@ async fn fetch_tax_classification(
         applicable_rate,
     })
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1H-0 product price control
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceControlQuery {
+    as_of: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePriceControlRequest {
+    expected_revision: i64,
+    price_control_status: String,
+    controlled_formulation_id: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicableCeilingResponse {
+    price_control_version_id: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    ceiling_price_paise: i64,
+    ceiling_basis: String,
+    ceiling_basis_unit_id: Option<String>,
+    notification_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceControlResponse {
+    product_id: String,
+    revision: i64,
+    price_control_status: String,
+    controlled_formulation_id: Option<String>,
+    /// The date the ceiling below was resolved for, echoed so a caller can never mistake it for
+    /// permanent Product metadata.
+    as_of: String,
+    applicable_ceiling: Option<ApplicableCeilingResponse>,
+    /// Whether that ceiling can be compared with a selling rate at all, or why it cannot. Resolved
+    /// on the server; nothing a client sends can change it.
+    comparability: Option<String>,
+    /// True when the Product is controlled and a ceiling actually resolves on this date. A
+    /// controlled Product with no applicable ceiling is the case a future Sale must refuse rather
+    /// than treat as unconstrained.
+    resolved: bool,
+}
+
+async fn get_price_control(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<PriceControlQuery>,
+) -> Result<Json<PriceControlResponse>, CatalogError> {
+    require_catalog_reader(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let as_of = match query
+        .as_of
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => price_control::validate_calendar_date(value)
+            .map_err(|_| validation("asOf", "must be a valid YYYY-MM-DD date"))?,
+        None => business_today(&state.pool).await?,
+    };
+    fetch_price_control(&state.pool, &id, &as_of)
+        .await
+        .map(Json)
+}
+
+async fn put_price_control(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdatePriceControlRequest>,
+) -> Result<Json<PriceControlResponse>, CatalogError> {
+    let actor = require_catalog_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let status = price_control::PriceControlStatus::parse(request.price_control_status.trim())
+        .ok_or_else(|| {
+            validation(
+                "priceControlStatus",
+                "must be unknown, not_applicable, or controlled",
+            )
+        })?;
+    let formulation =
+        validated_optional_uuid(request.controlled_formulation_id, "controlledFormulationId")?;
+    // The service refuses the impossible pairing before the trigger does, so the operator gets a
+    // field-level message rather than a database conflict.
+    match (status, formulation.as_deref()) {
+        (price_control::PriceControlStatus::Controlled, None) => {
+            return Err(validation(
+                "controlledFormulationId",
+                "a controlled Product must name the formulation its ceiling comes from",
+            ));
+        }
+        (status, Some(_)) if status != price_control::PriceControlStatus::Controlled => {
+            return Err(validation(
+                "controlledFormulationId",
+                "only a controlled Product may name a formulation",
+            ));
+        }
+        _ => {}
+    }
+    let reason =
+        optional_text(request.reason.as_deref(), "reason", 500).map_err(validation_issue)?;
+
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| CatalogError::Internal)?;
+    let current: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT revision,status,price_control_status,controlled_formulation_id \
+         FROM products WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (revision, lifecycle, previous_status, previous_formulation) =
+        current.ok_or(CatalogError::NotFound)?;
+    if revision != request.expected_revision {
+        return Err(CatalogError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+    if lifecycle != "active" {
+        return Err(CatalogError::Archived);
+    }
+
+    // Only a reference that actually changes is validated, matching the trigger and the reasoning
+    // migration 0009 recorded: re-checking an unchanged value would trap a Product whose assigned
+    // formulation was archived after the fact.
+    if formulation != previous_formulation
+        && let Some(candidate) = formulation.as_deref()
+    {
+        require_assignable(
+            &mut transaction,
+            "controlled_formulations",
+            candidate,
+            "controlledFormulationId",
+        )
+        .await?;
+    }
+
+    let next = revision + 1;
+    let now = database_now(&mut transaction).await?;
+    sqlx::query(
+        "UPDATE products SET price_control_status=?,controlled_formulation_id=?,revision=?,\
+         updated_at_utc=? WHERE id=? AND revision=? AND status='active'",
+    )
+    .bind(status.as_str())
+    .bind(&formulation)
+    .bind(next)
+    .bind(&now)
+    .bind(&id)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    // Deliberately not a price snapshot: no ceiling is recorded here, because no ceiling was decided
+    // here. What is recorded is who asserted which applicability, and from what.
+    audit_value(
+        &mut transaction,
+        "product",
+        &id,
+        next,
+        "updated",
+        reason.as_deref(),
+        &json!({
+            "change": "price_control",
+            "previous": {
+                "priceControlStatus": previous_status,
+                "controlledFormulationId": previous_formulation,
+            },
+            "next": {
+                "priceControlStatus": status.as_str(),
+                "controlledFormulationId": formulation,
+            },
+        }),
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+
+    let as_of = business_today(&state.pool).await?;
+    fetch_price_control(&state.pool, &id, &as_of)
+        .await
+        .map(Json)
+}
+
+async fn fetch_price_control(
+    pool: &SqlitePool,
+    id: &str,
+    as_of: &str,
+) -> Result<PriceControlResponse, CatalogError> {
+    let row: Option<(i64, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT revision,price_control_status,controlled_formulation_id,base_unit_id \
+         FROM products WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_database_error)?;
+    let (revision, status, controlled_formulation_id, base_unit_id) =
+        row.ok_or(CatalogError::NotFound)?;
+
+    let resolved = match controlled_formulation_id.as_deref() {
+        Some(formulation) => price_control::resolve_price_ceiling(pool, formulation, as_of)
+            .await
+            .map_err(|error| match error {
+                price_control::PriceControlError::InvalidDate => {
+                    validation("asOf", "must be a valid YYYY-MM-DD date")
+                }
+                price_control::PriceControlError::Database(_) => CatalogError::Internal,
+            })?,
+        None => None,
+    };
+    let comparability = resolved.as_ref().map(|ceiling| {
+        match price_control::compare_basis(ceiling, &base_unit_id) {
+            price_control::Comparability::Comparable => "comparable",
+            price_control::Comparability::IncomparablePackBasis => "incomparable_pack_basis",
+            price_control::Comparability::IncomparableUnit => "incomparable_unit",
+        }
+        .to_owned()
+    });
+
+    Ok(PriceControlResponse {
+        product_id: id.to_owned(),
+        revision,
+        resolved: status == price_control::PriceControlStatus::Controlled.as_str()
+            && resolved.is_some(),
+        price_control_status: status,
+        controlled_formulation_id,
+        as_of: as_of.to_owned(),
+        applicable_ceiling: resolved.map(|ceiling| ApplicableCeilingResponse {
+            price_control_version_id: ceiling.id,
+            effective_from: ceiling.effective_from,
+            effective_to: ceiling.effective_to,
+            ceiling_price_paise: ceiling.ceiling_price_paise,
+            ceiling_basis: ceiling.ceiling_basis,
+            ceiling_basis_unit_id: ceiling.ceiling_basis_unit_id,
+            notification_reference: ceiling.notification_reference,
+        }),
+        comparability,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration as StdDuration, Instant};
@@ -5862,5 +6127,771 @@ mod tax_classification_tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, body)
+    }
+}
+
+#[cfg(test)]
+mod price_control_tests {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const TABLET: &str = "01997000-0000-7000-8000-000000000001";
+    const STRIP: &str = "01997000-0000-7000-8000-000000000004";
+    const OWNER_TOKEN: &str = "price-owner-session-token";
+    const CASHIER_TOKEN: &str = "price-cashier-session-token";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        pool: SqlitePool,
+        product_id: String,
+        formulation_id: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = crate::infrastructure::database::connect(&temp.path().join("price.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO store_identity (store_id,display_name,business_time_zone,created_at_utc) \
+             VALUES (?,'Test Store','Asia/Kolkata',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_price_session(&pool, "owner_admin", OWNER_TOKEN).await;
+        insert_price_session(&pool, "cashier", CASHIER_TOKEN).await;
+
+        // A medicine must name its dosage form; the catalog has enforced that since Phase 1B.
+        // Seeded directly because reference masters are served by a different router.
+        let dosage_form_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO dosage_forms (id,canonical_code,display_name,created_at_utc,updated_at_utc)              VALUES (?,'tablet','Tablet',strftime('%Y-%m-%dT%H:%M:%fZ','now'),             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&dosage_form_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, product) = request_price(
+            pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({"product":{"productKind":"medicine","baseUnitId":TABLET,
+                "dosageFormId":dosage_form_id,
+                "quantityScale":0,"displayName":"Controlled tablet"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{product}");
+
+        let formulation_id = insert_formulation(&pool, "PARA-500-TAB").await;
+        Fixture {
+            _temp: temp,
+            pool,
+            product_id: product["id"].as_str().unwrap().to_owned(),
+            formulation_id,
+        }
+    }
+
+    async fn insert_price_session(pool: &SqlitePool, role: &str, token: &str) -> String {
+        let user_id = Uuid::now_v7().to_string();
+        let login = format!("{role}-{}", &user_id[24..32]);
+        sqlx::query(
+            "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,\
+             password_hash,role,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?,'$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',?,?,?)",
+        )
+        .bind(&user_id)
+        .bind(&login)
+        .bind(&login)
+        .bind(format!("{role} price user"))
+        .bind(role)
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_sessions (id,user_id,token_hash,created_at_utc,expires_at_utc,\
+             last_seen_at_utc) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&user_id)
+        .bind(crate::api::auth::sha256_hex(token.as_bytes()))
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("2099-01-01T00:00:00.000Z")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
+    }
+
+    async fn request_price(
+        pool: SqlitePool,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        request_price_as(pool, method, uri, body, Some(OWNER_TOKEN)).await
+    }
+
+    async fn request_price_as(
+        pool: SqlitePool,
+        method: &str,
+        uri: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:47831")
+            .header("origin", "http://127.0.0.1:47831")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("cookie", format!("aushadharth_session={token}"));
+        }
+        let request = builder
+            .body(if body.is_null() {
+                Body::empty()
+            } else {
+                Body::from(body.to_string())
+            })
+            .unwrap();
+        let response = routes()
+            .with_state(ReferenceState { pool })
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    async fn insert_formulation(pool: &SqlitePool, code: &str) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO controlled_formulations (id,jurisdiction,formulation_code,display_name,\
+             verification_state,created_at_utc,updated_at_utc) \
+             VALUES (?,'IN',?,'Paracetamol 500 mg Tablet','verified',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(code)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_ceiling(
+        pool: &SqlitePool,
+        formulation: &str,
+        from: &str,
+        to: Option<&str>,
+        paise: i64,
+        basis: &str,
+        unit: Option<&str>,
+    ) -> Result<String, sqlx::Error> {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO price_control_versions (id,controlled_formulation_id,effective_from,\
+             effective_to,ceiling_price_paise,ceiling_basis,ceiling_basis_unit_id,\
+             notification_reference,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?,?,?,?,'S.O. 1234(E)',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(formulation)
+        .bind(from)
+        .bind(to)
+        .bind(paise)
+        .bind(basis)
+        .bind(unit)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    fn uri(product: &str) -> String {
+        format!("/api/v1/products/{product}/price-control")
+    }
+
+    #[tokio::test]
+    async fn a_product_starts_unassessed_rather_than_uncontrolled() {
+        let f = fixture().await;
+        let (status, body) =
+            request_price(f.pool.clone(), "GET", &uri(&f.product_id), Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The default is a real state that says nobody has looked, never "not controlled".
+        assert_eq!(body["priceControlStatus"], "unknown");
+        assert_eq!(body["controlledFormulationId"], Value::Null);
+        assert_eq!(body["applicableCeiling"], Value::Null);
+        assert_eq!(body["resolved"], false);
+    }
+
+    #[tokio::test]
+    async fn a_medicine_can_be_asserted_outside_price_control() {
+        let f = fixture().await;
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"not_applicable"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["priceControlStatus"], "not_applicable");
+        assert_eq!(body["controlledFormulationId"], Value::Null);
+        assert_eq!(body["resolved"], false);
+    }
+
+    #[tokio::test]
+    async fn controlled_and_its_formulation_imply_each_other() {
+        let f = fixture().await;
+        // Controlled with nothing to resolve against.
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "controlledFormulationId");
+
+        // A formulation on a Product that claims not to be controlled.
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"not_applicable",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "controlledFormulationId");
+
+        // And the database refuses the same pairing independently of the service.
+        let direct = sqlx::query(
+            "UPDATE products SET price_control_status='controlled',controlled_formulation_id=NULL \
+             WHERE id=?",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await;
+        assert!(direct.is_err(), "the trigger must refuse the pairing too");
+    }
+
+    #[tokio::test]
+    async fn a_controlled_product_with_no_ceiling_on_the_date_is_reported_unresolved() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2027-01-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Before the notification takes effect there is no ceiling, and that is said plainly rather
+        // than being reported as unconstrained.
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-06-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["priceControlStatus"], "controlled");
+        assert_eq!(body["applicableCeiling"], Value::Null);
+        assert_eq!(
+            body["resolved"], false,
+            "a controlled product with no ceiling must not look unconstrained"
+        );
+    }
+
+    /// The ceiling must come from the formulation this Product is actually mapped to. With only one
+    /// formulation in the fixture, "resolve the assigned one" and "resolve any one" are the same
+    /// query, so a second formulation with its own ceiling is what makes the mapping provable.
+    #[tokio::test]
+    async fn the_ceiling_follows_the_assigned_formulation_and_no_other() {
+        let f = fixture().await;
+        let other = insert_formulation(&f.pool, "OTHER-FORMULATION").await;
+        // Deliberately ordered so the other formulation is not simply the first row either way.
+        insert_ceiling(
+            &f.pool,
+            &other,
+            "2020-01-01",
+            None,
+            777,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2020-01-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        let (_, body) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-06-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            body["applicableCeiling"]["ceilingPricePaise"], 109,
+            "the ceiling must be the assigned formulation's, never another's"
+        );
+        assert_ne!(body["applicableCeiling"]["ceilingPricePaise"], 777);
+    }
+
+    #[tokio::test]
+    async fn the_ceiling_resolves_on_the_half_open_boundary() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2025-01-01",
+            Some("2026-04-01"),
+            100,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2026-04-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+
+        for (date, expected) in [
+            ("2026-03-31", 100),
+            // On the day equal to effective_to the NEXT version applies.
+            ("2026-04-01", 109),
+            ("2026-04-02", 109),
+        ] {
+            let (_, body) = request_price(
+                f.pool.clone(),
+                "GET",
+                &format!("{}?asOf={date}", uri(&f.product_id)),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                body["applicableCeiling"]["ceilingPricePaise"], expected,
+                "on {date}"
+            );
+            assert_eq!(body["resolved"], true);
+            assert_eq!(body["comparability"], "comparable");
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_effective_periods_are_refused_by_the_database() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2026-01-01",
+            Some("2026-06-01"),
+            100,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        let overlapping = insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2026-05-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await;
+        let error = overlapping.expect_err("an overlapping ceiling must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("price_control_effective_period_overlap"),
+            "the overlap trigger must be what refuses it: {error}"
+        );
+
+        // Adjoining periods that merely touch are fine, which proves the check is not simply
+        // rejecting every second version.
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2026-06-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .expect("a period starting where the previous ends must be accepted");
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_in_another_unit_is_reported_incomparable_never_converted() {
+        let f = fixture().await;
+        // Quoted per strip rather than per tablet: a different unit entirely.
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2020-01-01",
+            None,
+            1635,
+            "per_base_unit",
+            Some(STRIP),
+        )
+        .await
+        .unwrap();
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        let (_, body) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-06-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(body["comparability"], "incomparable_unit");
+        assert_eq!(
+            body["applicableCeiling"]["ceilingPricePaise"], 1635,
+            "the ceiling is still reported honestly, it simply cannot be compared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_pack_ceiling_is_reported_incomparable_rather_than_divided() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2020-01-01",
+            None,
+            1635,
+            "per_pack",
+            None,
+        )
+        .await
+        .unwrap();
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        let (_, body) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-06-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(body["comparability"], "incomparable_pack_basis");
+    }
+
+    #[tokio::test]
+    async fn a_per_base_unit_ceiling_must_name_its_unit() {
+        let f = fixture().await;
+        let refused = insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2020-01-01",
+            None,
+            109,
+            "per_base_unit",
+            None,
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a per-base-unit ceiling with no unit cannot be compared with anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_todays_ceiling_cannot_rewrite_yesterdays() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2025-01-01",
+            Some("2026-04-01"),
+            100,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+
+        // A new notification arrives as a NEW version, never an edit of the old one.
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2026-04-01",
+            None,
+            140,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+
+        let (_, historical) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2025-07-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            historical["applicableCeiling"]["ceilingPricePaise"], 100,
+            "a past date must still resolve the ceiling that was in force then"
+        );
+        let (_, current) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-09-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(current["applicableCeiling"]["ceilingPricePaise"], 140);
+    }
+
+    #[tokio::test]
+    async fn a_stale_revision_and_an_unknown_formulation_are_refused() {
+        let f = fixture().await;
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":99,"priceControlStatus":"not_applicable"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "revision_conflict");
+
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":"01997a00-0000-7000-8000-0000000009ff"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "controlledFormulationId");
+
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"scheduled"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "priceControlStatus");
+    }
+
+    #[tokio::test]
+    async fn an_archived_formulation_stays_readable_but_cannot_be_newly_assigned() {
+        let f = fixture().await;
+        insert_ceiling(
+            &f.pool,
+            &f.formulation_id,
+            "2020-01-01",
+            None,
+            109,
+            "per_base_unit",
+            Some(TABLET),
+        )
+        .await
+        .unwrap();
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE controlled_formulations SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='superseded' \
+             WHERE id=?",
+        )
+        .bind(&f.formulation_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        // History still resolves: an archived formulation is history, not a broken reference.
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "GET",
+            &format!("{}?asOf=2026-06-01", uri(&f.product_id)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applicableCeiling"]["ceilingPricePaise"], 109);
+
+        // But a different Product cannot newly adopt it.
+        let (_, other) = request_price(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/products",
+            json!({"product":{"productKind":"general_pharmacy_item","baseUnitId":TABLET,
+                "quantityScale":0,"displayName":"Another item"}}),
+        )
+        .await;
+        let other_id = other["id"].as_str().unwrap();
+        let (status, body) = request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(other_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "archived_conflict");
+    }
+
+    #[tokio::test]
+    async fn reads_need_a_session_and_writes_need_owner_admin() {
+        let f = fixture().await;
+        let (status, body) = request_price_as(
+            f.pool.clone(),
+            "GET",
+            &uri(&f.product_id),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+        let (status, _) = request_price_as(
+            f.pool.clone(),
+            "GET",
+            &uri(&f.product_id),
+            Value::Null,
+            Some(CASHIER_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a cashier may read price control");
+
+        let (status, body) = request_price_as(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"not_applicable"}),
+            Some(CASHIER_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "authorization_denied");
+    }
+
+    #[tokio::test]
+    async fn the_assertion_is_audited_without_recording_a_price() {
+        let f = fixture().await;
+        request_price(
+            f.pool.clone(),
+            "PUT",
+            &uri(&f.product_id),
+            json!({"expectedRevision":1,"priceControlStatus":"controlled",
+                "controlledFormulationId":f.formulation_id,"reason":"NPPA notification applied"}),
+        )
+        .await;
+        let payload: String = sqlx::query_scalar(
+            "SELECT change_payload FROM master_change_events \
+             WHERE entity_type='product' AND entity_id=? ORDER BY entity_revision DESC LIMIT 1",
+        )
+        .bind(&f.product_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let recorded: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(recorded["change"], "price_control");
+        assert_eq!(recorded["previous"]["priceControlStatus"], "unknown");
+        assert_eq!(recorded["next"]["priceControlStatus"], "controlled");
+        // No ceiling is recorded here, because no ceiling was decided here.
+        assert_eq!(recorded["next"]["ceilingPricePaise"], Value::Null);
     }
 }

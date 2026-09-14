@@ -1904,3 +1904,355 @@ async fn real_service_denies_purchase_mutation_to_a_non_admin_over_http() {
     assert_eq!(detail.body["status"], "draft");
     assert_eq!(detail.body["lines"].as_array().expect("lines").len(), 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1H-0 — medicine price control
+// ---------------------------------------------------------------------------------------------
+
+/// Ceiling prices across the real boundary: a real socket, real migrations, the real half-open
+/// resolver, and the real database trigger that forbids overlapping effective periods.
+#[tokio::test]
+async fn real_service_resolves_a_medicine_price_ceiling_by_date_over_http() {
+    let service = start().await;
+    let cookie = owner_cookie(&service).await;
+
+    let reference = async |kind: &str, attributes: Value| {
+        let reply = call(
+            &service,
+            "POST",
+            &format!("/api/v1/reference/{kind}"),
+            Some(json!({ "attributes": attributes })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 201, "{kind}: {:?}", reply.body);
+        reply.body["id"].as_str().expect("reference id").to_owned()
+    };
+
+    let dosage_form = reference(
+        "dosage-forms",
+        json!({ "canonicalCode": "tablet", "displayName": "Tablet" }),
+    )
+    .await;
+    let formulation = reference(
+        "controlled-formulations",
+        json!({
+            "jurisdiction": "IN", "formulationCode": "PARA-500-TAB",
+            "displayName": "Paracetamol 500 mg Tablet", "dosageFormId": dosage_form,
+            "strengthText": "500 mg", "verificationState": "verified",
+            "sourceNote": "Recorded from the notification as published"
+        }),
+    )
+    .await;
+
+    // Two adjoining periods, so the half-open boundary is genuinely exercised end to end.
+    reference(
+        "price-control-versions",
+        json!({
+            "controlledFormulationId": formulation,
+            "effectiveFrom": "2025-01-01", "effectiveTo": "2026-04-01",
+            "ceilingPricePaise": 100, "ceilingBasis": "per_base_unit",
+            "ceilingBasisUnitId": TABLET, "notificationReference": "S.O. 1111(E)"
+        }),
+    )
+    .await;
+    reference(
+        "price-control-versions",
+        json!({
+            "controlledFormulationId": formulation,
+            "effectiveFrom": "2026-04-01", "effectiveTo": null,
+            "ceilingPricePaise": 109, "ceilingBasis": "per_base_unit",
+            "ceilingBasisUnitId": TABLET, "notificationReference": "S.O. 2222(E)"
+        }),
+    )
+    .await;
+
+    // An overlapping period is refused by the database, not by the service being careful.
+    let overlapping = call(
+        &service,
+        "POST",
+        "/api/v1/reference/price-control-versions",
+        Some(json!({ "attributes": {
+            "controlledFormulationId": formulation,
+            "effectiveFrom": "2026-06-01", "effectiveTo": null,
+            "ceilingPricePaise": 120, "ceilingBasis": "per_base_unit",
+            "ceilingBasisUnitId": TABLET
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(overlapping.status, 409, "{:?}", overlapping.body);
+
+    let product = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"medicine","baseUnitId":TABLET,"dosageFormId":dosage_form,
+            "quantityScale":0,"displayName":"Paracetamol 500 mg Tablet"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(product.status, 201, "{:?}", product.body);
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+    let uri = format!("/api/v1/products/{product_id}/price-control");
+
+    // A fresh Product is unassessed, which is a real state and not "uncontrolled".
+    let initial = call(&service, "GET", &uri, None, Some(&cookie)).await;
+    assert_eq!(initial.status, 200, "{:?}", initial.body);
+    assert_eq!(initial.body["priceControlStatus"], "unknown");
+    assert_eq!(initial.body["resolved"], false);
+
+    let assigned = call(
+        &service,
+        "PUT",
+        &uri,
+        Some(json!({
+            "expectedRevision": 1, "priceControlStatus": "controlled",
+            "controlledFormulationId": formulation
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(assigned.status, 200, "{:?}", assigned.body);
+    assert_eq!(assigned.body["priceControlStatus"], "controlled");
+
+    // The half-open boundary across the wire: on the day equal to effective_to the NEXT version
+    // applies, and before the first period there is no ceiling at all.
+    for (date, expected) in [
+        ("2024-12-31", None),
+        ("2025-01-01", Some(100)),
+        ("2026-03-31", Some(100)),
+        ("2026-04-01", Some(109)),
+        ("2030-01-01", Some(109)),
+    ] {
+        let reply = call(
+            &service,
+            "GET",
+            &format!("{uri}?asOf={date}"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{date}: {:?}", reply.body);
+        match expected {
+            Some(paise) => {
+                assert_eq!(
+                    reply.body["applicableCeiling"]["ceilingPricePaise"], paise,
+                    "on {date}"
+                );
+                assert_eq!(reply.body["comparability"], "comparable", "on {date}");
+                assert_eq!(reply.body["resolved"], true, "on {date}");
+            }
+            None => {
+                assert_eq!(reply.body["applicableCeiling"], Value::Null, "on {date}");
+                assert_eq!(
+                    reply.body["resolved"], false,
+                    "a controlled product with no ceiling must never look unconstrained"
+                );
+            }
+        }
+    }
+}
+
+/// A ceiling whose basis cannot be reconciled with the Product is reported as incomparable rather
+/// than converted, divided or guessed at.
+#[tokio::test]
+async fn real_service_refuses_to_compare_an_incompatible_ceiling_basis_over_http() {
+    let service = start().await;
+    let cookie = owner_cookie(&service).await;
+
+    let reference = async |kind: &str, attributes: Value| {
+        let reply = call(
+            &service,
+            "POST",
+            &format!("/api/v1/reference/{kind}"),
+            Some(json!({ "attributes": attributes })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 201, "{kind}: {:?}", reply.body);
+        reply.body["id"].as_str().expect("reference id").to_owned()
+    };
+
+    let dosage_form = reference(
+        "dosage-forms",
+        json!({ "canonicalCode": "tablet", "displayName": "Tablet" }),
+    )
+    .await;
+
+    // A per-base-unit ceiling with no unit named cannot be compared with anything, so it is refused
+    // at the door rather than stored as an unusable legal fact.
+    let unitless = call(
+        &service,
+        "POST",
+        "/api/v1/reference/price-control-versions",
+        Some(json!({ "attributes": {
+            "controlledFormulationId": "01997a00-0000-7000-8000-0000000009aa",
+            "effectiveFrom": "2020-01-01", "effectiveTo": null,
+            "ceilingPricePaise": 109, "ceilingBasis": "per_base_unit"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(unitless.status, 422, "{:?}", unitless.body);
+    assert_eq!(unitless.body["issues"][0]["field"], "ceilingBasisUnitId");
+
+    let make = async |code: &str, basis: &str, unit: Option<&str>| {
+        let formulation = reference(
+            "controlled-formulations",
+            json!({
+                "jurisdiction": "IN", "formulationCode": code,
+                "displayName": "Some controlled formulation", "verificationState": "unverified"
+            }),
+        )
+        .await;
+        let mut attributes = json!({
+            "controlledFormulationId": formulation,
+            "effectiveFrom": "2020-01-01", "effectiveTo": null,
+            "ceilingPricePaise": 1635, "ceilingBasis": basis
+        });
+        if let Some(unit) = unit {
+            attributes["ceilingBasisUnitId"] = json!(unit);
+        }
+        reference("price-control-versions", attributes).await;
+
+        let product = call(
+            &service,
+            "POST",
+            "/api/v1/products",
+            Some(json!({"product":{
+                "productKind":"medicine","baseUnitId":TABLET,"dosageFormId":dosage_form,
+                "quantityScale":0,"displayName":format!("Product {code}")
+            }})),
+            Some(&cookie),
+        )
+        .await;
+        let product_id = product.body["id"].as_str().expect("product id").to_owned();
+        let uri = format!("/api/v1/products/{product_id}/price-control");
+        let assigned = call(
+            &service,
+            "PUT",
+            &uri,
+            Some(json!({
+                "expectedRevision": 1, "priceControlStatus": "controlled",
+                "controlledFormulationId": formulation
+            })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(assigned.status, 200, "{:?}", assigned.body);
+        call(
+            &service,
+            "GET",
+            &format!("{uri}?asOf=2026-09-14"),
+            None,
+            Some(&cookie),
+        )
+        .await
+    };
+
+    // Quoted per pack: which pack is not stated, so dividing it would invent a legal fact.
+    let per_pack = make("PACK-BASIS", "per_pack", None).await;
+    assert_eq!(per_pack.body["comparability"], "incomparable_pack_basis");
+    assert_eq!(
+        per_pack.body["applicableCeiling"]["ceilingPricePaise"], 1635,
+        "the ceiling is still reported honestly; only the comparison is refused"
+    );
+
+    // Quoted per strip against a product measured in tablets: no unit conversion is attempted.
+    let wrong_unit = make("UNIT-BASIS", "per_base_unit", Some(STRIP)).await;
+    assert_eq!(wrong_unit.body["comparability"], "incomparable_unit");
+}
+
+/// Price-control reference data is Owner/Admin work; a reader may look but never assert.
+#[tokio::test]
+async fn real_service_keeps_price_control_assertion_to_an_admin_over_http() {
+    let service = start().await;
+    let cookie = owner_cookie(&service).await;
+
+    let dosage_form = call(
+        &service,
+        "POST",
+        "/api/v1/reference/dosage-forms",
+        Some(json!({ "attributes": { "canonicalCode": "tablet", "displayName": "Tablet" }})),
+        Some(&cookie),
+    )
+    .await
+    .body["id"]
+        .as_str()
+        .expect("dosage form")
+        .to_owned();
+    let product = call(
+        &service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"medicine","baseUnitId":TABLET,"dosageFormId":dosage_form,
+            "quantityScale":0,"displayName":"Reader test tablet"
+        }})),
+        Some(&cookie),
+    )
+    .await;
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+    let uri = format!("/api/v1/products/{product_id}/price-control");
+
+    // There is no user-management API yet, so the reader is seeded directly; the login, the session
+    // and the role check all still happen over the real transport.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let owner_hash: String = sqlx::query_scalar("SELECT password_hash FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("owner hash");
+    sqlx::query(
+        "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,\
+         password_hash,role,created_at_utc,updated_at_utc) \
+         VALUES (?,?,?,?,?, 'pharmacist', strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind("01997a00-0000-7000-8000-000000000401")
+    .bind("price.reader")
+    .bind("price.reader")
+    .bind("Price Reader")
+    .bind(&owner_hash)
+    .execute(&pool)
+    .await
+    .expect("seed a reader");
+    pool.close().await;
+
+    let login = call(
+        &service,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({
+            "loginIdentifier": "price.reader", "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(login.status, 200, "{:?}", login.body);
+    let reader = session_cookie(&login.headers);
+
+    let readable = call(&service, "GET", &uri, None, Some(&reader)).await;
+    assert_eq!(readable.status, 200, "{:?}", readable.body);
+    assert_eq!(readable.body["priceControlStatus"], "unknown");
+
+    let denied = call(
+        &service,
+        "PUT",
+        &uri,
+        Some(json!({ "expectedRevision": 1, "priceControlStatus": "not_applicable" })),
+        Some(&reader),
+    )
+    .await;
+    assert_eq!(denied.status, 403, "{:?}", denied.body);
+    assert_eq!(denied.body["code"], "authorization_denied");
+
+    // And an anonymous caller never reaches it at all.
+    let anonymous = call(&service, "GET", &uri, None, None).await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body["code"], "authentication_required");
+}

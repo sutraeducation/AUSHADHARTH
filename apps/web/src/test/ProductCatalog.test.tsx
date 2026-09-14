@@ -337,6 +337,16 @@ function catalogService(options: Options = {}) {
       });
     }
 
+    // Phase 1H-0: a medicine's Product Detail also reads price control. Identity only — the double
+    // never returns a ceiling stored against the Product, because the service never stores one.
+    if (/\/price-control$/.test(url.pathname)) {
+      return response({
+        productId: IDs.product, revision: 1, priceControlStatus: "unknown",
+        controlledFormulationId: null, asOf: "2026-09-13", applicableCeiling: null,
+        comparability: null, resolved: false
+      });
+    }
+
     throw new Error(`Unexpected request: ${method} ${url.pathname}`);
   });
 

@@ -28,6 +28,8 @@ export const ReferenceKindSchema = z.enum([
   "hsn-codes",
   "tax-categories",
   "tax-rate-versions",
+  "controlled-formulations",
+  "price-control-versions",
   "regulatory-categories",
   "ingredients",
   "salt-forms",
@@ -99,6 +101,36 @@ export const TaxRateVersionAttributesSchema = z.object({
   cessBasisPoints: z.number().int()
 });
 
+/**
+ * A notified formulation a ceiling price belongs to. `strengthText` records the notification as
+ * written and is deliberately never parsed — a Product is linked by explicit assignment, never by
+ * matching this text.
+ */
+export const ControlledFormulationAttributesSchema = z.object({
+  jurisdiction: z.string(),
+  formulationCode: z.string(),
+  displayName: z.string(),
+  dosageFormId: z.string().nullable().optional(),
+  strengthText: z.string().nullable().optional(),
+  verificationState: z.enum(["unverified", "verified", "rejected"]),
+  sourceNote: z.string().nullable().optional()
+});
+
+/** What a ceiling price is quoted per. A per-pack ceiling is recorded but never divided. */
+export const CeilingBasisSchema = z.enum(["per_base_unit", "per_pack"]);
+
+export const PriceControlVersionAttributesSchema = z.object({
+  controlledFormulationId: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable().optional(),
+  /** Exact integer minor units per ADR-009, exclusive of GST. Never a binary float. */
+  ceilingPricePaise: z.number().int().positive(),
+  ceilingBasis: CeilingBasisSchema,
+  ceilingBasisUnitId: z.string().nullable().optional(),
+  notificationReference: z.string().nullable().optional(),
+  sourceNote: z.string().nullable().optional()
+});
+
 export const RegulatoryCategoryAttributesSchema = z.object({
   jurisdiction: z.string(),
   categorySystem: z.string(),
@@ -152,6 +184,8 @@ export const ReferenceAttributesSchema = z.union([
   HsnAttributesSchema,
   TaxCategoryAttributesSchema,
   TaxRateVersionAttributesSchema,
+  ControlledFormulationAttributesSchema,
+  PriceControlVersionAttributesSchema,
   RegulatoryCategoryAttributesSchema,
   IngredientAttributesSchema,
   SaltFormAttributesSchema,
@@ -178,6 +212,8 @@ export const ReferenceMasterResponseSchema = z.discriminatedUnion("kind", [
   ReferenceMasterBaseSchema.extend({ kind: z.literal("hsn-codes"), attributes: HsnAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-categories"), attributes: TaxCategoryAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("tax-rate-versions"), attributes: TaxRateVersionAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("controlled-formulations"), attributes: ControlledFormulationAttributesSchema }),
+  ReferenceMasterBaseSchema.extend({ kind: z.literal("price-control-versions"), attributes: PriceControlVersionAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("regulatory-categories"), attributes: RegulatoryCategoryAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("ingredients"), attributes: IngredientAttributesSchema }),
   ReferenceMasterBaseSchema.extend({ kind: z.literal("salt-forms"), attributes: SaltFormAttributesSchema }),
@@ -222,6 +258,13 @@ export const ReferenceErrorResponseSchema = z.object({
 });
 
 export type ReferenceKind = z.infer<typeof ReferenceKindSchema>;
+export type ControlledFormulationAttributes = z.infer<typeof ControlledFormulationAttributesSchema>;
+export type PriceControlVersionAttributes = z.infer<typeof PriceControlVersionAttributesSchema>;
+export type CeilingBasis = z.infer<typeof CeilingBasisSchema>;
+export type PriceControlStatus = z.infer<typeof PriceControlStatusSchema>;
+export type Comparability = z.infer<typeof ComparabilitySchema>;
+export type ApplicableCeiling = z.infer<typeof ApplicableCeilingSchema>;
+export type ProductPriceControl = z.infer<typeof ProductPriceControlSchema>;
 export type ReferenceMasterResponse = z.infer<typeof ReferenceMasterResponseSchema>;
 export type CreateReferenceRequest = z.infer<typeof CreateReferenceRequestSchema>;
 export type UpdateReferenceRequest = z.infer<typeof UpdateReferenceRequestSchema>;
@@ -358,6 +401,51 @@ export const ApplicableTaxRateSchema = z.object({
   sgstBasisPoints: z.number().int(),
   igstBasisPoints: z.number().int(),
   cessBasisPoints: z.number().int()
+});
+
+/**
+ * Whether anyone has assessed this Product for price control, and what they concluded.
+ *
+ * `unknown` is a real state, never to be read as "not controlled": a medicine appearing
+ * uncontrolled because reference data is incomplete is the failure Phase 1H-0 exists to prevent.
+ */
+export const PriceControlStatusSchema = z.enum(["unknown", "not_applicable", "controlled"]);
+
+/** Whether a resolved ceiling can be compared with a selling rate at all, or why it cannot. */
+export const ComparabilitySchema = z.enum([
+  "comparable",
+  "incomparable_pack_basis",
+  "incomparable_unit"
+]);
+
+export const ApplicableCeilingSchema = z.object({
+  priceControlVersionId: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  ceilingPricePaise: z.number().int(),
+  ceilingBasis: CeilingBasisSchema,
+  ceilingBasisUnitId: z.string().nullable(),
+  notificationReference: z.string().nullable()
+});
+
+export const ProductPriceControlSchema = z.object({
+  productId: z.string(),
+  revision: z.number().int().positive(),
+  priceControlStatus: PriceControlStatusSchema,
+  controlledFormulationId: z.string().nullable(),
+  /** The date the ceiling was resolved for, so it can never be mistaken for Product metadata. */
+  asOf: z.string(),
+  applicableCeiling: ApplicableCeilingSchema.nullable(),
+  comparability: ComparabilitySchema.nullable(),
+  /** True only when the Product is controlled AND a ceiling actually resolves on this date. */
+  resolved: z.boolean()
+});
+
+export const UpdateProductPriceControlRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  priceControlStatus: PriceControlStatusSchema,
+  controlledFormulationId: z.string().nullable().optional(),
+  reason: z.string().nullable().optional()
 });
 
 export const ProductTaxClassificationSchema = ProductTaxClassificationFieldsSchema.extend({

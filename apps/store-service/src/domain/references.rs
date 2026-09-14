@@ -15,6 +15,8 @@ pub enum MasterKind {
     TaxCategory,
     TaxRateVersion,
     RegulatoryCategory,
+    ControlledFormulation,
+    PriceControlVersion,
     Ingredient,
     SaltForm,
     StrengthUnit,
@@ -33,6 +35,8 @@ impl MasterKind {
             Self::TaxCategory => "tax-categories",
             Self::TaxRateVersion => "tax-rate-versions",
             Self::RegulatoryCategory => "regulatory-categories",
+            Self::ControlledFormulation => "controlled-formulations",
+            Self::PriceControlVersion => "price-control-versions",
             Self::Ingredient => "ingredients",
             Self::SaltForm => "salt-forms",
             Self::StrengthUnit => "strength-units",
@@ -51,6 +55,8 @@ impl MasterKind {
             Self::TaxCategory => "tax_categories",
             Self::TaxRateVersion => "tax_rate_versions",
             Self::RegulatoryCategory => "regulatory_categories",
+            Self::ControlledFormulation => "controlled_formulations",
+            Self::PriceControlVersion => "price_control_versions",
             Self::Ingredient => "ingredients",
             Self::SaltForm => "salt_forms",
             Self::StrengthUnit => "strength_units",
@@ -69,6 +75,8 @@ impl MasterKind {
             Self::TaxCategory => "tax_category",
             Self::TaxRateVersion => "tax_rate_version",
             Self::RegulatoryCategory => "regulatory_category",
+            Self::ControlledFormulation => "controlled_formulation",
+            Self::PriceControlVersion => "price_control_version",
             Self::Ingredient => "ingredient",
             Self::SaltForm => "salt_form",
             Self::StrengthUnit => "strength_unit",
@@ -105,6 +113,12 @@ impl MasterKind {
             Self::RegulatoryCategory => {
                 "json_object('jurisdiction',jurisdiction,'categorySystem',category_system,'categoryCode',category_code,'displayName',display_name,'effectiveFrom',effective_from,'effectiveTo',effective_to,'sourceReference',source_reference,'verificationState',verification_state)"
             }
+            Self::ControlledFormulation => {
+                "json_object('jurisdiction',jurisdiction,'formulationCode',formulation_code,'displayName',display_name,'dosageFormId',dosage_form_id,'strengthText',strength_text,'verificationState',verification_state,'sourceNote',source_note)"
+            }
+            Self::PriceControlVersion => {
+                "json_object('controlledFormulationId',controlled_formulation_id,'effectiveFrom',effective_from,'effectiveTo',effective_to,'ceilingPricePaise',ceiling_price_paise,'ceilingBasis',ceiling_basis,'ceilingBasisUnitId',ceiling_basis_unit_id,'notificationReference',notification_reference,'sourceNote',source_note)"
+            }
             Self::Ingredient => {
                 "json_object('canonicalCode',canonical_code,'displayName',display_name,'normalizedSearchName',normalized_search_name,'description',description)"
             }
@@ -133,6 +147,12 @@ impl MasterKind {
             Self::RegulatoryCategory => {
                 "jurisdiction || ' ' || category_system || ' ' || category_code || ' ' || display_name"
             }
+            Self::ControlledFormulation => {
+                "jurisdiction || ' ' || formulation_code || ' ' || display_name || ' ' || COALESCE(strength_text, '')"
+            }
+            Self::PriceControlVersion => {
+                "effective_from || ' ' || COALESCE(effective_to, '') || ' ' || COALESCE(notification_reference, '')"
+            }
             Self::Ingredient | Self::SaltForm => {
                 "canonical_code || ' ' || normalized_search_name || ' ' || display_name"
             }
@@ -156,6 +176,8 @@ impl FromStr for MasterKind {
             Self::TaxCategory,
             Self::TaxRateVersion,
             Self::RegulatoryCategory,
+            Self::ControlledFormulation,
+            Self::PriceControlVersion,
             Self::Ingredient,
             Self::SaltForm,
             Self::StrengthUnit,
@@ -198,6 +220,8 @@ pub fn validate_attributes(
         MasterKind::TaxCategory => validate_tax_category(object),
         MasterKind::TaxRateVersion => validate_tax_rate(object),
         MasterKind::RegulatoryCategory => validate_regulatory_category(object),
+        MasterKind::ControlledFormulation => validate_controlled_formulation(object),
+        MasterKind::PriceControlVersion => validate_price_control_version(object),
         MasterKind::Ingredient => validate_ingredient(object),
         MasterKind::SaltForm => validate_salt_form(object),
         MasterKind::StrengthUnit => validate_strength_unit(object),
@@ -496,6 +520,102 @@ fn validate_tax_rate(object: &Map<String, Value>) -> Result<ValidatedFields, Val
         (
             "cess_basis_points",
             DbValue::Integer(optional_integer(object, "cessBasisPoints", 0, 10_000)?.unwrap_or(0)),
+        ),
+    ])
+}
+
+/// A notified formulation a ceiling price belongs to.
+///
+/// `strengthText` is recorded as written and deliberately never parsed: it exists so a human can
+/// verify the mapping, and nothing computes from it. Matching a Product to a formulation is an
+/// explicit operator assignment, never an inference from this text.
+fn validate_controlled_formulation(
+    object: &Map<String, Value>,
+) -> Result<ValidatedFields, ValidationIssue> {
+    fields([
+        ("jurisdiction", DbValue::Text(Some(jurisdiction(object)?))),
+        (
+            "formulation_code",
+            DbValue::Text(Some(
+                required_text(object, "formulationCode", 64)?.to_uppercase(),
+            )),
+        ),
+        (
+            "display_name",
+            DbValue::Text(Some(required_text(object, "displayName", 200)?)),
+        ),
+        (
+            "dosage_form_id",
+            DbValue::Text(optional_uuid_v7_text(object, "dosageFormId")?),
+        ),
+        (
+            "strength_text",
+            DbValue::Text(optional_text(object, "strengthText", 200)?),
+        ),
+        (
+            "verification_state",
+            DbValue::Text(Some(enum_text(
+                object,
+                "verificationState",
+                &["unverified", "verified", "rejected"],
+            )?)),
+        ),
+        (
+            "source_note",
+            DbValue::Text(optional_text(object, "sourceNote", 500)?),
+        ),
+    ])
+}
+
+/// One effective-dated ceiling.
+///
+/// A per-base-unit ceiling must name the unit it is quoted in, because that unit is what decides
+/// whether the ceiling can be compared with a Product's rate at all. A per-pack ceiling is recorded
+/// truthfully and reported as incomparable rather than divided by an assumed pack size.
+fn validate_price_control_version(
+    object: &Map<String, Value>,
+) -> Result<ValidatedFields, ValidationIssue> {
+    let from = date_text(object, "effectiveFrom", false)?.expect("required date");
+    let to = date_text(object, "effectiveTo", true)?;
+    if to.as_ref().is_some_and(|to| to <= &from) {
+        return Err(issue(
+            "effectiveTo",
+            "must be later than effectiveFrom; periods are [from, to)",
+        ));
+    }
+    let basis = enum_text(object, "ceilingBasis", &["per_base_unit", "per_pack"])?;
+    let unit = optional_uuid_v7_text(object, "ceilingBasisUnitId")?;
+    if basis == "per_base_unit" && unit.is_none() {
+        return Err(issue(
+            "ceilingBasisUnitId",
+            "a per-base-unit ceiling must name the unit it is quoted in",
+        ));
+    }
+    fields([
+        (
+            "controlled_formulation_id",
+            DbValue::Text(Some(uuid_v7_text(object, "controlledFormulationId")?)),
+        ),
+        ("effective_from", DbValue::Text(Some(from))),
+        ("effective_to", DbValue::Text(to)),
+        (
+            "ceiling_price_paise",
+            DbValue::Integer(required_integer(
+                object,
+                "ceilingPricePaise",
+                1,
+                100_000_000_000,
+            )?),
+        ),
+        ("ceiling_basis", DbValue::Text(Some(basis))),
+        ("ceiling_basis_unit_id", DbValue::Text(unit)),
+        (
+            "notification_reference",
+            DbValue::Text(optional_text(object, "notificationReference", 200)?),
+        ),
+        (
+            "source_note",
+            DbValue::Text(optional_text(object, "sourceNote", 500)?),
         ),
     ])
 }

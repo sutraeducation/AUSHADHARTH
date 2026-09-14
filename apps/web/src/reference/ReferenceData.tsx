@@ -13,6 +13,7 @@ import { Link, Navigate, useParams } from "react-router";
 import type { ReferenceKind, ReferenceMasterResponse } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
 import { LocalServiceError } from "../platform/localService";
+import { paiseToRupees, rupeesToPaise } from "../products/productApi";
 import {
   basisPointsToPercent,
   changeReferenceLifecycle,
@@ -33,6 +34,7 @@ const SECTIONS = [
   { slug: "brands", kind: "brands", title: "Brands", short: "Brands", description: "Trade names with optional owning companies." },
   { slug: "hsn", kind: "hsn-codes", title: "HSN Codes", short: "HSN", description: "Jurisdiction-scoped classification references." },
   { slug: "tax", kind: "tax-categories", title: "Tax Categories", short: "Tax Categories", description: "Tax treatment and effective-dated percentage versions." },
+  { slug: "price-control", kind: "controlled-formulations", title: "Medicine Price Control", short: "Price Control", description: "Notified formulations and their effective-dated ceiling prices. Distinct from a Batch's printed MRP." },
   { slug: "regulatory", kind: "regulatory-categories", title: "Regulatory References", short: "Regulatory", description: "Verified reference metadata without legal enforcement." },
   { slug: "ingredients", kind: "ingredients", title: "Ingredients", short: "Ingredients", description: "Active moieties used in medicine composition, independent of salt form." },
   { slug: "salt-forms", kind: "salt-forms", title: "Salt Forms", short: "Salt Forms", description: "Chemical form modifiers applied to an ingredient." },
@@ -134,23 +136,27 @@ function ReferenceTable({ records, kind, canMutate, onEdit, onLifecycle, onRelat
   return <div className="table-scroll"><table className="data-table"><thead><tr>{columns.map((column) => <th key={column.key} scope="col">{column.label}</th>)}<th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead><tbody>{records.map((record) => {
     const attributes = record.attributes as unknown as Attributes;
     return <tr key={record.id}>{columns.map((column) => <td key={column.key} data-label={column.label}>{displayValue(attributes, column.key, companies)}</td>)}<td data-label="Status"><StatusBadge status={record.status} /></td><td className="row-actions"><div>
-      {(kind === "companies" || kind === "tax-categories") && <button type="button" onClick={() => onRelated(record)}>{kind === "companies" ? "Identifiers" : "Rate history"}</button>}
-      {canMutate && record.status === "active" && kind !== "tax-rate-versions" && <button type="button" onClick={() => onEdit(record)}>Edit</button>}
+      {(kind === "companies" || kind === "tax-categories" || kind === "controlled-formulations") && <button type="button" onClick={() => onRelated(record)}>{kind === "companies" ? "Identifiers" : kind === "tax-categories" ? "Rate history" : "Ceiling history"}</button>}
+      {canMutate && record.status === "active" && kind !== "tax-rate-versions" && kind !== "price-control-versions" && <button type="button" onClick={() => onEdit(record)}>Edit</button>}
       {canMutate && <button type="button" onClick={() => onLifecycle(record)}>{record.status === "active" ? "Archive" : "Restore"}</button>}
     </div></td></tr>;
   })}</tbody></table></div>;
 }
 
 function RelatedRecordsDialog({ parent, parentKind, canMutate, onClose }: { parent: ReferenceMasterResponse; parentKind: ReferenceKind; canMutate: boolean; onClose: () => void }) {
-  const childKind: ReferenceKind = parentKind === "companies" ? "company-identifiers" : "tax-rate-versions";
-  const title = parentKind === "companies" ? "Company identifiers" : "Tax rate history";
+  const childKind: ReferenceKind = parentKind === "companies"
+    ? "company-identifiers"
+    : parentKind === "controlled-formulations"
+      ? "price-control-versions"
+      : "tax-rate-versions";
+  const title = parentKind === "companies" ? "Company identifiers" : parentKind === "controlled-formulations" ? "Ceiling price history" : "Tax rate history";
   const [editing, setEditing] = useState<ReferenceMasterResponse | "new" | null>(null);
   const [lifecycle, setLifecycle] = useState<ReferenceMasterResponse | null>(null);
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["reference", childKind, parent.id], queryFn: () => listReferences(childKind, "", "all", parent.id), retry: false });
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["reference"] });
   return <Modal title={title} description={`Managed separately from ${primaryName(parent)}.`} onClose={onClose} wide suspended={Boolean(editing || lifecycle)}>
-    <div className="related-heading"><p>{parentKind === "companies" ? "Identifiers are optional. Verified namespace/value pairs must be unique." : "Rates are stored as exact basis points. Active periods use [from, to), so adjacent dates are allowed."}</p>{canMutate && <button className="button button--primary" type="button" onClick={() => setEditing("new")}>Add {parentKind === "companies" ? "identifier" : "rate version"}</button>}</div>
+    <div className="related-heading"><p>{relatedNote(parentKind)}</p>{canMutate && <button className="button button--primary" type="button" onClick={() => setEditing("new")}>Add {childNoun(parentKind)}</button>}</div>
     {query.isPending ? <TableLoading /> : query.isError ? <QueryError onRetry={() => void query.refetch()} /> : query.data.length === 0 ? <EmptyState searching={false} archived={false} /> : <ReferenceTable records={query.data} kind={childKind} canMutate={canMutate} onEdit={setEditing} onLifecycle={setLifecycle} onRelated={() => undefined} companies={[]} />}
     {editing && <MasterEditor kind={childKind} record={editing === "new" ? undefined : editing} parentId={parent.id} companies={[]} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); void refresh(); }} />}
     {lifecycle && <LifecycleDialog record={lifecycle} onClose={() => setLifecycle(null)} onSaved={() => { setLifecycle(null); void refresh(); }} />}
@@ -216,6 +222,8 @@ function FormFields({ kind, values, set, errors, companies }: { kind: ReferenceK
     case "brands": return <>{field("Display / trade name", "displayName", true)}<SelectField label="Owner company (optional)" field="brandOwnerCompanyId" value={String(values.brandOwnerCompanyId)} onChange={(value) => set("brandOwnerCompanyId", value)} options={[["", "No owner selected"], ...companies.map((company) => [company.id, primaryName(company)] as [string, string])]} /></>;
     case "hsn-codes": return <>{field("Jurisdiction", "jurisdiction", true)}{field("HSN code", "hsnCode", true)}{field("Description", "description", true)}</>;
     case "tax-categories": return <>{field("Jurisdiction", "jurisdiction", true)}{field("Category code", "categoryCode", true)}{field("Display name", "displayName", true)}<SelectField label="Tax treatment" field="taxTreatment" value={String(values.taxTreatment)} onChange={(value) => set("taxTreatment", value)} options={[["taxable", "Taxable"], ["exempt", "Exempt"], ["nil_rated", "Nil rated"], ["non_gst", "Non-GST"]]} /></>;
+    case "controlled-formulations": return <>{field("Jurisdiction", "jurisdiction", true)}{field("Formulation code", "formulationCode", true, "text", "The canonical code this notification is filed under. Uppercase.")}{field("Display name", "displayName", true)}{field("Strength as notified", "strengthText", false, "text", "Recorded exactly as the notification words it. Never parsed, and never used to match a Product.")}{field("Notification source", "sourceNote", false)}<SelectField label="Verification" field="verificationState" value={String(values.verificationState ?? "unverified")} onChange={(value) => set("verificationState", value)} options={[["unverified", "Unverified"], ["verified", "Verified"], ["rejected", "Rejected"]]} /></>;
+    case "price-control-versions": return <>{field("Effective from", "effectiveFrom", true, "date")}{field("Effective to (exclusive)", "effectiveTo", false, "date", "Leave empty for an open-ended period. The end date itself belongs to the next period.")}{field("Ceiling price (₹)", "ceilingPrice", true, "text", "Exclusive of GST, as notified. This is not the Batch MRP, which is the printed price including tax.")}<SelectField label="Quoted per" field="ceilingBasis" value={String(values.ceilingBasis ?? "per_base_unit")} onChange={(value) => set("ceilingBasis", value)} options={[["per_base_unit", "One base unit (per tablet, per ml)"], ["per_pack", "A pack presentation"]]} />{String(values.ceilingBasis ?? "per_base_unit") === "per_base_unit" && field("Base unit id", "ceilingBasisUnitId", true, "text", "Must be the Product's own base unit, or the ceiling cannot be compared with a selling rate.")}{field("Notification reference", "notificationReference", false)}{field("Source note", "sourceNote", false)}</>;
     case "tax-rate-versions": return <>{field("Effective from", "effectiveFrom", true, "date")}{field("Effective to (exclusive)", "effectiveTo", false, "date", "Leave empty for an open-ended period. The end date itself belongs to the next period.")}{field("CGST (%)", "cgstPercent", true)}{field("SGST (%)", "sgstPercent", true)}{field("IGST (%)", "igstPercent", true)}{field("Cess (%)", "cessPercent", true)}</>;
     case "regulatory-categories": return <><div className="reference-disclaimer" role="note">Reference metadata only — not legal advice or an enforcement rule.</div>{field("Jurisdiction", "jurisdiction", true)}{field("Category system", "categorySystem", true)}{field("Code", "categoryCode", true)}{field("Display name", "displayName", true)}{field("Effective from", "effectiveFrom", false, "date")}{field("Effective to", "effectiveTo", false, "date")}{field("Source / reference", "sourceReference")}<SelectField label="Verification state" field="verificationState" value={String(values.verificationState)} onChange={(value) => set("verificationState", value)} options={[["unverified", "Unverified"], ["verified", "Verified"], ["rejected", "Rejected"]]} /></>;
   }
@@ -266,7 +274,20 @@ function StatusBadge({ status }: { status: string }) { return <span className={`
 function useDebouncedValue(value: string, milliseconds: number) { const [debounced, setDebounced] = useState(value); useEffect(() => { const timer = window.setTimeout(() => setDebounced(value), milliseconds); return () => window.clearTimeout(timer); }, [value, milliseconds]); return debounced; }
 class ClientValidationError extends Error {}
 
-function singular(kind: ReferenceKind): string { return ({ units: "unit", "dosage-forms": "dosage form", companies: "company", "company-identifiers": "identifier", brands: "brand", "hsn-codes": "HSN code", "tax-categories": "tax category", "tax-rate-versions": "tax rate version", "regulatory-categories": "regulatory reference", ingredients: "ingredient", "salt-forms": "salt form", "strength-units": "strength unit", "state-codes": "State" })[kind]; }
+/** Each parent's child list explains its own rules; tax wording must not leak into a ceiling list. */
+function relatedNote(parentKind: ReferenceKind): string {
+  if (parentKind === "companies") return "Identifiers are optional. Verified namespace/value pairs must be unique.";
+  if (parentKind === "controlled-formulations") return "Ceilings are stored as exact integer paise, exclusive of GST, and are not the printed MRP on a batch. Active periods use [from, to), so adjacent dates are allowed and a new notification supersedes rather than edits.";
+  return "Rates are stored as exact basis points. Active periods use [from, to), so adjacent dates are allowed.";
+}
+
+function childNoun(parentKind: ReferenceKind): string {
+  if (parentKind === "companies") return "identifier";
+  if (parentKind === "controlled-formulations") return "ceiling version";
+  return "rate version";
+}
+
+function singular(kind: ReferenceKind): string { return ({ units: "unit", "dosage-forms": "dosage form", companies: "company", "company-identifiers": "identifier", brands: "brand", "hsn-codes": "HSN code", "tax-categories": "tax category", "tax-rate-versions": "tax rate version", "controlled-formulations": "controlled formulation", "price-control-versions": "ceiling price version", "regulatory-categories": "regulatory reference", ingredients: "ingredient", "salt-forms": "salt form", "strength-units": "strength unit", "state-codes": "State" })[kind]; }
 function attrs(record: ReferenceMasterResponse): Attributes { return record.attributes as unknown as Attributes; }
 function primaryName(record: ReferenceMasterResponse): string { const value = attrs(record); return String(value.displayName ?? value.canonicalCode ?? value.hsnCode ?? value.categoryCode ?? value.normalizedValue ?? "Reference record"); }
 
@@ -280,6 +301,8 @@ function columnsFor(kind: ReferenceKind): Array<{ key: string; label: string }> 
     "hsn-codes": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "hsnCode", label: "HSN code" }, { key: "description", label: "Description" }],
     "tax-categories": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "categoryCode", label: "Code" }, { key: "displayName", label: "Name" }, { key: "taxTreatment", label: "Treatment" }],
     "tax-rate-versions": [{ key: "period", label: "Effective period" }, { key: "cgstBasisPoints", label: "CGST" }, { key: "sgstBasisPoints", label: "SGST" }, { key: "igstBasisPoints", label: "IGST" }, { key: "cessBasisPoints", label: "Cess" }],
+    "controlled-formulations": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "formulationCode", label: "Code" }, { key: "displayName", label: "Formulation" }, { key: "strengthText", label: "Strength" }, { key: "verificationState", label: "Verification" }],
+    "price-control-versions": [{ key: "period", label: "Effective period" }, { key: "ceilingPricePaise", label: "Ceiling" }, { key: "ceilingBasis", label: "Quoted per" }, { key: "notificationReference", label: "Notification" }],
     "regulatory-categories": [{ key: "jurisdiction", label: "Jurisdiction" }, { key: "categorySystem", label: "System" }, { key: "categoryCode", label: "Code" }, { key: "displayName", label: "Name" }, { key: "verificationState", label: "Verification" }],
     ingredients: [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Ingredient" }, { key: "description", label: "Description" }],
     "salt-forms": [{ key: "canonicalCode", label: "Code" }, { key: "displayName", label: "Salt / Form" }],
@@ -292,11 +315,13 @@ function displayValue(attributes: Attributes, key: string, companies: ReferenceM
   if (key === "location") return [attributes.city, attributes.state, attributes.countryCode].filter(Boolean).join(", ") || "—";
   if (key === "period") return `${String(attributes.effectiveFrom)} → ${attributes.effectiveTo ? String(attributes.effectiveTo) : "Open ended"}`;
   if (key.endsWith("BasisPoints")) return `${basisPointsToPercent(Number(attributes[key]))}%`;
+  // Money is stored in paise and must never be shown in paise: 109 is ₹1.09, not one hundred and nine.
+  if (key.endsWith("Paise")) return paiseToRupees(Number(attributes[key]));
   if (key === "brandOwnerCompanyId") return companies.find((company) => company.id === attributes[key]) ? primaryName(companies.find((company) => company.id === attributes[key])!) : "—";
   const value = attributes[key];
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (value === null || value === undefined || value === "") return "—";
-  const labels: Record<string, string> = { taxable: "Taxable", exempt: "Exempt", nil_rated: "Nil rated", non_gst: "Non-GST", unverified: "Unverified", verified: "Verified", rejected: "Rejected" };
+  const labels: Record<string, string> = { taxable: "Taxable", exempt: "Exempt", nil_rated: "Nil rated", non_gst: "Non-GST", unverified: "Unverified", verified: "Verified", rejected: "Rejected", per_base_unit: "One base unit", per_pack: "A pack" };
   return labels[String(value)] ?? String(value);
 }
 
@@ -311,6 +336,8 @@ function initialValues(kind: ReferenceKind, record?: ReferenceMasterResponse, pa
     "hsn-codes": { jurisdiction: "IN", hsnCode: "", description: "" },
     "tax-categories": { jurisdiction: "IN", categoryCode: "", displayName: "", taxTreatment: "taxable" },
     "tax-rate-versions": { taxCategoryId: parentId ?? "", effectiveFrom: "", effectiveTo: "", cgstPercent: "0.00", sgstPercent: "0.00", igstPercent: "0.00", cessPercent: "0.00" },
+    "controlled-formulations": { jurisdiction: "IN", formulationCode: "", displayName: "", strengthText: "", sourceNote: "", verificationState: "unverified" },
+    "price-control-versions": { controlledFormulationId: parentId ?? "", effectiveFrom: "", effectiveTo: "", ceilingPrice: "", ceilingBasis: "per_base_unit", ceilingBasisUnitId: "", notificationReference: "", sourceNote: "" },
     "regulatory-categories": { jurisdiction: "IN", categorySystem: "", categoryCode: "", displayName: "", effectiveFrom: "", effectiveTo: "", sourceReference: "", verificationState: "unverified" },
     ingredients: { canonicalCode: "", displayName: "", description: "" },
     "salt-forms": { canonicalCode: "", displayName: "" },
@@ -326,12 +353,16 @@ function initialValues(kind: ReferenceKind, record?: ReferenceMasterResponse, pa
 
 function validateForm(kind: ReferenceKind, values: FormValues): Record<string, string> {
   const errors: Record<string, string> = {};
-  const required: Partial<Record<ReferenceKind, string[]>> = { units: ["canonicalCode", "displayName", "allowedScale"], "dosage-forms": ["canonicalCode", "displayName"], companies: ["displayName"], "company-identifiers": ["namespace", "normalizedValue"], brands: ["displayName"], "hsn-codes": ["jurisdiction", "hsnCode", "description"], "tax-categories": ["jurisdiction", "categoryCode", "displayName"], "tax-rate-versions": ["effectiveFrom", "cgstPercent", "sgstPercent", "igstPercent", "cessPercent"], "regulatory-categories": ["jurisdiction", "categorySystem", "categoryCode", "displayName"], ingredients: ["canonicalCode", "displayName"], "salt-forms": ["canonicalCode", "displayName"], "strength-units": ["canonicalCode", "displayName", "allowedScale"], "state-codes": ["jurisdiction", "stateCode", "displayName"] };
+  const required: Partial<Record<ReferenceKind, string[]>> = { units: ["canonicalCode", "displayName", "allowedScale"], "dosage-forms": ["canonicalCode", "displayName"], companies: ["displayName"], "company-identifiers": ["namespace", "normalizedValue"], brands: ["displayName"], "hsn-codes": ["jurisdiction", "hsnCode", "description"], "tax-categories": ["jurisdiction", "categoryCode", "displayName"], "tax-rate-versions": ["effectiveFrom", "cgstPercent", "sgstPercent", "igstPercent", "cessPercent"], "controlled-formulations": ["jurisdiction", "formulationCode", "displayName"], "price-control-versions": ["effectiveFrom", "ceilingPrice"], "regulatory-categories": ["jurisdiction", "categorySystem", "categoryCode", "displayName"], ingredients: ["canonicalCode", "displayName"], "salt-forms": ["canonicalCode", "displayName"], "strength-units": ["canonicalCode", "displayName", "allowedScale"], "state-codes": ["jurisdiction", "stateCode", "displayName"] };
   for (const field of required[kind] ?? []) if (!String(values[field] ?? "").trim()) errors[field] = "This field is required.";
   if (kind === "units") { const scale = Number(values.allowedScale); if (!Number.isInteger(scale) || scale < 0 || scale > 6 || (values.isDiscrete && scale !== 0)) errors.allowedScale = values.isDiscrete ? "Discrete units must use scale 0." : "Use an integer from 0 to 6."; }
   if (kind === "companies" && values.countryCode && !/^[A-Za-z]{2}$/.test(String(values.countryCode))) errors.countryCode = "Use a two-letter country code.";
   if (kind === "tax-rate-versions") for (const field of ["cgstPercent", "sgstPercent", "igstPercent", "cessPercent"]) if (percentToBasisPoints(String(values[field])) === null) errors[field] = "Enter a percentage from 0.00 to 100.00 with at most two decimals.";
-  if ((kind === "tax-rate-versions" || kind === "regulatory-categories") && values.effectiveFrom && values.effectiveTo && String(values.effectiveTo) <= String(values.effectiveFrom)) errors.effectiveTo = "End date must be later than start date.";
+  if (kind === "price-control-versions") {
+    if (rupeesToPaise(String(values.ceilingPrice)) === null) errors.ceilingPrice = "Enter an amount in rupees with at most two decimal places.";
+    if (String(values.ceilingBasis) === "per_base_unit" && !String(values.ceilingBasisUnitId ?? "").trim()) errors.ceilingBasisUnitId = "A per-base-unit ceiling must name the unit it is quoted in.";
+  }
+  if ((kind === "tax-rate-versions" || kind === "regulatory-categories" || kind === "price-control-versions") && values.effectiveFrom && values.effectiveTo && String(values.effectiveTo) <= String(values.effectiveFrom)) errors.effectiveTo = "End date must be later than start date.";
   return errors;
 }
 
@@ -346,6 +377,8 @@ function toAttributes(kind: ReferenceKind, values: FormValues, parentId?: string
     case "hsn-codes": return { jurisdiction: values.jurisdiction, hsnCode: values.hsnCode, description: values.description };
     case "tax-categories": return { jurisdiction: values.jurisdiction, categoryCode: values.categoryCode, displayName: values.displayName, taxTreatment: values.taxTreatment };
     case "tax-rate-versions": return { taxCategoryId: parentId, effectiveFrom: values.effectiveFrom, effectiveTo: nullable("effectiveTo"), cgstBasisPoints: percentToBasisPoints(String(values.cgstPercent)), sgstBasisPoints: percentToBasisPoints(String(values.sgstPercent)), igstBasisPoints: percentToBasisPoints(String(values.igstPercent)), cessBasisPoints: percentToBasisPoints(String(values.cessPercent)) };
+    case "controlled-formulations": return { jurisdiction: values.jurisdiction, formulationCode: String(values.formulationCode).toUpperCase(), displayName: values.displayName, strengthText: nullable("strengthText"), sourceNote: nullable("sourceNote"), verificationState: values.verificationState };
+    case "price-control-versions": return { controlledFormulationId: parentId, effectiveFrom: values.effectiveFrom, effectiveTo: nullable("effectiveTo"), ceilingPricePaise: rupeesToPaise(String(values.ceilingPrice)), ceilingBasis: values.ceilingBasis, ceilingBasisUnitId: String(values.ceilingBasis) === "per_base_unit" ? nullable("ceilingBasisUnitId") : null, notificationReference: nullable("notificationReference"), sourceNote: nullable("sourceNote") };
     case "regulatory-categories": return { jurisdiction: values.jurisdiction, categorySystem: values.categorySystem, categoryCode: values.categoryCode, displayName: values.displayName, effectiveFrom: nullable("effectiveFrom"), effectiveTo: nullable("effectiveTo"), sourceReference: nullable("sourceReference"), verificationState: values.verificationState };
     case "ingredients": return { canonicalCode: values.canonicalCode, displayName: values.displayName, description: nullable("description") };
     case "salt-forms": return { canonicalCode: values.canonicalCode, displayName: values.displayName };
