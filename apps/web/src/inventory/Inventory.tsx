@@ -91,7 +91,8 @@ function LedgerRow({ movement, productName }: { movement: InventoryMovement; pro
 const MOVEMENT_LABELS: Record<InventoryMovement["movementType"], string> = {
   opening_stock: "Opening stock",
   adjustment: "Adjustment",
-  purchase: "Purchase"
+  purchase: "Purchase",
+  sale: "Sale"
 };
 
 function PostMovementDialog({ onClose, onPosted }: { onClose: () => void; onPosted: () => void }) {

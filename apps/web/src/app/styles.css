@@ -378,3 +378,58 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .running-total { display: flex; align-items: baseline; gap: 9px; margin: 0; }
 .running-total span { color: var(--ink-500); font-size: .64rem; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
 .running-total strong { font-size: .86rem; font-variant-numeric: tabular-nums; }
+
+/* Phase 1H point of sale.
+
+   A counter screen is not an admin form. Everything a cashier needs is on one surface in one tab
+   order — entry, the bill, and the amount payable — because a queue does not wait while somebody
+   opens a dialog. The bill and the total sit side by side on a wide screen and stack on a narrow
+   one, so the same screen works on the shop's monitor and on a phone at the delivery counter. */
+.pos { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); grid-template-areas: "entry entry" "lines summary" "customer summary"; align-items: start; }
+.pos-entry { grid-area: entry; }
+.pos-lines { grid-area: lines; min-width: 0; }
+.pos-summary { grid-area: summary; }
+.pos-customer { grid-area: customer; }
+.pos > .inline-notice { grid-area: entry; grid-row: 1; align-self: end; }
+
+/* The entry row. The search box is given the width because it is where every line begins, and the
+   rest of the fields are only ever a tab away from it. */
+.pos-entry { display: grid; gap: 10px 14px; padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); align-items: start; }
+.pos-entry__search { position: relative; grid-column: 1 / -1; }
+.pos-entry__basis { border: 0; margin: 0; padding: 0; min-width: 0; }
+.pos-entry__basis legend { margin-bottom: 3px; color: var(--ink-500); font-size: .62rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.pos-entry__submit { display: flex; align-items: end; }
+.pos-entry__submit .button { width: 100%; }
+
+/* Search results sit over the page rather than pushing the bill down: a list that reflows the whole
+   screen on every keystroke is unusable at speed. */
+.pos-results { position: absolute; z-index: 20; top: 100%; left: 0; right: 0; margin: 3px 0 0; padding: 4px; max-height: 220px; overflow-y: auto; list-style: none; border: 1px solid var(--line-strong); border-radius: 8px; background: white; box-shadow: 0 10px 28px rgb(16 32 24 / .14); }
+.pos-results li { margin: 0; }
+.pos-results button { display: block; width: 100%; padding: 7px 9px; border: 0; border-radius: 6px; background: none; text-align: left; font: inherit; font-size: .74rem; cursor: pointer; }
+.pos-results button:hover, .pos-results button:focus-visible { background: var(--surface-soft); }
+.pos-results__note { padding: 7px 9px; color: var(--ink-500); font-size: .72rem; }
+
+/* The amount payable is the one number the customer is told out loud, so it is the largest thing
+   on the panel and is never rendered from a browser-side calculation. */
+.pos-summary { display: grid; gap: 10px; padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; position: sticky; top: 12px; }
+.pos-summary__count { margin: 0; color: var(--ink-500); font-size: .66rem; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+.pos-summary__pending { margin: 0; color: var(--ink-500); font-size: .74rem; }
+.pos-summary .totals-grid { padding: 0; gap: 7px 14px; grid-template-columns: 1fr; }
+.pos-summary .totals-grid > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.pos-summary .totals-grand { padding-top: 8px; border-top: 1px solid var(--line); }
+.pos-summary .totals-grand dd { font-size: 1.15rem; font-weight: 800; }
+.pos-summary__note { margin: 0; color: var(--ink-500); font-size: .66rem; line-height: 1.45; }
+
+.pos-customer { padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.pos-customer h3 { margin: 0 0 4px; font-size: .78rem; }
+.pos-customer__current { margin: 0 0 10px; color: var(--ink-500); font-size: .74rem; }
+.pos-customer .master-form { padding: 0; }
+
+/* An expired lot or an empty one is stated in the operator's own colour vocabulary rather than
+   quietly hidden: a lot that vanishes teaches nothing, and the operator goes looking for it. */
+.pos-warning { color: var(--danger-700); font-weight: 700; }
+
+@media (max-width: 900px) {
+  .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "customer"; }
+  .pos-summary { position: static; }
+}

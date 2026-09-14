@@ -92,7 +92,7 @@ function inventoryService(options: Options = {}) {
       const replay = state.seenKeys.get(String(body.idempotencyKey));
       if (replay) return response(replay);
       if (options.postError) return failure(options.postError.code, options.postError.status, options.postError.extra);
-      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
+      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, saleLineId: null, idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
       state.movements.push(movement);
       state.seenKeys.set(movement.idempotencyKey, movement);
       return response(movement, 201);
@@ -111,7 +111,7 @@ function bodiesFor(fetchMock: ReturnType<typeof inventoryService>["fetchMock"], 
   return fetchMock.mock.calls.filter(([input, init]) => predicate(String(input), init?.method ?? "GET")).map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
 }
 function movement(overrides: Partial<InventoryMovement> = {}): InventoryMovement {
-  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, purchaseLineId: null, idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
+  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, purchaseLineId: null, saleLineId: null, idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
 }
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 

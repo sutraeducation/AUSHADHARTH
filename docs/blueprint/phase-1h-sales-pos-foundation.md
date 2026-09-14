@@ -1,8 +1,8 @@
 # Phase 1H — Sales / POS Foundation
 
-**Status: architecture only. No schema, no production code.** Written against the repository at
-`394c9759` (Phase 1G). Every claim below was checked against that commit, not against earlier
-blueprints. Revised to incorporate the three approved architecture decisions.
+**Status: implementation authority.** Written against the repository at `394c9759` (Phase 1G) and
+reconciled against `70d718c9` (Phase 1H-0 medicine price control). Every claim below was checked
+against the repository, not against earlier blueprints.
 
 ---
 
@@ -17,7 +17,8 @@ identity, or the Purchase foundation.
 
 One canonical **Sale** document, Draft → Posted, **delivered to the customer at the Store**, with or
 without an identified customer; outward GST resolved from the product's Tax Category on the sale's
-business date; exact integer money on an explicit quantity/rate basis; a hard MRP ceiling; one
+business date; exact integer money on an explicit quantity/rate basis; hard MRP and controlled-price
+ceilings; one
 negative inventory movement per line with durable provenance; a store-issued invoice number allocated
 atomically at posting; single-tender payment evidence.
 
@@ -37,7 +38,8 @@ integration.
 |---|---|---|
 | Product / Pack / base-unit atoms | `products.quantity_scale`, `product_packs.base_quantity_atoms` | yes |
 | Sale permission per pack | `store_pack_policies.sale_enabled` | yes |
-| Fractional permission + granularity | `fractional_sale_allowed`, `minimum_sale_increment_atoms` | yes — **designed for this** |
+| Sale granularity / pack-break control | `minimum_sale_increment_atoms` | yes — **designed for this** |
+| Sub-base-unit permission | `fractional_sale_allowed` | yes — see §12.1, which corrects an earlier misreading |
 | POS pack default | `default_sale_pack` | yes |
 | Batch identity, expiry, MRP | `product_batches.batch_number / expires_on / mrp_paise` | yes |
 | Tax classification | `products.hsn_code_id`, `products.tax_category_id` | yes |
@@ -50,9 +52,10 @@ integration.
 | Business date | `apps/web/src/platform/businessDate.ts` | yes |
 | Real-service gate | `tests/real_service_gate.rs` | yes |
 
-**Absent from the foundation, and therefore designed here:** document numbering (§7).
-**Absent from the foundation, and therefore *not* enforceable in Phase 1H:** statutory medicine
-ceiling prices (§15.4).
+| Medicine price control | `price_control_status`, `resolve_price_ceiling`, `compare_basis` (Phase 1H-0) | yes — see §15.4 |
+
+**Absent from the foundation, and therefore designed here:** document numbering (§7). It is the only
+mechanism Phase 1H must build from nothing.
 
 ## 5. Customer / walk-in model
 
@@ -187,14 +190,60 @@ generic "quantity" anywhere in the model or the UI.
 | rate authority | integer paise **per base atom** |
 | taxable value | `quantity_atoms × selling_rate_per_atom_paise` |
 | inventory atoms | the entered atoms |
-| permitted when | `fractional_sale_allowed = 1` **and** `quantity_atoms % minimum_sale_increment_atoms = 0` **and** `sale_enabled = 1` |
+| permitted when | `sale_enabled = 1` **and** `quantity_atoms % minimum_sale_increment_atoms = 0`; `fractional_sale_allowed = 1` is required **only** when the quantity is not aligned to one whole base unit (§12.1) |
 
 Every one of these is exact **checked** integer multiplication, reusing `domain::money`'s existing
 checked helpers and its `quantity_atoms` guard.
 
 **Decimal pack quantities are impossible by construction.** There is no `0.3 strip`; selling three
 tablets from a strip of ten is `basis = base_unit, quantity_atoms = 3`, and only where the frozen Pack
-policy permits it. A pharmacy that never breaks a strip simply never uses Basis B.
+policy permits it. A pharmacy that never breaks a strip sets its increment to a whole strip (§12.1).
+
+### 12.1 Breaking a Pack and selling a fraction of a base unit are different things
+
+An earlier draft of this section said Basis B is "permitted when `fractional_sale_allowed = 1`". That
+was a misreading of the frozen Phase 1B model, and taken literally it would have made the commonest
+transaction in an Indian pharmacy impossible. The corrected rule is below; the old wording appears
+nowhere else in this document.
+
+**Why the old rule could not work.** `0002_reference_foundations.sql` seeds Tablet, Capsule and Piece
+with `is_discrete = 1, allowed_scale = 0`. `products_unit_compatibility_insert` then pins any Product
+on a discrete base unit to `quantity_scale = 0`, and `store_pack_policies_quantity_insert` raises
+`pack_policy_conflict` unless `quantity_scale > 0 OR fractional_sale_allowed = 0`. A tablet can
+therefore **never** carry `fractional_sale_allowed = 1` — the Product-catalog UI already hard-codes
+this (`ProductCatalog.tsx`: `fractionalSaleAllowed: product.quantityScale > 0 && values.fractional`).
+Gating loose sale on that flag would have made "three tablets from a strip of ten" unreachable for
+every tablet and capsule in the catalog.
+
+**The two concepts, separated.**
+
+| concept | example | governed by |
+|---|---|---|
+| breaking a Pack | strip of 10 → sell 3 tablets | `minimum_sale_increment_atoms` |
+| a fraction of a base unit | 0.5 ml of a syrup at `quantity_scale = 1` | `fractional_sale_allowed` |
+
+Three tablets are **three whole base units**, not a fraction of one.
+
+**The authoritative rule.** With `atoms_per_base_unit = 10 ^ quantity_scale`, a Basis B line is
+permitted when all of:
+
+1. `sale_enabled = 1` on an active Store Pack Policy;
+2. `quantity_atoms > 0` (and within `MAX_SALE_QUANTITY_ATOMS`);
+3. `quantity_atoms % minimum_sale_increment_atoms = 0`;
+4. **only if** `quantity_atoms % atoms_per_base_unit <> 0`, then `fractional_sale_allowed = 1`.
+
+The granularity is evaluated before the permission, so a store cannot be talked past its own
+increment by holding the other flag.
+
+**Whole-Pack-only sale is expressible, and always was.** A store that never breaks a strip sets
+`minimum_sale_increment_atoms = base_quantity_atoms`; three tablets are then refused with
+`quantity_increment_violation` while ten are accepted. This is an explicit configuration rather than
+a side effect of a permission that means something else.
+
+**Nothing in Phase 1B changes.** `fractional_sale_allowed` keeps its frozen meaning (genuine
+sub-base-unit precision), `minimum_sale_increment_atoms` keeps its frozen meaning (operational sale
+granularity), and `base_quantity_atoms` keeps its frozen meaning (Pack containment). The correction
+is to how Sales *reads* those fields, not to what they mean. The Phase 1B triggers are untouched.
 
 ### Input bounds (new constants, mirroring Phase 1G)
 
@@ -302,23 +351,42 @@ than a wrap. The uncancelled cross-product the audit started from would have rea
 `9×10¹⁵ × 10¹¹ × 9×10¹⁵ = 8.1×10⁴²`, which **exceeds `i128` as well** — the cancellation in §15.2 is
 therefore not merely tidier, it is what makes the comparison representable at all.
 
-### 15.4 Medicine price control — reported, NOT implemented
+### 15.4 Medicine price control — ENFORCED, on the Phase 1H-0 foundation
 
-Scheduled formulations are additionally capped by DPCO/NPPA ceiling prices, which are stricter than
-MRP. **The repository contains no ceiling-price foundation:** no DPCO, NPPA, ceiling-price,
-scheduled-formulation or price-control field exists in any migration, domain module or contract. A
-grep across the whole repository returns nothing.
+An earlier draft of this section recorded that no ceiling-price foundation existed. **Phase 1H-0
+(`70d718c9`) built it**, so Phase 1H enforces the controlled ceiling as well as the MRP ceiling.
+The names below are the committed ones, not proposals:
 
-Therefore **Phase 1H cannot enforce the DPCO ceiling, and must not pretend to.** What Phase 1H does:
+| concern | committed surface |
+|---|---|
+| applicability | `products.price_control_status` ∈ `unknown` / `not_applicable` / `controlled` |
+| mapping | `products.controlled_formulation_id` — explicit assignment, never inferred |
+| resolution | `domain::price_control::resolve_price_ceiling(executor, formulation_id, on_date)` |
+| comparability | `compare_basis(&ceiling, product_base_unit_id) -> Comparability` |
+| pack-basis check | `per_pack_rate_within_ceiling(rate, scale, base_quantity_atoms, ceiling)` |
+| atom-basis check | `per_atom_rate_within_ceiling(rate, scale, ceiling)` |
 
-- enforces the Batch MRP ceiling as a hard block (data exists);
-- does **not** claim that passing the MRP check means a scheduled formulation is lawfully priced;
-- leaves `products.product_kind = 'medicine'` as the existing hook a future phase can use.
+Both checks are exact `i128` comparisons that multiply rather than divide, so no rounded per-unit
+ceiling is ever invented.
 
-Enforcing DPCO needs a ceiling-price master (formulation identity, ceiling price, effective period,
-revision history) — a real foundation phase of its own, analogous to Phase 1F's tax rate versions.
-**This is a documented limitation, not a Phase 1H blocker**, because the MRP ceiling is the operative
-constraint at the counter and is fully enforceable today.
+**Posting rules.** When `price_control_status = 'controlled'`:
+
+- no ceiling resolves on the business date → refuse (`price_control_unresolved`);
+- a ceiling resolves but `compare_basis` is not `Comparable` → refuse (`price_control_incomparable`);
+- the selling rate exceeds the ceiling → refuse (`selling_rate_above_ceiling`).
+
+**Never silently fall back to the MRP rule.** When the status is `unknown`, the sale proceeds under
+the MRP rule alone and the status is **snapshotted onto the posted line**, so the gap is auditable
+rather than invisible (§28).
+
+**Tax basis, restated because it is the trap.** A DPCO ceiling is **exclusive** of GST and is
+therefore compared against the line's **taxable value**; a Batch MRP is **inclusive** and is compared
+against the line's **GST-inclusive total** (§15.0–15.2). The two ceilings are never compared with
+each other — both are enforced, which yields the stricter maximum without placing them on one axis.
+
+**The application enforces the reference data that has been configured.** It does not certify that
+manually entered NPPA/DPCO data is complete or current, and Phase 1H performs no online lookup: a
+sale posts with no internet.
 
 ### 15.5 When MRP is unknown
 
@@ -506,8 +574,27 @@ PUT    /api/v1/sale-lines/{id}
 DELETE /api/v1/sale-lines/{id}             {expectedRevision}
 POST   /api/v1/sales/{id}/post             {expectedRevision, idempotencyKey,
                                             tenders:[{method, amountPaise, reference?}]}
+GET    /api/v1/sales/{id}/quote            what this draft would come to — see below
 GET    /api/v1/packs/{id}/sellable-batches batch, expiry, available atoms, MRP — for the chooser
 ```
+
+**`/quote` was added during implementation.** §29 requires the tender due to be permanently visible,
+and that cannot be satisfied without it: the tax is resolved from the rate in force on the business
+date, which only the Store Service knows, and a browser that added the tax up itself would be a second
+implementation of the money path — the exact defect §15.0 exists to prevent.
+
+The endpoint reuses `resolve_and_compute`, the very function posting uses, so a quote and the invoice
+that follows it cannot disagree. It allocates no number, writes no snapshot and moves no stock, and a
+line that posting would refuse is refused here too with the same typed code — so an above-MRP price is
+found while the customer is still at the counter rather than after the cash is in the drawer.
+
+**Live display names on a draft line.** The four identity snapshots (`productDisplayName`,
+`packDisplayLabel`, `baseUnitLabel`, `batchNumber`) are NULL until posting freezes them, which is
+correct: a snapshot is what was true when the invoice was issued, and a draft has issued nothing. But
+the counter still has to read its own bill while building it. `GET /api/v1/sales/{id}` therefore also
+returns `currentProductDisplayName`, `currentPackDisplayLabel`, `currentBaseUnitLabel` and
+`currentBatchNumber`, joined live from the catalogue and written nowhere. The browser preview found
+this: before it, a draft bill showed a raw UUID for the item and the word "Chosen" for the batch.
 
 ## 29. POS workflow
 
@@ -519,10 +606,15 @@ The hard requirement: **materially faster than Purchase entry, keyboard-first, n
         └───────────── focus returns to search ────────────────┘
 ```
 
-- A single always-focused search/scan field. A scanned barcode ends in Enter and resolves to a pack.
+- A single always-focused search/scan field. A scanned barcode ends in Enter, and that Enter takes the
+  match rather than submitting an incomplete line — before it was handled, a scan produced "Find the
+  product being sold" for a product the operator had just found.
 - Lines are entered **inline in the table**, not in a dialog. The Phase 1G dialog suits an admin form;
   it does not suit a counter.
-- Pack defaults from `default_sale_pack`; the batch chooser is one keystroke and is stock-aware.
+- A Product whose only active Pack is unambiguous selects that Pack itself; with several the operator
+  still chooses, because guessing which presentation a customer asked for would be inventing an
+  answer. The batch chooser is one keystroke and is stock-aware, and **nothing about a lot is ever
+  auto-selected**: which lot leaves the shelf is a real decision with an expiry attached to it.
 - Basis-correct labels at all times (§20).
 - Running total, line count and tender due permanently visible.
 - Tender and post at the end, one confirmation, with the synchronous double-submit guard Phase 1G
@@ -558,8 +650,8 @@ as issued.
 ## 32. Real-service tests
 
 Extend `tests/real_service_gate.rs` over real HTTP: seed → sell a whole pack → sell loose units →
-refuse a decimal pack quantity → refuse an increment violation → refuse a fractional sale on a pack
-that forbids it → refuse an expired batch → refuse a rate above the MRP ceiling on both bases →
+refuse a decimal pack quantity → refuse an increment violation on a pack whose increment is a whole
+strip → refuse a sub-base-unit quantity on a measurable pack that forbids it → refuse an expired batch → refuse a rate above the MRP ceiling on both bases →
 refuse overselling, including two lines on one batch that only fail when aggregated → post → verify
 the invoice number, financial year, snapshots, exact tax, negative atoms, provenance and derived
 balance → replay the key and prove no second number → reuse the key on another sale → force a

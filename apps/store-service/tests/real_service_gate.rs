@@ -2256,3 +2256,879 @@ async fn real_service_keeps_price_control_assertion_to_an_admin_over_http() {
     assert_eq!(anonymous.status, 401);
     assert_eq!(anonymous.body["code"], "authentication_required");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1H — sales / POS outward
+// ---------------------------------------------------------------------------------------------
+
+/// Everything a sale needs, built over real HTTP on top of the purchase world: the pack is enabled
+/// for sale at this store, a lot exists with a printed MRP, and stock has actually been received.
+struct SaleWorld {
+    cookie: String,
+    store: String,
+    supplier: String,
+    product: String,
+    pack: String,
+    batch: String,
+    customer: String,
+}
+
+const SALE_DATE: &str = "2026-09-12";
+
+async fn seed_sale_world(service: &Service, increment_atoms: i64) -> SaleWorld {
+    let world = seed_purchase_world(service, MAHARASHTRA, "taxable").await;
+
+    let store = call(
+        service,
+        "GET",
+        "/api/v1/store/tax-identity",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(store.status, 200, "{:?}", store.body);
+    let store_id = store.body["storeId"].as_str().expect("store id").to_owned();
+
+    // The pack is enabled for sale here. `fractionalSaleAllowed` is false and must stay false: the
+    // product is a tablet, so the frozen Phase 1B triggers forbid that permission outright. Loose
+    // sale is governed by the increment alone.
+    let policy = call(
+        service,
+        "PUT",
+        &format!("/api/v1/packs/{}/policy", world.pack),
+        Some(json!({
+            "expectedRevision": null,
+            "policy": {
+                "storeId": store_id, "purchaseEnabled": true, "saleEnabled": true,
+                "wholePackOnlyPurchase": false, "fractionalSaleAllowed": false,
+                "minimumSaleIncrementAtoms": increment_atoms,
+                "defaultPurchasePack": false, "defaultSalePack": true
+            }
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        policy.status == 200 || policy.status == 201,
+        "{:?}",
+        policy.body
+    );
+
+    // Stock arrives the way it really does: through a posted purchase, which also creates the lot.
+    let draft = create_draft(service, &world, "INV-SALE-SEED").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "newBatchNumber": "B-9001",
+            "newBatchExpiresOn": "2028-03-31",
+            "newBatchMrpPaise": 9550,
+            "quantityPacks": 10,
+            "ratePerPackPaise": 6000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let posted = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000000b1"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let batch = posted.body["lines"][0]["batchId"]
+        .as_str()
+        .expect("materialised batch")
+        .to_owned();
+
+    let customer = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": {
+                "displayName": "Rahul Deshmukh", "gstRegistrationStatus": "unregistered",
+                "gstin": null, "placeOfSupplyStateId": MAHARASHTRA
+            },
+            "roles": [{ "role": "customer" }],
+            "addresses": []
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(customer.status, 201, "{:?}", customer.body);
+
+    SaleWorld {
+        cookie: world.cookie,
+        store: store_id,
+        supplier: world.supplier,
+        product: world.product,
+        pack: world.pack,
+        batch,
+        customer: customer.body["id"]
+            .as_str()
+            .expect("customer id")
+            .to_owned(),
+    }
+}
+
+async fn sale_draft(service: &Service, world: &SaleWorld, customer: Option<&str>) -> String {
+    let draft = call(
+        service,
+        "POST",
+        "/api/v1/sales",
+        Some(json!({ "customerPartyId": customer, "businessDate": SALE_DATE })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    draft.body["id"].as_str().expect("sale id").to_owned()
+}
+
+async fn sale_line(
+    service: &Service,
+    world: &SaleWorld,
+    sale_id: &str,
+    revision: i64,
+    basis: &str,
+    quantity: i64,
+    rate: i64,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/lines"),
+        Some(json!({
+            "expectedRevision": revision,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "batchId": world.batch,
+            "quantityBasis": basis,
+            "quantity": quantity,
+            "sellingRatePaise": rate
+        })),
+        Some(&world.cookie),
+    )
+    .await
+}
+
+async fn post_sale(
+    service: &Service,
+    world: &SaleWorld,
+    sale_id: &str,
+    revision: i64,
+    key: &str,
+    amount: i64,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": key,
+            "tenders": [{ "method": "cash", "amountPaise": amount }]
+        })),
+        Some(&world.cookie),
+    )
+    .await
+}
+
+/// Receives another lot of the same pack through a real posted purchase, so the stock behind it is
+/// as genuine as the first one's.
+async fn receive_lot(
+    service: &Service,
+    world: &SaleWorld,
+    batch_number: &str,
+    mrp_paise: i64,
+    invoice: &str,
+    key: &str,
+) -> String {
+    let draft = call(
+        service,
+        "POST",
+        "/api/v1/purchases",
+        Some(json!({
+            "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": invoice,
+            "invoiceDate": "2026-09-10"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let purchase_id = draft.body["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+            "newBatchNumber": batch_number, "newBatchExpiresOn": "2028-03-31",
+            "newBatchMrpPaise": mrp_paise, "quantityPacks": 10, "ratePerPackPaise": 6000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let posted = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"], "idempotencyKey": key
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    posted.body["lines"][0]["batchId"]
+        .as_str()
+        .expect("materialised batch")
+        .to_owned()
+}
+
+/// The whole Phase 1H workflow across a real socket: a draft becomes a numbered GST invoice, the
+/// snapshots freeze, and exactly the sold atoms leave the ledger.
+#[tokio::test]
+async fn real_service_posts_a_gst_sale_and_issues_stock_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let sale_id = sale_draft(&service, &world, Some(&world.customer)).await;
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 2, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    // The browser sent "2 packs"; the atoms came from the frozen pack model.
+    assert_eq!(with_line.body["lines"][0]["quantityAtoms"], 20);
+    assert_eq!(with_line.body["lines"][0]["taxableValuePaise"], 16_000);
+    // A draft carries no tax and no number at all.
+    assert_eq!(with_line.body["lines"][0]["cgstPaise"], 0);
+    assert_eq!(with_line.body["documentNumber"], Value::Null);
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000000c1",
+        17_920,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    // Refetched rather than trusted from the write response.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    assert_eq!(detail.body["status"], "posted");
+    assert_eq!(detail.body["documentNumber"], "INV/2026-27/000001");
+    assert_eq!(detail.body["seriesCode"], "INV");
+    assert_eq!(detail.body["financialYear"], "2026-27");
+    assert_eq!(detail.body["sequenceValue"], 1);
+    // Goods handed over at the counter: the place of supply is the store, so the tax splits.
+    assert_eq!(detail.body["taxTreatment"], "intra_state");
+    assert_eq!(detail.body["taxableValuePaise"], 16_000);
+    assert_eq!(detail.body["cgstPaise"], 960);
+    assert_eq!(detail.body["sgstPaise"], 960);
+    assert_eq!(detail.body["igstPaise"], 0);
+    assert_eq!(detail.body["grandTotalPaise"], 17_920);
+    assert_eq!(detail.body["storeNormalizedGstin"], STORE_GSTIN);
+    assert_eq!(detail.body["storeStateCode"], "27");
+    assert_eq!(detail.body["customerDisplayName"], "Rahul Deshmukh");
+    assert!(detail.body["postedAtUtc"].is_string());
+
+    let line = &detail.body["lines"][0];
+    assert_eq!(line["productDisplayName"], "Crocin 500 mg Tablet");
+    assert_eq!(line["packDisplayLabel"], "Strip of 10");
+    assert_eq!(line["baseUnitLabel"], "Tablet");
+    assert_eq!(line["batchNumber"], "B-9001");
+    assert_eq!(line["batchExpiresOn"], "2028-03-31");
+    assert_eq!(line["batchMrpPaise"], 9_550);
+    assert_eq!(line["hsnCode"], "30049099");
+    assert_eq!(line["taxTreatmentKind"], "taxable");
+    assert_eq!(line["cgstBasisPoints"], 600);
+    assert_eq!(line["lineTotalPaise"], 17_920);
+    // Nobody has assessed this product for price control, and the posted line says so honestly.
+    assert_eq!(line["priceControlStatus"], "unknown");
+    assert_eq!(line["ceilingPricePaise"], Value::Null);
+    assert_eq!(detail.body["tenders"][0]["method"], "cash");
+    assert_eq!(detail.body["tenders"][0]["amountPaise"], 17_920);
+
+    // The ledger: one outward, negative, on the right lot, traceable to the line that caused it.
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(movements.status, 200, "{:?}", movements.body);
+    let rows = movements.body.as_array().expect("movements");
+    let outward: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["movementType"] == "sale")
+        .collect();
+    assert_eq!(outward.len(), 1, "one line must post exactly one movement");
+    assert_eq!(outward[0]["quantityDeltaAtoms"], -20);
+    assert_eq!(outward[0]["batchId"], world.batch.as_str());
+    assert_eq!(outward[0]["saleLineId"], line["id"]);
+    assert_eq!(outward[0]["occurredOn"], SALE_DATE);
+
+    // 100 atoms received, 20 sold, and the balance is still summed rather than stored.
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.status, 200, "{:?}", stock.body);
+    assert_eq!(stock.body[0]["balanceAtoms"], 80);
+}
+
+/// Loose units over real HTTP, and the increment that decides whether a strip may be broken.
+/// A decimal pack quantity is unrepresentable rather than merely refused.
+#[tokio::test]
+async fn real_service_sells_loose_units_under_the_pack_increment_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let sale_id = sale_draft(&service, &world, None).await;
+
+    // Three tablets from a strip of ten, with no sub-unit permission anywhere in the model.
+    let loose = sale_line(&service, &world, &sale_id, 1, "base_unit", 3, 800).await;
+    assert_eq!(loose.status, 201, "{:?}", loose.body);
+    assert_eq!(loose.body["lines"][0]["quantityAtoms"], 3);
+    assert_eq!(loose.body["lines"][0]["quantityPacks"], Value::Null);
+    assert_eq!(loose.body["lines"][0]["taxableValuePaise"], 2_400);
+
+    // There is no such thing as 0.3 of a strip: the field is an integer, so the request is rejected
+    // before any rule is even consulted.
+    let decimal = call(
+        &service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/lines"),
+        Some(json!({
+            "expectedRevision": 2, "productId": world.product, "productPackId": world.pack,
+            "batchId": world.batch, "quantityBasis": "pack", "quantity": 0.3,
+            "sellingRatePaise": 8000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        decimal.status == 400 || decimal.status == 422,
+        "a decimal pack quantity must not parse: {:?}",
+        decimal.body
+    );
+
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000c2",
+        2_688,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["grandTotalPaise"], 2_688);
+
+    // A second store, whose increment is a whole strip, refuses the same three tablets.
+    let strict = start().await;
+    let strict_world = seed_sale_world(&strict, 10).await;
+    let strict_sale = sale_draft(&strict, &strict_world, None).await;
+    let refused = sale_line(&strict, &strict_world, &strict_sale, 1, "base_unit", 3, 800).await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "quantity_increment_violation");
+    let accepted = sale_line(
+        &strict,
+        &strict_world,
+        &strict_sale,
+        1,
+        "base_unit",
+        10,
+        800,
+    )
+    .await;
+    assert_eq!(accepted.status, 201, "{:?}", accepted.body);
+}
+
+/// Every refusal a counter can provoke, over real HTTP, each with a typed and safe code.
+#[tokio::test]
+async fn real_service_refuses_ineligible_sales_with_safe_codes_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    // Above the printed MRP. The ceiling is INCLUSIVE of GST, so 85.27 a strip prints 95.51.
+    let sale_id = sale_draft(&service, &world, None).await;
+    let line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8_527).await;
+    assert_eq!(line.status, 201, "{:?}", line.body);
+    let above = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000d1",
+        9_551,
+    )
+    .await;
+    assert_eq!(above.status, 409, "{:?}", above.body);
+    assert_eq!(above.body["code"], "selling_rate_above_mrp");
+
+    // Overselling the lot, including two lines that only fail once aggregated.
+    let over_id = sale_draft(&service, &world, None).await;
+    let first = sale_line(&service, &world, &over_id, 1, "pack", 6, 8_000).await;
+    assert_eq!(first.status, 201, "{:?}", first.body);
+    let second = sale_line(&service, &world, &over_id, 2, "pack", 6, 8_000).await;
+    assert_eq!(second.status, 201, "{:?}", second.body);
+    let oversold = post_sale(
+        &service,
+        &world,
+        &over_id,
+        3,
+        "01997a00-0000-7000-8000-0000000000d2",
+        107_520,
+    )
+    .await;
+    assert_eq!(oversold.status, 409, "{:?}", oversold.body);
+    assert_eq!(oversold.body["code"], "insufficient_stock");
+    assert_eq!(oversold.body["availableAtoms"], 100);
+
+    // A tender that does not settle the invoice.
+    let tender_id = sale_draft(&service, &world, None).await;
+    let tender_line = sale_line(&service, &world, &tender_id, 1, "pack", 1, 8_000).await;
+    assert_eq!(tender_line.status, 201, "{:?}", tender_line.body);
+    let short = post_sale(
+        &service,
+        &world,
+        &tender_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000d3",
+        8_000,
+    )
+    .await;
+    assert_eq!(short.status, 409, "{:?}", short.body);
+    assert_eq!(short.body["code"], "tender_mismatch");
+
+    // A party that is not a customer of this store. Unregistered, so it needs no GSTIN of its own
+    // and cannot collide with the supplier the world already seeded.
+    let party = call(
+        &service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": {
+                "displayName": "Wholesale Only", "gstRegistrationStatus": "unregistered",
+                "gstin": null, "placeOfSupplyStateId": MAHARASHTRA
+            },
+            "roles": [{ "role": "supplier" }],
+            "addresses": []
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(party.status, 201, "{:?}", party.body);
+    let supplier_only = party.body["id"].as_str().expect("party id").to_owned();
+    let ineligible = call(
+        &service,
+        "POST",
+        "/api/v1/sales",
+        Some(json!({ "customerPartyId": supplier_only, "businessDate": SALE_DATE })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(ineligible.status, 409, "{:?}", ineligible.body);
+    assert_eq!(ineligible.body["code"], "customer_not_eligible");
+
+    // Nothing above moved a single atom.
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.status, 200, "{:?}", stock.body);
+    assert_eq!(stock.body[0]["balanceAtoms"], 100);
+}
+
+/// A retry after a successful post returns the original invoice; the same key on a different sale
+/// is refused; and a posting that fails after partial work leaves no number, movement or tender.
+#[tokio::test]
+async fn real_service_keeps_the_invoice_series_dense_under_replay_and_failure_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let key = "01997a00-0000-7000-8000-0000000000e1";
+
+    let sale_id = sale_draft(&service, &world, None).await;
+    let line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8_000).await;
+    assert_eq!(line.status, 201, "{:?}", line.body);
+    let posted = post_sale(&service, &world, &sale_id, 2, key, 8_960).await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["documentNumber"], "INV/2026-27/000001");
+
+    // The counter's network dropped and the operator pressed Post again.
+    let replay = post_sale(&service, &world, &sale_id, 2, key, 8_960).await;
+    assert_eq!(replay.status, 200, "{:?}", replay.body);
+    assert_eq!(replay.body["documentNumber"], "INV/2026-27/000001");
+    assert_eq!(replay.body["revision"], posted.body["revision"]);
+
+    // The same key on a different sale: refused after it has already allocated a number, rewritten
+    // its lines and inserted its movements — all of which must be undone.
+    let second = sale_draft(&service, &world, None).await;
+    let second_line = sale_line(&service, &world, &second, 1, "pack", 3, 8_000).await;
+    assert_eq!(second_line.status, 201, "{:?}", second_line.body);
+    let reused = post_sale(&service, &world, &second, 2, key, 26_880).await;
+    assert_eq!(reused.status, 409, "{:?}", reused.body);
+    assert_eq!(reused.body["code"], "idempotency_conflict");
+
+    let residue = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{second}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(residue.status, 200, "{:?}", residue.body);
+    assert_eq!(residue.body["status"], "draft");
+    assert_eq!(residue.body["documentNumber"], Value::Null);
+    assert_eq!(residue.body["lines"][0]["batchNumber"], Value::Null);
+    assert_eq!(
+        residue.body["tenders"].as_array().expect("tenders").len(),
+        0
+    );
+
+    // Exactly one sale movement exists, and the series is dense: the next number is 2, not 3.
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(movements.status, 200, "{:?}", movements.body);
+    let sales: Vec<&Value> = movements
+        .body
+        .as_array()
+        .expect("movements")
+        .iter()
+        .filter(|row| row["movementType"] == "sale")
+        .collect();
+    assert_eq!(sales.len(), 1, "a refused posting must move no stock");
+
+    let third = sale_draft(&service, &world, None).await;
+    let third_line = sale_line(&service, &world, &third, 1, "pack", 1, 8_000).await;
+    assert_eq!(third_line.status, 201, "{:?}", third_line.body);
+    let next = post_sale(
+        &service,
+        &world,
+        &third,
+        2,
+        "01997a00-0000-7000-8000-0000000000e2",
+        8_960,
+    )
+    .await;
+    assert_eq!(next.status, 200, "{:?}", next.body);
+    assert_eq!(
+        next.body["documentNumber"], "INV/2026-27/000002",
+        "a refused posting must consume no number"
+    );
+}
+
+/// A posted invoice is a document that was issued to a customer. It cannot be edited, and an
+/// expired lot cannot be sold at all.
+#[tokio::test]
+async fn real_service_freezes_a_posted_sale_and_blocks_an_expired_lot_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let sale_id = sale_draft(&service, &world, None).await;
+    let line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8_000).await;
+    assert_eq!(line.status, 201, "{:?}", line.body);
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000f1",
+        8_960,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let revision = posted.body["revision"].as_i64().expect("revision");
+
+    let edited = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/sales/{sale_id}"),
+        Some(json!({
+            "expectedRevision": revision, "customerPartyId": null, "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(edited.status, 409, "{:?}", edited.body);
+    assert_eq!(edited.body["code"], "sale_not_draft");
+
+    let added = sale_line(&service, &world, &sale_id, revision, "pack", 1, 8_000).await;
+    assert_eq!(added.status, 409, "{:?}", added.body);
+    assert_eq!(added.body["code"], "sale_not_draft");
+
+    // A lot whose expiry has passed on the business date cannot be sold.
+    let expired_batch = call(
+        &service,
+        "POST",
+        &format!("/api/v1/packs/{}/batches", world.pack),
+        Some(json!({
+            "batchNumber": "B-OLD", "expiresOn": "2026-01-31", "mrpPaise": 9550
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(expired_batch.status, 201, "{:?}", expired_batch.body);
+    let expired_id = expired_batch.body["id"].as_str().expect("batch id");
+
+    let stale_sale = sale_draft(&service, &world, None).await;
+    let refused = call(
+        &service,
+        "POST",
+        &format!("/api/v1/sales/{stale_sale}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "productId": world.product, "productPackId": world.pack,
+            "batchId": expired_id, "quantityBasis": "pack", "quantity": 1,
+            "sellingRatePaise": 8000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "batch_expired");
+
+    // The chooser still shows the lot and says why it is unusable, rather than hiding it.
+    let batches = call(
+        &service,
+        "GET",
+        &format!(
+            "/api/v1/packs/{}/sellable-batches?asOf={SALE_DATE}",
+            world.pack
+        ),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(batches.status, 200, "{:?}", batches.body);
+    let rows = batches.body.as_array().expect("batches");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["batchNumber"], "B-OLD");
+    assert_eq!(rows[0]["expired"], true);
+    assert_eq!(rows[0]["availableAtoms"], 0);
+    assert_eq!(rows[1]["batchNumber"], "B-9001");
+    assert_eq!(rows[1]["expired"], false);
+    assert_eq!(rows[1]["availableAtoms"], 90);
+    let _ = world.store;
+}
+
+/// A controlled medicine is held to its notified ceiling over real HTTP, against the tax-exclusive
+/// rate — and a ceiling that cannot be compared is refused rather than guessed at.
+#[tokio::test]
+async fn real_service_enforces_the_notified_ceiling_on_a_sale_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let formulation = call(
+        &service,
+        "POST",
+        "/api/v1/reference/controlled-formulations",
+        Some(json!({ "attributes": {
+            "jurisdiction": "IN", "formulationCode": "CROCIN-500",
+            "displayName": "Paracetamol 500 mg tablet", "dosageFormId": null,
+            "strengthText": "500 mg", "verificationState": "verified",
+            "sourceNote": "Recorded from the notification as published"
+        }})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(formulation.status, 201, "{:?}", formulation.body);
+    let formulation_id = formulation.body["id"].as_str().expect("formulation id");
+
+    let version = call(
+        &service,
+        "POST",
+        "/api/v1/reference/price-control-versions",
+        Some(json!({ "attributes": {
+            "controlledFormulationId": formulation_id, "effectiveFrom": "2026-01-01",
+            "effectiveTo": null, "ceilingPricePaise": 900, "ceilingBasis": "per_base_unit",
+            "ceilingBasisUnitId": TABLET, "notificationReference": "S.O. 1234(E)"
+        }})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(version.status, 201, "{:?}", version.body);
+
+    let asserted = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/products/{}/price-control", world.product),
+        Some(json!({
+            "expectedRevision": 2, "priceControlStatus": "controlled",
+            "controlledFormulationId": formulation_id
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(asserted.status, 200, "{:?}", asserted.body);
+
+    // The seeded lot is printed at 95.50, which would refuse this sale on the MRP rule before the
+    // ceiling was ever consulted. A generously priced second lot isolates the ceiling, so what this
+    // test proves is the DPCO rule and not the Legal Metrology one.
+    let second_lot = receive_lot(
+        &service,
+        &world,
+        "B-CEIL",
+        50_000,
+        "INV-CEIL",
+        "01997a00-0000-7000-8000-00000000001c",
+    )
+    .await;
+    let world = SaleWorld {
+        batch: second_lot,
+        ..world
+    };
+
+    // 9.00 a tablet: a strip of ten may be sold for at most 90.00 EXCLUSIVE of GST.
+    let over_id = sale_draft(&service, &world, None).await;
+    let over_line = sale_line(&service, &world, &over_id, 1, "pack", 1, 9_001).await;
+    assert_eq!(over_line.status, 201, "{:?}", over_line.body);
+    let over = post_sale(
+        &service,
+        &world,
+        &over_id,
+        2,
+        "01997a00-0000-7000-8000-00000000001a",
+        10_081,
+    )
+    .await;
+    assert_eq!(over.status, 409, "{:?}", over.body);
+    assert_eq!(over.body["code"], "selling_rate_above_ceiling");
+
+    let at_id = sale_draft(&service, &world, None).await;
+    let at_line = sale_line(&service, &world, &at_id, 1, "pack", 1, 9_000).await;
+    assert_eq!(at_line.status, 201, "{:?}", at_line.body);
+    let at = post_sale(
+        &service,
+        &world,
+        &at_id,
+        2,
+        "01997a00-0000-7000-8000-00000000001b",
+        10_080,
+    )
+    .await;
+    assert_eq!(at.status, 200, "{:?}", at.body);
+    assert_eq!(at.body["lines"][0]["priceControlStatus"], "controlled");
+    assert_eq!(at.body["lines"][0]["ceilingPricePaise"], 900);
+    assert_eq!(at.body["lines"][0]["ceilingBasis"], "per_base_unit");
+    assert!(at.body["lines"][0]["priceControlVersionId"].is_string());
+}
+
+/// Selling is counter work, so a cashier may do it — but an anonymous request may not, and the
+/// ledger will not mint a sale movement by hand.
+#[tokio::test]
+async fn real_service_lets_a_cashier_sell_but_refuses_a_hand_written_outward_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    // There is no user-administration endpoint yet, so the cashier is seeded directly into the
+    // disposable gate database — reusing the owner's verifier so the real Argon2 login path below is
+    // still exercised over the transport. Everything under test is the role check, not the seeding.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let owner_hash: String = sqlx::query_scalar("SELECT password_hash FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("owner hash");
+    sqlx::query(
+        "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,         password_hash,role,created_at_utc,updated_at_utc)          VALUES (?,?,?,?,?, 'cashier', strftime('%Y-%m-%dT%H:%M:%fZ','now'),          strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind("01997a00-0000-7000-8000-000000000301")
+    .bind("counter.cashier")
+    .bind("counter.cashier")
+    .bind("Counter Cashier")
+    .bind(&owner_hash)
+    .execute(&pool)
+    .await
+    .expect("seed a cashier");
+    pool.close().await;
+
+    let login = call(
+        &service,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({
+            "loginIdentifier": "counter.cashier", "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(login.status, 200, "{:?}", login.body);
+    let cashier_cookie = session_cookie(&login.headers);
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/sales",
+        Some(json!({ "customerPartyId": null, "businessDate": SALE_DATE })),
+        Some(&cashier_cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+
+    let anonymous = call(
+        &service,
+        "POST",
+        "/api/v1/sales",
+        Some(json!({ "customerPartyId": null, "businessDate": SALE_DATE })),
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, 401, "{:?}", anonymous.body);
+
+    // An outward must come from a posting, never from the manual ledger endpoint.
+    let minted = call(
+        &service,
+        "POST",
+        "/api/v1/inventory/movements",
+        Some(json!({
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000002a",
+            "movementType": "sale", "productPackId": world.pack, "batchId": world.batch,
+            "quantityDeltaAtoms": -10, "occurredOn": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(minted.status, 422, "{:?}", minted.body);
+    assert_eq!(minted.body["issues"][0]["field"], "movementType");
+}

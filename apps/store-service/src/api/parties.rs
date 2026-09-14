@@ -584,12 +584,7 @@ fn prepare_party(fields: PartyFields) -> Result<PreparedParty, PartyError> {
 fn prepare_role(fields: &PartyRoleFields) -> Result<String, PartyError> {
     let role = fields.role.trim().to_ascii_lowercase();
     if !SUPPORTED_PARTY_ROLES.contains(&role.as_str()) {
-        // The schema names 'customer' as the other half of the closed set, but the Customer
-        // workflow — sales, receivables, loyalty — is a later phase, so it is refused here.
-        return Err(validation(
-            "role",
-            "must be supplier; the customer role arrives with the sales phase",
-        ));
+        return Err(validation("role", "must be supplier or customer"));
     }
     Ok(role)
 }
@@ -1865,34 +1860,38 @@ mod tests {
         assert_eq!(sibling["normalizedPan"], "AAPFU0939F");
     }
 
+    /// Phase 1E refused the customer role and this test locked that in. Phase 1H serves sales, so a
+    /// party may now be a customer — a deliberate feature expansion, rewritten here rather than
+    /// deleted so the change reads as intentional.
     #[tokio::test]
-    async fn the_customer_role_is_named_by_the_schema_but_refused_by_this_phase() {
+    async fn a_party_may_now_hold_the_customer_role_without_weakening_supplier_rules() {
         let f = fixture().await;
         let mut body = supplier();
         body["roles"] = json!([{ "role": "customer" }]);
-        let (status, error) = create(&f.pool, body).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-        assert_eq!(error["issues"][0]["field"], "role");
-        assert!(
-            error["issues"][0]["message"]
-                .as_str()
-                .unwrap()
-                .contains("supplier")
-        );
+        let (status, created) = create(&f.pool, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["roles"][0]["role"], "customer");
+        assert_eq!(created["roles"][0]["status"], "active");
 
-        // The schema does name it, so the later phase needs no migration for the word itself.
-        let (_, created) = create(&f.pool, supplier()).await;
-        let party_id = created["id"].as_str().unwrap();
-        let direct = sqlx::query(
-            "INSERT INTO party_roles (id,party_id,role,created_at_utc,updated_at_utc) \
-             VALUES (?,?,'customer',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
-             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        // A party may hold both roles at once: the same business can sell to us and buy from us.
+        let party_id = created["id"].as_str().unwrap().to_owned();
+        let (status, added) = request_json(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/parties/{party_id}/roles"),
+            json!({ "role": "supplier" }),
         )
-        .bind(Uuid::now_v7().to_string())
-        .bind(party_id)
-        .execute(&f.pool)
         .await;
-        assert!(direct.is_ok(), "the schema must already accept the word");
+        assert_eq!(status, StatusCode::CREATED, "{added}");
+
+        // The closed set is still closed: widening it admitted exactly one more word, not any word.
+        let mut invented = supplier();
+        invented["party"]["gstin"] = json!(null);
+        invented["party"]["gstRegistrationStatus"] = json!("unregistered");
+        invented["roles"] = json!([{ "role": "distributor" }]);
+        let (status, refused) = create(&f.pool, invented).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["issues"][0]["field"], "role");
     }
 
     #[tokio::test]

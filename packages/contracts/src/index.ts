@@ -657,11 +657,11 @@ export type UpdateProductTaxClassificationRequest = z.infer<
  * a balance is always derived by summing movements and is never stored anywhere.
  */
 /**
- * `purchase` is written only by posting a purchase document, never by the movement endpoint, but it
- * must be listed here: the ledger returns it like any other movement, and an enum that omits it
- * fails to parse the whole page.
+ * `purchase` and `sale` are written only by posting their own documents, never by the movement
+ * endpoint, but both must be listed here: the ledger returns them like any other movement, and an
+ * enum that omits one fails to parse the whole page.
  */
-export const MovementTypeSchema = z.enum(["opening_stock", "adjustment", "purchase"]);
+export const MovementTypeSchema = z.enum(["opening_stock", "adjustment", "purchase", "sale"]);
 
 export const PostMovementRequestSchema = z.object({
   idempotencyKey: z.string(),
@@ -687,6 +687,8 @@ export const InventoryMovementSchema = z.object({
   reversesMovementId: z.string().nullable(),
   /** The purchase line that caused this inward, when one did. */
   purchaseLineId: z.string().nullable(),
+  /** The sale line that caused this outward, when one did. */
+  saleLineId: z.string().nullable(),
   idempotencyKey: z.string(),
   postedByUserId: z.string(),
   postedAtUtc: z.string()
@@ -1036,6 +1038,276 @@ export type PurchaseDetail = z.infer<typeof PurchaseDetailSchema>;
 export type PurchaseDraftInput = z.infer<typeof PurchaseDraftInputSchema>;
 export type PurchaseLineInput = z.infer<typeof PurchaseLineInputSchema>;
 export type PurchaseErrorCode = z.infer<typeof PurchaseErrorCodeSchema>;
+
+/**
+ * Phase 1H sales / POS outward.
+ *
+ * The same discipline as Phase 1G: a draft carries only commercial intent, and every tax figure,
+ * every snapshot, the invoice number, the inventory atoms, the Store and the actor are derived by
+ * the Store Service. The input schemas below deliberately cannot express any of them.
+ */
+export const SaleStatusSchema = z.enum(["draft", "posted"]);
+export const SaleTaxTreatmentSchema = z.enum(["intra_state", "inter_state"]);
+export const SaleLineTaxKindSchema = z.enum(["taxable", "exempt", "nil_rated", "non_gst"]);
+export const TenderMethodSchema = z.enum(["cash", "card", "upi"]);
+
+/**
+ * What a line's quantity and rate are counted in.
+ *
+ * `pack` is a whole-pack count at a rate per pack; `base_unit` is a count of base-unit atoms at a
+ * rate per atom. There is deliberately no decimal pack quantity: three tablets out of a strip of ten
+ * is `base_unit` with three atoms, not `0.3` of a pack.
+ */
+export const QuantityBasisSchema = z.enum(["pack", "base_unit"]);
+
+// A posted line snapshots its price-control assessment using the Phase 1H-0 vocabulary above:
+// `PriceControlStatusSchema` and `CeilingBasisSchema` are reused rather than restated, so the two
+// phases can never drift apart on what 'unknown' or 'per_base_unit' means.
+
+/** Server-owned header facts. Everything below `revision` is null until the sale is posted. */
+export const SaleSchema = z.object({
+  id: z.string(),
+  storeId: z.string(),
+  /** Null means a walk-in. There is deliberately no shared "Cash Customer" party row. */
+  customerPartyId: z.string().nullable(),
+  customerNameText: z.string().nullable(),
+  businessDate: z.string(),
+  status: SaleStatusSchema,
+  revision: z.number().int().positive(),
+  /** The invoice number the store itself issues, allocated at posting and never before. */
+  seriesCode: z.string().nullable(),
+  financialYear: z.string().nullable(),
+  sequenceValue: z.number().int().positive().nullable(),
+  documentNumber: z.string().nullable(),
+  storeGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  storeNormalizedGstin: z.string().nullable(),
+  storePlaceOfSupplyStateId: z.string().nullable(),
+  storeStateCode: z.string().nullable(),
+  customerDisplayName: z.string().nullable(),
+  customerGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  customerNormalizedGstin: z.string().nullable(),
+  customerStateCode: z.string().nullable(),
+  taxTreatment: SaleTaxTreatmentSchema.nullable(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  grandTotalPaise: z.number().int(),
+  createdByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  postedByUserId: z.string().nullable(),
+  postedAtUtc: z.string().nullable()
+});
+
+/**
+ * A line as the server returns it.
+ *
+ * `quantityAtoms` is derived from the basis and the frozen Pack model; the browser never supplies
+ * atoms. `taxableValuePaise` is present on a draft (it is an exact integer product), but every tax
+ * and snapshot field stays zero or null until posting resolves them.
+ */
+export const SaleLineSchema = z.object({
+  id: z.string(),
+  saleDocumentId: z.string(),
+  lineNumber: z.number().int().positive(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  quantityBasis: QuantityBasisSchema,
+  /** Present only for the `pack` basis, matching the schema's own CHECK. */
+  quantityPacks: z.number().int().positive().nullable(),
+  quantityAtoms: z.number().int().positive(),
+  sellingRatePaise: z.number().int(),
+  productDisplayName: z.string().nullable(),
+  packDisplayLabel: z.string().nullable(),
+  baseUnitLabel: z.string().nullable(),
+  batchNumber: z.string().nullable(),
+  batchExpiresOn: z.string().nullable(),
+  batchMrpPaise: z.number().int().nullable(),
+  hsnCodeId: z.string().nullable(),
+  hsnCode: z.string().nullable(),
+  taxCategoryId: z.string().nullable(),
+  taxTreatmentKind: SaleLineTaxKindSchema.nullable(),
+  taxRateVersionId: z.string().nullable(),
+  cgstBasisPoints: z.number().int(),
+  sgstBasisPoints: z.number().int(),
+  igstBasisPoints: z.number().int(),
+  cessBasisPoints: z.number().int(),
+  priceControlStatus: PriceControlStatusSchema.nullable(),
+  controlledFormulationId: z.string().nullable(),
+  priceControlVersionId: z.string().nullable(),
+  ceilingPricePaise: z.number().int().nullable(),
+  ceilingBasis: CeilingBasisSchema.nullable(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int(),
+  /**
+   * What the catalogue calls these things right now.
+   *
+   * The snapshot fields above are null until posting freezes them, because a snapshot is what was
+   * true when the invoice was issued and a draft has issued nothing. These are read live so a
+   * counter can read its own bill while building it, and are never written anywhere.
+   */
+  currentProductDisplayName: z.string().nullable(),
+  currentPackDisplayLabel: z.string().nullable(),
+  currentBaseUnitLabel: z.string().nullable(),
+  currentBatchNumber: z.string().nullable()
+});
+
+/** Operational evidence of payment. No cash ledger, no settlement, no receivable. */
+export const SaleTenderSchema = z.object({
+  id: z.string(),
+  saleDocumentId: z.string(),
+  method: TenderMethodSchema,
+  amountPaise: z.number().int().positive(),
+  referenceText: z.string().nullable()
+});
+
+export const SaleDetailSchema = SaleSchema.extend({
+  lines: z.array(SaleLineSchema).default([]),
+  tenders: z.array(SaleTenderSchema).default([])
+});
+
+/** The only header facts a browser may supply. */
+export const SaleDraftInputSchema = z.object({
+  customerPartyId: z.string().nullable().optional(),
+  customerNameText: z.string().nullable().optional(),
+  businessDate: z.string()
+});
+
+export const UpdateSaleDraftRequestSchema = SaleDraftInputSchema.extend({
+  expectedRevision: z.number().int().positive()
+});
+
+/**
+ * The only line facts a browser may supply.
+ *
+ * One `quantity` field, read in the basis named beside it, because a second field would let the two
+ * disagree about what was sold.
+ */
+export const SaleLineInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  quantityBasis: QuantityBasisSchema,
+  quantity: z.number().int().positive(),
+  sellingRatePaise: z.number().int().nonnegative()
+});
+
+export const TenderInputSchema = z.object({
+  method: TenderMethodSchema,
+  amountPaise: z.number().int().positive(),
+  referenceText: z.string().nullable().optional()
+});
+
+export const PostSaleRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string(),
+  tenders: z.array(TenderInputSchema).min(1)
+});
+
+/**
+ * A lot the counter may choose from, with what the ledger says is left and whether it has expired.
+ * Expired lots are returned and marked rather than hidden, so the operator can see why a lot they
+ * expected to use is unavailable.
+ */
+export const SellableBatchSchema = z.object({
+  id: z.string(),
+  productPackId: z.string(),
+  batchNumber: z.string(),
+  expiresOn: z.string().nullable(),
+  mrpPaise: z.number().int().nullable(),
+  availableAtoms: z.number().int(),
+  expired: z.boolean()
+});
+
+/**
+ * What a draft would come to if it were posted now.
+ *
+ * A quote, never a commitment: the Store Service resolves it with the same code posting uses, but
+ * allocates no number, freezes no snapshot and moves no stock. It exists so the counter can say the
+ * amount before taking money — and so a price the posting would refuse is discovered while the
+ * customer is still standing there.
+ */
+export const SaleQuoteLineSchema = z.object({
+  id: z.string(),
+  lineNumber: z.number().int().positive(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int()
+});
+
+export const SaleQuoteSchema = z.object({
+  saleDocumentId: z.string(),
+  revision: z.number().int().positive(),
+  taxTreatment: SaleTaxTreatmentSchema,
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  grandTotalPaise: z.number().int(),
+  lines: z.array(SaleQuoteLineSchema).default([])
+});
+
+/** Every code the sale API can return, mirroring `api::sales::SaleError`. */
+export const SaleErrorCodeSchema = z.enum([
+  "validation_failed",
+  "sale_not_found",
+  "sale_not_draft",
+  "revision_conflict",
+  "customer_not_eligible",
+  "store_tax_profile_incomplete",
+  "product_tax_classification_incomplete",
+  "tax_rate_not_found",
+  "product_pack_mismatch",
+  "pack_not_sellable",
+  "batch_pack_mismatch",
+  "batch_expired",
+  "fractional_sale_not_allowed",
+  "quantity_increment_violation",
+  "insufficient_stock",
+  "selling_rate_above_mrp",
+  "selling_rate_above_ceiling",
+  "price_control_unresolved",
+  "price_control_incomparable",
+  "tender_mismatch",
+  "arithmetic_overflow",
+  "idempotency_conflict",
+  "posting_conflict",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied",
+  "service_busy",
+  "internal_error"
+]);
+
+export type SaleStatus = z.infer<typeof SaleStatusSchema>;
+export type SaleTaxTreatment = z.infer<typeof SaleTaxTreatmentSchema>;
+export type SaleLineTaxKind = z.infer<typeof SaleLineTaxKindSchema>;
+export type QuantityBasis = z.infer<typeof QuantityBasisSchema>;
+export type TenderMethod = z.infer<typeof TenderMethodSchema>;
+export type Sale = z.infer<typeof SaleSchema>;
+export type SaleLine = z.infer<typeof SaleLineSchema>;
+export type SaleTender = z.infer<typeof SaleTenderSchema>;
+export type SaleDetail = z.infer<typeof SaleDetailSchema>;
+export type SaleDraftInput = z.infer<typeof SaleDraftInputSchema>;
+export type SaleLineInput = z.infer<typeof SaleLineInputSchema>;
+export type TenderInput = z.infer<typeof TenderInputSchema>;
+export type SellableBatch = z.infer<typeof SellableBatchSchema>;
+export type SaleQuote = z.infer<typeof SaleQuoteSchema>;
+export type SaleQuoteLine = z.infer<typeof SaleQuoteLineSchema>;
+export type SaleErrorCode = z.infer<typeof SaleErrorCodeSchema>;
+
 
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
 

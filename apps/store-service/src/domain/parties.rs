@@ -10,8 +10,12 @@ use crate::domain::catalog::CatalogValidationIssue;
 const GSTIN_CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 pub const PARTY_ROLES: [&str; 2] = ["supplier", "customer"];
-/// The roles this phase actually administers. Customer is schema-visible but not yet serviceable.
-pub const SUPPORTED_PARTY_ROLES: [&str; 1] = ["supplier"];
+/// The roles this phase actually administers.
+///
+/// Phase 1H deliberately widened this from supplier-only: a sale may name a customer, so the
+/// customer role became serviceable. Widening it does **not** relax supplier eligibility — a
+/// purchase still requires an active supplier role, and a sale an active customer role.
+pub const SUPPORTED_PARTY_ROLES: [&str; 2] = ["supplier", "customer"];
 pub const ADDRESS_ROLES: [&str; 2] = ["billing", "shipping"];
 pub const GST_REGISTRATION_STATUSES: [&str; 3] = ["registered", "unregistered", "unknown"];
 
@@ -293,9 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_supplier_role_is_serviceable_in_this_phase() {
+    fn both_party_roles_are_serviceable_since_the_sales_phase() {
+        // Phase 1E deliberately refused the customer role and this test locked that in. Phase 1H
+        // changes it deliberately, as a feature expansion, so the widening can never be mistaken
+        // for an accidental loosening.
         assert!(PARTY_ROLES.contains(&"customer"));
-        assert!(!SUPPORTED_PARTY_ROLES.contains(&"customer"));
+        assert!(SUPPORTED_PARTY_ROLES.contains(&"customer"));
+        // Supplier eligibility is untouched: enabling one role must not make the other optional.
         assert!(SUPPORTED_PARTY_ROLES.contains(&"supplier"));
+        assert_eq!(SUPPORTED_PARTY_ROLES.len(), PARTY_ROLES.len());
     }
 }
