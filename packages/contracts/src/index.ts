@@ -764,6 +764,35 @@ export type UpdatePartyRequest = z.infer<typeof UpdatePartyRequestSchema>;
 export type PartyErrorResponse = z.infer<typeof PartyErrorResponseSchema>;
 export type StateCodeAttributes = z.infer<typeof StateCodeAttributesSchema>;
 
+/**
+ * Phase 1G-0 store tax identity.
+ *
+ * The Store's own GST registration and place of supply — the half of the tax-treatment comparison
+ * that Phase 1E supplied for the supplier. `complete` is true once a place of supply exists, which
+ * is the single fact a GST-aware document needs; an unregistered store can still be complete.
+ */
+export const StoreTaxIdentitySchema = z.object({
+  storeId: z.string(),
+  displayName: z.string(),
+  revision: z.number().int().positive(),
+  gstRegistrationStatus: GstRegistrationStatusSchema,
+  gstin: z.string().nullable(),
+  normalizedGstin: z.string().nullable(),
+  placeOfSupplyStateId: z.string().nullable(),
+  complete: z.boolean()
+});
+
+export const UpdateStoreTaxIdentityRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  gstRegistrationStatus: GstRegistrationStatusSchema,
+  gstin: z.string().nullable(),
+  placeOfSupplyStateId: z.string().nullable(),
+  reason: z.string().nullable().optional()
+});
+
+export type StoreTaxIdentity = z.infer<typeof StoreTaxIdentitySchema>;
+export type UpdateStoreTaxIdentityRequest = z.infer<typeof UpdateStoreTaxIdentityRequestSchema>;
+
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);
 
 export const SafeUserSchema = z.object({

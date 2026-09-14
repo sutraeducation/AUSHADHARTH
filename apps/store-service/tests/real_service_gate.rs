@@ -665,3 +665,138 @@ async fn real_service_classifies_a_product_and_resolves_its_rate_by_date_over_ht
     assert!(columns.iter().any(|column| column == "tax_category_id"));
     pool.close().await;
 }
+
+/// The Store's own tax identity across the real boundary — the Purchase prerequisite.
+///
+/// Proves the half of the tax-treatment comparison that Phase 1E left missing now exists, is
+/// validated by the same GSTIN rules a supplier gets, and is enforced by real SQLite.
+#[tokio::test]
+async fn real_service_records_the_store_place_of_supply_over_http() {
+    let service = start().await;
+    let setup = call(
+        &service,
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({
+            "storeDisplayName": "Integration Pharmacy",
+            "ownerDisplayName": "Integration Owner",
+            "loginIdentifier": "integration.owner",
+            "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, 201, "{:?}", setup.body);
+    let cookie = session_cookie(&setup.headers);
+
+    let maharashtra = "01997300-0000-7000-8000-000000000027";
+    let karnataka = "01997300-0000-7000-8000-000000000029";
+    let gstin = "27AAPFU0939F1ZV";
+    let uri = "/api/v1/store/tax-identity";
+
+    // An unauthenticated caller is refused by the real auth layer.
+    let anonymous = call(&service, "GET", uri, None, None).await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body["code"], "authentication_required");
+
+    // A fresh installation has no place of supply, which is exactly what blocks a GST document.
+    let initial = call(&service, "GET", uri, None, Some(&cookie)).await;
+    assert_eq!(initial.status, 200, "{:?}", initial.body);
+    assert_eq!(initial.body["complete"], false);
+    assert_eq!(initial.body["placeOfSupplyStateId"], Value::Null);
+    assert_eq!(initial.body["revision"], 1);
+
+    let update = |revision: i64, status: &str, gstin: Option<&str>, state: Option<&str>| {
+        json!({
+            "expectedRevision": revision,
+            "gstRegistrationStatus": status,
+            "gstin": gstin,
+            "placeOfSupplyStateId": state
+        })
+    };
+
+    // A mistyped GSTIN is caught by the shared party validator's check digit.
+    let bad = call(
+        &service,
+        "PUT",
+        uri,
+        Some(update(
+            1,
+            "registered",
+            Some("27AAPFU0939F1ZX"),
+            Some(maharashtra),
+        )),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(bad.status, 422, "{:?}", bad.body);
+    assert_eq!(bad.body["issues"][0]["field"], "gstin");
+
+    // A Maharashtra GSTIN cannot claim a Karnataka place of supply.
+    let mismatched = call(
+        &service,
+        "PUT",
+        uri,
+        Some(update(1, "registered", Some(gstin), Some(karnataka))),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(mismatched.status, 409, "{:?}", mismatched.body);
+    assert_eq!(mismatched.body["code"], "store_tax_conflict");
+
+    let saved = call(
+        &service,
+        "PUT",
+        uri,
+        Some(update(1, "registered", Some(gstin), Some(maharashtra))),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "{:?}", saved.body);
+    assert_eq!(saved.body["complete"], true);
+    assert_eq!(saved.body["normalizedGstin"], gstin);
+    assert_eq!(saved.body["revision"], 2);
+
+    // It survives a round trip through the socket.
+    let read_back = call(&service, "GET", uri, None, Some(&cookie)).await;
+    assert_eq!(read_back.body["placeOfSupplyStateId"], maharashtra);
+    assert_eq!(read_back.body["complete"], true);
+
+    // A stale revision cannot overwrite it.
+    let stale = call(
+        &service,
+        "PUT",
+        uri,
+        Some(update(1, "unknown", None, None)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert_eq!(stale.body["code"], "revision_conflict");
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+
+    // Real SQLite enforces the GSTIN/State agreement independently of the service.
+    let direct = sqlx::query(
+        "UPDATE store_identity SET gst_registration_status='registered',gstin=?,normalized_gstin=?,\
+         place_of_supply_state_id=?",
+    )
+    .bind(gstin)
+    .bind(gstin)
+    .bind(karnataka)
+    .execute(&pool)
+    .await;
+    assert!(direct.is_err(), "the trigger must reject a state mismatch");
+
+    // The audit recorded the change under the frozen append-only stream.
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM master_change_events WHERE entity_type='store_tax_identity'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count audit rows");
+    assert_eq!(audited, 1, "the refused attempts must not have audited");
+    pool.close().await;
+}
