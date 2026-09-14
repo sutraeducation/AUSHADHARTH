@@ -2539,7 +2539,7 @@ async fn real_service_posts_a_gst_sale_and_issues_stock_over_http() {
     .await;
     assert_eq!(detail.status, 200, "{:?}", detail.body);
     assert_eq!(detail.body["status"], "posted");
-    assert_eq!(detail.body["documentNumber"], "INV/2026-27/000001");
+    assert_eq!(detail.body["documentNumber"], "INV/2627/000001");
     assert_eq!(detail.body["seriesCode"], "INV");
     assert_eq!(detail.body["financialYear"], "2026-27");
     assert_eq!(detail.body["sequenceValue"], 1);
@@ -2786,12 +2786,12 @@ async fn real_service_keeps_the_invoice_series_dense_under_replay_and_failure_ov
     assert_eq!(line.status, 201, "{:?}", line.body);
     let posted = post_sale(&service, &world, &sale_id, 2, key, 8_960).await;
     assert_eq!(posted.status, 200, "{:?}", posted.body);
-    assert_eq!(posted.body["documentNumber"], "INV/2026-27/000001");
+    assert_eq!(posted.body["documentNumber"], "INV/2627/000001");
 
     // The counter's network dropped and the operator pressed Post again.
     let replay = post_sale(&service, &world, &sale_id, 2, key, 8_960).await;
     assert_eq!(replay.status, 200, "{:?}", replay.body);
-    assert_eq!(replay.body["documentNumber"], "INV/2026-27/000001");
+    assert_eq!(replay.body["documentNumber"], "INV/2627/000001");
     assert_eq!(replay.body["revision"], posted.body["revision"]);
 
     // The same key on a different sale: refused after it has already allocated a number, rewritten
@@ -2853,7 +2853,7 @@ async fn real_service_keeps_the_invoice_series_dense_under_replay_and_failure_ov
     .await;
     assert_eq!(next.status, 200, "{:?}", next.body);
     assert_eq!(
-        next.body["documentNumber"], "INV/2026-27/000002",
+        next.body["documentNumber"], "INV/2627/000002",
         "a refused posting must consume no number"
     );
 }

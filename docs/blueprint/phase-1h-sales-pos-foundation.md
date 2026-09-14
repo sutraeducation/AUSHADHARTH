@@ -102,9 +102,18 @@ and issuing it wrongly is a compliance failure. All seven attributes are frozen 
 3. **Numbering period:** Indian financial year, 1 April – 31 March, derived **from the sale's business
    date** (§8), never from the clock: `month >= 4 → "YYYY-(YY+1)"`, else `"(YYYY-1)-YY"`. Stored on
    the document as a literal so it can never be recomputed differently later.
-4. **Prefix:** a `series_code` per store (default `INV`), stored on the series row, snapshotted onto
-   the document. Display form `{prefix}/{financial_year}/{zero-padded sequence}`, e.g.
-   `INV/2026-27/000148`.
+4. **Prefix and statutory length:** a `series_code` per store (default `INV`), stored on the series
+   row and snapshotted onto the document. Rendered form `{prefix}/{compact financial year}/{zero-padded
+   sequence}`, e.g. `INV/2627/000148` — **fifteen characters**.
+
+   **Rule 46(b) of the CGST Rules caps a tax invoice serial at sixteen characters**, and Rule 53(1A)(c)
+   caps a credit or debit note at the same. The form first shipped in Phase 1H, `INV/2026-27/000148`,
+   was eighteen and therefore non-conforming; Phase 1H-C1 corrected it before any real invoice was
+   issued. The **stored** financial year is unchanged and is still the full business fact `2026-27` on
+   both the series row and the document — only the rendered serial is compact, because the full form
+   does not fit. `domain::sales::document_serial` is the single renderer and **refuses** rather than
+   issues a serial that would breach the limit: an invoice number is permanent once issued, and a
+   non-conforming one cannot be put right by re-issuing it.
 5. **Reset behaviour:** the sequence restarts at 1 for each new `(store, series, financial_year)`
    scope — a new scope row is created on first use inside the posting transaction.
 6. **Uniqueness:** a unique index on `(store_id, series_code, financial_year, sequence_value)` and a

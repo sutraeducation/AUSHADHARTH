@@ -1668,8 +1668,14 @@ async fn allocate_document_number(
         return Err(SaleError::ServiceBusy);
     }
 
+    // Rendered by the domain, never here, and refused rather than issued if it would breach the
+    // sixteen-character statutory limit. An invoice number is permanent once issued: a
+    // non-conforming one cannot be put right by re-issuing it.
+    let document_number = sales::document_serial(SALE_SERIES_CODE, &financial_year, sequence_value)
+        .ok_or(SaleError::Internal)?;
+
     Ok(AllocatedNumber {
-        document_number: format!("{SALE_SERIES_CODE}/{financial_year}/{sequence_value:06}"),
+        document_number,
         series_code: SALE_SERIES_CODE.to_owned(),
         financial_year,
         sequence_value,
@@ -3057,7 +3063,7 @@ mod tests {
             post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 17920).await;
         assert_eq!(status, StatusCode::OK, "{posted}");
         assert_eq!(posted["status"], "posted");
-        assert_eq!(posted["documentNumber"], "INV/2026-27/000001");
+        assert_eq!(posted["documentNumber"], "INV/2627/000001");
         assert_eq!(posted["sequenceValue"], 1);
         assert_eq!(posted["taxTreatment"], "intra_state");
         assert_eq!(posted["taxableValuePaise"], 16000);
@@ -3124,7 +3130,7 @@ mod tests {
     #[tokio::test]
     async fn the_series_advances_by_one_and_restarts_each_financial_year() {
         let f = fixture().await;
-        for expected in ["INV/2026-27/000001", "INV/2026-27/000002"] {
+        for expected in ["INV/2627/000001", "INV/2627/000002"] {
             let id = draft_with_line(&f, "pack", 1, 8000).await;
             let (status, posted) =
                 post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
@@ -3150,7 +3156,7 @@ mod tests {
         let (status, posted) =
             post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
         assert_eq!(status, StatusCode::OK, "{posted}");
-        assert_eq!(posted["documentNumber"], "INV/2027-28/000001");
+        assert_eq!(posted["documentNumber"], "INV/2728/000001");
     }
 
     /// A posting that fails AFTER it has allocated a number, rewritten every line and inserted the
@@ -3166,7 +3172,7 @@ mod tests {
         let first = draft_with_line(&f, "pack", 1, 8000).await;
         let (status, posted) = post_sale_request(&f, &first, 2, &key, 8960).await;
         assert_eq!(status, StatusCode::OK, "{posted}");
-        assert_eq!(posted["documentNumber"], "INV/2026-27/000001");
+        assert_eq!(posted["documentNumber"], "INV/2627/000001");
         assert_eq!(balance(&f, &f.batch_id).await, 90);
 
         let second = draft_with_line(&f, "pack", 3, 8000).await;
@@ -3206,7 +3212,7 @@ mod tests {
         let (status, posted) =
             post_sale_request(&f, &third, 2, &Uuid::now_v7().to_string(), 8960).await;
         assert_eq!(status, StatusCode::OK, "{posted}");
-        assert_eq!(posted["documentNumber"], "INV/2026-27/000002");
+        assert_eq!(posted["documentNumber"], "INV/2627/000002");
     }
 
     /// A retry after a successful post — the counter's network dropped, the operator pressed Post
@@ -3708,7 +3714,7 @@ mod tests {
             two.1["documentNumber"].as_str().unwrap().to_owned(),
         ];
         numbers.sort();
-        assert_eq!(numbers, ["INV/2026-27/000001", "INV/2026-27/000002"]);
+        assert_eq!(numbers, ["INV/2627/000001", "INV/2627/000002"]);
         let next_value: i64 = sqlx::query_scalar(
             "SELECT next_value FROM document_number_series WHERE series_code='INV'",
         )

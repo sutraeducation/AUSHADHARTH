@@ -288,6 +288,65 @@ pub fn indian_financial_year(business_date: &str) -> Option<String> {
     Some(format!("{starting_year:04}-{:02}", ending_year % 100))
 }
 
+/// The longest a statutory document serial may be.
+///
+/// Rule 46(b) of the CGST Rules requires a tax invoice to carry "a consecutive serial number **not
+/// exceeding sixteen characters**, in one or multiple series, containing alphabets or numerals or
+/// special characters-hyphen or dash and slash symbolised as `-` and `/` respectively, and any
+/// combination thereof, unique for a financial year". Rule 53(1A)(c) imposes the identical limit on
+/// a credit or debit note under section 34.
+///
+/// This is a statutory limit, not a house style.
+pub const MAX_DOCUMENT_SERIAL_LENGTH: usize = 16;
+
+/// The compact financial-year component of a document serial: `2026-27` becomes `2627`.
+///
+/// The stored business fact stays `2026-27` — on the series row and on the posted document — because
+/// that is what a financial year *is*. Only the rendered serial is compacted, and only because the
+/// full form does not fit inside sixteen characters beside a series code and a sequence.
+///
+/// A value that is not already in the frozen `YYYY-YY` shape yields `None` rather than a guess: this
+/// function never invents a year, it only shortens one the caller already established.
+pub fn compact_financial_year(financial_year: &str) -> Option<String> {
+    let bytes = financial_year.as_bytes();
+    if bytes.len() != 7 || bytes[4] != b'-' {
+        return None;
+    }
+    if !financial_year
+        .chars()
+        .enumerate()
+        .all(|(index, character)| index == 4 || character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        &financial_year[2..4],
+        &financial_year[5..7]
+    ))
+}
+
+/// Renders the statutory serial for a numbered document.
+///
+/// `INV` + `2627` + a six-digit sequence gives `INV/2627/000001` — fifteen characters, one inside the
+/// limit, and still able to express 999 999 documents in a financial year.
+///
+/// Returns `None` rather than an over-long string if the parts cannot fit. A serial that breaches
+/// Rule 46(b) must never reach a document: once issued, an invoice number is permanent, and a
+/// non-conforming one cannot be corrected by re-issuing it.
+pub fn document_serial(
+    series_code: &str,
+    financial_year: &str,
+    sequence_value: i64,
+) -> Option<String> {
+    if series_code.is_empty() || sequence_value < 1 {
+        return None;
+    }
+    let compact = compact_financial_year(financial_year)?;
+    let serial = format!("{series_code}/{compact}/{sequence_value:06}");
+    (serial.len() <= MAX_DOCUMENT_SERIAL_LENGTH).then_some(serial)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +777,74 @@ mod tests {
         assert!(indian_financial_year("2026-13-01").is_none());
         assert!(indian_financial_year("2026-02-30").is_none());
         assert!(indian_financial_year("").is_none());
+    }
+
+    /// Rule 46(b) caps a tax invoice serial at sixteen characters, and Rule 53(1A)(c) caps a credit
+    /// or debit note at the same. The first shipped format, `INV/2026-27/000001`, was eighteen.
+    ///
+    /// The financial year the database stores is unchanged and is still the full business fact; only
+    /// the rendered serial is compact, and only because the full form does not fit.
+    #[test]
+    fn a_document_serial_fits_inside_the_statutory_sixteen_characters() {
+        let serial = document_serial("INV", "2026-27", 1).expect("a serial");
+        assert_eq!(serial, "INV/2627/000001");
+        assert_eq!(serial.len(), 15);
+        assert!(serial.len() <= MAX_DOCUMENT_SERIAL_LENGTH);
+
+        // The whole six-digit range still fits, so the limit costs no capacity.
+        let last = document_serial("INV", "2026-27", 999_999).expect("a serial");
+        assert_eq!(last, "INV/2627/999999");
+        assert!(last.len() <= MAX_DOCUMENT_SERIAL_LENGTH);
+    }
+
+    /// The compact component is a rendering of the stored year, never a recomputation of it.
+    #[test]
+    fn the_compact_financial_year_shortens_rather_than_reinvents() {
+        assert_eq!(compact_financial_year("2026-27").as_deref(), Some("2627"));
+        assert_eq!(compact_financial_year("2027-28").as_deref(), Some("2728"));
+        // The century boundary the year helper already produces.
+        assert_eq!(compact_financial_year("2099-00").as_deref(), Some("9900"));
+
+        // Anything not already in the frozen YYYY-YY shape is refused rather than guessed at.
+        for bad in ["2026-2027", "26-27", "2026/27", "", "20A6-27", "2026-2"] {
+            assert!(
+                compact_financial_year(bad).is_none(),
+                "{bad} must not yield a compact year"
+            );
+        }
+    }
+
+    /// The year the business stores and the year the serial renders must agree, across the boundary
+    /// that opens a new series.
+    #[test]
+    fn the_serial_follows_the_financial_year_the_business_date_falls_in() {
+        for (date, expected) in [
+            ("2026-03-31", "INV/2526/000001"),
+            ("2026-04-01", "INV/2627/000001"),
+            ("2027-03-31", "INV/2627/000001"),
+            ("2027-04-01", "INV/2728/000001"),
+        ] {
+            let year = indian_financial_year(date).expect("a financial year");
+            let serial = document_serial("INV", &year, 1).expect("a serial");
+            assert_eq!(serial, expected, "{date}");
+            assert!(serial.len() <= MAX_DOCUMENT_SERIAL_LENGTH, "{date}");
+        }
+    }
+
+    /// A serial that cannot be rendered inside the limit is refused, not truncated and not issued.
+    /// An invoice number is permanent: a non-conforming one cannot be put right afterwards.
+    #[test]
+    fn a_serial_that_would_breach_the_limit_is_refused_rather_than_issued() {
+        // Eight characters of series leaves no room for `/2627/000001`.
+        assert!(document_serial("VERYLONGSERIES", "2026-27", 1).is_none());
+        // A series code right at the edge still renders.
+        assert_eq!(
+            document_serial("INVOI", "2026-27", 1).as_deref(),
+            Some("INVOI/2627/000001").filter(|serial| serial.len() <= MAX_DOCUMENT_SERIAL_LENGTH)
+        );
+        // Nonsense inputs yield nothing rather than a malformed serial.
+        assert!(document_serial("", "2026-27", 1).is_none());
+        assert!(document_serial("INV", "2026-27", 0).is_none());
+        assert!(document_serial("INV", "not-a-year", 1).is_none());
     }
 }

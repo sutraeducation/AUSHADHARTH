@@ -78,7 +78,7 @@ function sale(overrides: Partial<SaleDetail> = {}): SaleDetail {
 function postedSale(overrides: Partial<SaleDetail> = {}): SaleDetail {
   return sale({
     id: IDs.posted, status: "posted", revision: 3,
-    seriesCode: "INV", financialYear: "2026-27", sequenceValue: 1, documentNumber: "INV/2026-27/000001",
+    seriesCode: "INV", financialYear: "2026-27", sequenceValue: 1, documentNumber: "INV/2627/000001",
     storeGstRegistrationStatus: "registered", storeNormalizedGstin: "27AAACX0000A1Z9", storeStateCode: "27",
     taxTreatment: "intra_state", taxableValuePaise: 16_000, cgstPaise: 960, sgstPaise: 960,
     grandTotalPaise: 17_920, postedByUserId: IDs.user, postedAtUtc: "2026-09-12T06:30:00Z",
@@ -322,7 +322,7 @@ describe("Sales list", () => {
   it("lists invoices and marks a draft as unposted", async () => {
     renderApp("/app/sales", saleService({ documents: [sale(), postedSale()] }));
     expect(await screen.findByRole("heading", { name: "Sales", level: 1 })).toBeInTheDocument();
-    expect(await screen.findByRole("link", { name: "INV/2026-27/000001" })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "INV/2627/000001" })).toBeInTheDocument();
     const rows = screen.getAllByRole("row");
     expect(rows.some((row) => within(row).queryByText("Not posted"))).toBe(true);
     expect(screen.getByText("179.20")).toBeInTheDocument();
@@ -659,7 +659,7 @@ describe("Point of sale", () => {
 describe("Posted invoice", () => {
   it("shows the issued number, the resolved tax and the tender", async () => {
     renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale()] }));
-    expect(await screen.findByRole("heading", { name: "INV/2026-27/000001", level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeInTheDocument();
     expect(screen.getByText("2026-27")).toBeInTheDocument();
     expect(screen.getByText("CGST + SGST (same State)")).toBeInTheDocument();
     expect(screen.getByText("Paid by Cash · 179.20")).toBeInTheDocument();
@@ -671,7 +671,7 @@ describe("Posted invoice", () => {
 
   it("offers no way to edit a posted invoice", async () => {
     renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale()] }));
-    await screen.findByRole("heading", { name: "INV/2026-27/000001", level: 1 });
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
     expect(screen.queryByRole("button", { name: /post/i })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Product or barcode")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
@@ -681,7 +681,7 @@ describe("Posted invoice", () => {
     renderApp(`/app/sales/${IDs.posted}`, saleService({
       documents: [postedSale({ lines: [line({ saleDocumentId: IDs.posted, priceControlStatus: "controlled", ceilingPricePaise: 900, ceilingBasis: "per_base_unit", lineTotalPaise: 17_920 })] })]
     }));
-    await screen.findByRole("heading", { name: "INV/2026-27/000001", level: 1 });
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
     expect(screen.getByText(/notified ceiling in force on the sale date was checked/)).toBeInTheDocument();
   });
 });

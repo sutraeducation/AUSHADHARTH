@@ -183,7 +183,7 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
       if (Number(tender.amountPaise) !== totals.total) return deny("tender_mismatch", 409);
       const posted = {
         ...document, status: "posted", revision: document.revision + 1,
-        seriesCode: "INV", financialYear: "2026-27", sequenceValue: 1, documentNumber: "INV/2026-27/000001",
+        seriesCode: "INV", financialYear: "2026-27", sequenceValue: 1, documentNumber: "INV/2627/000001",
         storeGstRegistrationStatus: "registered", storeNormalizedGstin: "27AAACX0000A1Z9", storeStateCode: "27",
         taxTreatment: "intra_state", taxableValuePaise: totals.taxable, cgstPaise: totals.cgst,
         sgstPaise: totals.sgst, igstPaise: 0, cessPaise: 0, grandTotalPaise: totals.total,
@@ -328,7 +328,7 @@ test.describe("Phase 1H point of sale", () => {
     await expect(page.getByRole("button", { name: "Take 179.20 and post" })).toBeVisible();
 
     await page.getByRole("button", { name: "Take 179.20 and post" }).click();
-    await expect(page.getByRole("heading", { name: "INV/2026-27/000001", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeVisible();
     await expect(page.getByText("Paid by Cash · 179.20")).toBeVisible();
     await expect(page.getByText("CGST + SGST (same State)")).toBeVisible();
 
@@ -373,7 +373,7 @@ test.describe("Phase 1H point of sale", () => {
     await expect(summary.locator(".totals-grand dd")).toHaveText("4,928.00");
 
     await page.getByRole("button", { name: "Take 4,928.00 and post" }).click();
-    await expect(page.getByRole("heading", { name: "INV/2026-27/000001", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeVisible();
   });
 
   test("sells loose tablets and labels every field in the unit being sold", async ({ page }) => {
@@ -472,7 +472,7 @@ test.describe("Phase 1H point of sale", () => {
     await expect(page.getByRole("button", { name: "Take 89.60 and post" })).toBeVisible();
 
     await page.getByRole("button", { name: "Take 89.60 and post" }).click({ clickCount: 3, delay: 0 });
-    await expect(page.getByRole("heading", { name: "INV/2026-27/000001", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeVisible();
 
     expect(state.writes.filter((write) => write.path.endsWith("/post"))).toHaveLength(1);
   });
@@ -509,7 +509,7 @@ test.describe("Phase 1H point of sale", () => {
     await page.goto(`/app/sales/${IDs.sale}`);
     await typeLine(page, { name: "Crocin 500 mg Tablet", packId: IDs.pack, batchId: IDs.batch, quantity: "1", rate: "80" });
     await page.getByRole("button", { name: "Take 89.60 and post" }).click();
-    await expect(page.getByRole("heading", { name: "INV/2026-27/000001", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeVisible();
 
     await expect(page.getByLabel("Product or barcode")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Remove" })).toHaveCount(0);
