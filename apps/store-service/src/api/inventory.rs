@@ -190,6 +190,12 @@ struct MovementResponse {
     /// The sale line that caused this outward, for the same reason: an issue with no way back to
     /// the invoice that explains it is not an auditable ledger.
     sale_line_id: Option<String>,
+    /// The return line that caused this compensating movement.
+    return_line_id: Option<String>,
+    /// The disposition transfer that moved this quantity between stock statuses.
+    stock_disposition_id: Option<String>,
+    /// Which stock this movement belongs to.
+    stock_status: String,
     idempotency_key: String,
     posted_by_user_id: String,
     posted_at_utc: String,
@@ -202,6 +208,9 @@ struct StockBalanceResponse {
     product_id: String,
     product_pack_id: String,
     batch_id: Option<String>,
+    /// Which stock this balance is. Quarantined and non-sellable quantity is real and must be
+    /// visible, but it must never be added to what the counter can sell.
+    stock_status: String,
     balance_atoms: i64,
 }
 
@@ -269,12 +278,13 @@ async fn list_stock(
     let pack_filter = optional_uuid(query.pack_id, "packId")?;
     // A balance is a sum of movements. Nothing is read from a stored quantity, because none exists.
     let rows = sqlx::query_as::<_, StockBalanceResponse>(
-        "SELECT product_id,product_pack_id,batch_id,SUM(quantity_delta_atoms) AS balance_atoms \
+        "SELECT product_id,product_pack_id,batch_id,stock_status,\
+         SUM(quantity_delta_atoms) AS balance_atoms \
          FROM inventory_movements \
          WHERE store_id=?1 AND (?2 IS NULL OR product_id=?2) AND (?3 IS NULL OR product_pack_id=?3) \
-         GROUP BY product_id,product_pack_id,batch_id \
+         GROUP BY product_id,product_pack_id,batch_id,stock_status \
          HAVING SUM(quantity_delta_atoms) <> 0 \
-         ORDER BY product_id,product_pack_id,batch_id",
+         ORDER BY product_id,product_pack_id,batch_id,stock_status",
     )
     .bind(&store_id)
     .bind(&product_filter)
@@ -427,9 +437,11 @@ async fn post_within_transaction(
     // Negative resulting stock is prohibited in this foundation. The balance is read under the write
     // lock taken above, so this check cannot race another posting.
     if request.quantity_delta_atoms < 0 {
+        // A hand-posted movement is sellable stock, so it is the sellable balance it may not
+        // drive negative. Quarantined quantity is moved by a disposition transfer, not by this.
         let available: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(quantity_delta_atoms),0) FROM inventory_movements \
-             WHERE store_id=? AND product_pack_id=? AND batch_id IS ?",
+             WHERE store_id=? AND product_pack_id=? AND batch_id IS ? AND stock_status='sellable'",
         )
         .bind(store_id)
         .bind(&request.product_pack_id)
@@ -545,7 +557,7 @@ fn optional_uuid(value: Option<String>, field: &str) -> Result<Option<String>, I
 }
 
 const MOVEMENT_COLUMNS: &str = "id,store_id,product_id,product_pack_id,batch_id,movement_type,quantity_delta_atoms,\
-     occurred_on,reason,reverses_movement_id,purchase_line_id,sale_line_id,idempotency_key,posted_by_user_id,     posted_at_utc";
+     occurred_on,reason,reverses_movement_id,purchase_line_id,sale_line_id,return_line_id,stock_disposition_id,stock_status,idempotency_key,posted_by_user_id,posted_at_utc";
 
 async fn fetch_movement(pool: &SqlitePool, id: &str) -> Result<MovementResponse, InventoryError> {
     sqlx::query_as::<_, MovementResponse>(&format!(

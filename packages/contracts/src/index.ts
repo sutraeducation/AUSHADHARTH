@@ -661,7 +661,13 @@ export type UpdateProductTaxClassificationRequest = z.infer<
  * endpoint, but both must be listed here: the ledger returns them like any other movement, and an
  * enum that omits one fails to parse the whole page.
  */
-export const MovementTypeSchema = z.enum(["opening_stock", "adjustment", "purchase", "sale"]);
+/** Which stock a quantity is: what the counter may sell, versus what is merely in the building. */
+export const StockStatusSchema = z.enum(["sellable", "quarantined", "non_sellable"]);
+
+export const MovementTypeSchema = z.enum([
+  "opening_stock", "adjustment", "purchase", "sale",
+  "sales_return", "purchase_return", "disposition_transfer"
+]);
 
 export const PostMovementRequestSchema = z.object({
   idempotencyKey: z.string(),
@@ -689,6 +695,12 @@ export const InventoryMovementSchema = z.object({
   purchaseLineId: z.string().nullable(),
   /** The sale line that caused this outward, when one did. */
   saleLineId: z.string().nullable(),
+  /** The return line that caused this compensating movement, when one did. */
+  returnLineId: z.string().nullable(),
+  /** The disposition transfer that moved this quantity between stock statuses, when one did. */
+  stockDispositionId: z.string().nullable(),
+  /** Which stock this movement belongs to. The counter may only sell `sellable`. */
+  stockStatus: StockStatusSchema,
   idempotencyKey: z.string(),
   postedByUserId: z.string(),
   postedAtUtc: z.string()
@@ -698,6 +710,8 @@ export const StockBalanceSchema = z.object({
   productId: z.string(),
   productPackId: z.string(),
   batchId: z.string().nullable(),
+  /** Balances are reported per status, never merged: unavailable stock is not sellable stock. */
+  stockStatus: StockStatusSchema,
   balanceAtoms: z.number().int()
 });
 
@@ -1307,6 +1321,288 @@ export type SellableBatch = z.infer<typeof SellableBatchSchema>;
 export type SaleQuote = z.infer<typeof SaleQuoteSchema>;
 export type SaleQuoteLine = z.infer<typeof SaleQuoteLineSchema>;
 export type SaleErrorCode = z.infer<typeof SaleErrorCodeSchema>;
+
+/**
+ * Phase 1I returns.
+ *
+ * Three concepts stay separate here exactly as they do in the schema, because merging them would
+ * encode a legal claim the software is not entitled to make:
+ *
+ * - the **commercial return** — what part of the original is reversed;
+ * - the **GST evidence** — what tax document the law attaches to it;
+ * - the **stock disposition** — what physical state the goods enter.
+ *
+ * Note what this vocabulary deliberately does NOT contain: a `debit_note` kind. CGST s.34(3) gives
+ * the debit note to "the registered person, who has supplied" — the supplier — so a pharmacy
+ * returning goods never issues one. Its document is a Purchase Return carrying a GST route.
+ */
+export const ReturnKindSchema = z.enum(["sales_return", "purchase_return"]);
+export const ReturnStatusSchema = z.enum(["draft", "posted"]);
+
+/**
+ * Where returned goods go. `sellable` is deliberately absent: a commercial return may never create
+ * sellable stock, because Indian drug law gives a retailer no rule permitting resale of a medicine a
+ * customer brought back. Releasing quarantined stock is a separate, separately-authorised transfer.
+ */
+export const ReturnDispositionSchema = z.enum(["quarantined", "non_sellable"]);
+
+/**
+ * Whether the credit note this return evidences may reduce output tax liability.
+ *
+ * Recorded, never inferred. Section 34(2) makes the answer depend on facts the software does not
+ * hold — whether a registered recipient reversed the attributable input tax credit, and whether the
+ * incidence of tax was passed on — so the operator asserts it and a later GST phase audits it.
+ */
+export const TaxAdjustmentStatusSchema = z.enum(["tax_adjustable", "commercial_only"]);
+
+/** Circular 72/46/2018-GST gives a returning retailer two routes, and this is which one was used. */
+export const GstRouteSchema = z.enum(["fresh_supply", "supplier_credit_note"]);
+
+export const ReturnSchema = z.object({
+  id: z.string(),
+  storeId: z.string(),
+  returnKind: ReturnKindSchema,
+  originalSaleDocumentId: z.string().nullable(),
+  originalPurchaseDocumentId: z.string().nullable(),
+  originalDocumentNumber: z.string().nullable(),
+  originalDocumentDate: z.string().nullable(),
+  businessDate: z.string(),
+  status: ReturnStatusSchema,
+  revision: z.number().int().positive(),
+  seriesCode: z.string().nullable(),
+  financialYear: z.string().nullable(),
+  sequenceValue: z.number().int().positive().nullable(),
+  documentNumber: z.string().nullable(),
+  storeGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  storeNormalizedGstin: z.string().nullable(),
+  storePlaceOfSupplyStateId: z.string().nullable(),
+  storeStateCode: z.string().nullable(),
+  counterpartyPartyId: z.string().nullable(),
+  counterpartyDisplayName: z.string().nullable(),
+  counterpartyGstRegistrationStatus: GstRegistrationStatusSchema.nullable(),
+  counterpartyNormalizedGstin: z.string().nullable(),
+  counterpartyStateCode: z.string().nullable(),
+  taxTreatment: SaleTaxTreatmentSchema.nullable(),
+  taxAdjustmentStatus: TaxAdjustmentStatusSchema.nullable(),
+  taxAdjustmentReason: z.string().nullable(),
+  gstRoute: GstRouteSchema.nullable(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  grandTotalPaise: z.number().int(),
+  createdByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  postedByUserId: z.string().nullable(),
+  postedAtUtc: z.string().nullable()
+});
+
+/**
+ * A return line. Every commercial and tax fact is copied from the original line it reverses, so a
+ * reversal stays equal and opposite even if a rate, a price or a product name changed since.
+ */
+export const ReturnLineSchema = z.object({
+  id: z.string(),
+  returnDocumentId: z.string(),
+  lineNumber: z.number().int().positive(),
+  originalSaleLineId: z.string().nullable(),
+  originalPurchaseLineId: z.string().nullable(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  quantityBasis: QuantityBasisSchema,
+  quantityPacks: z.number().int().positive().nullable(),
+  quantityAtoms: z.number().int().positive(),
+  disposition: ReturnDispositionSchema.nullable(),
+  productDisplayName: z.string().nullable(),
+  packDisplayLabel: z.string().nullable(),
+  baseUnitLabel: z.string().nullable(),
+  batchNumber: z.string().nullable(),
+  batchExpiresOn: z.string().nullable(),
+  hsnCodeId: z.string().nullable(),
+  hsnCode: z.string().nullable(),
+  taxCategoryId: z.string().nullable(),
+  taxTreatmentKind: SaleLineTaxKindSchema.nullable(),
+  taxRateVersionId: z.string().nullable(),
+  cgstBasisPoints: z.number().int(),
+  sgstBasisPoints: z.number().int(),
+  igstBasisPoints: z.number().int(),
+  cessBasisPoints: z.number().int(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int()
+});
+
+/** Evidence of the credit note the supplier issued — never our own tax document. */
+export const SupplierCreditNoteSchema = z.object({
+  id: z.string(),
+  returnDocumentId: z.string(),
+  creditNoteNumber: z.string(),
+  creditNoteDate: z.string(),
+  creditNoteAmountPaise: z.number().int(),
+  recordedAtUtc: z.string()
+});
+
+export const ReturnDetailSchema = ReturnSchema.extend({
+  lines: z.array(ReturnLineSchema).default([]),
+  supplierCreditNotes: z.array(SupplierCreditNoteSchema).default([])
+});
+
+/** One original line and what is left of it. */
+export const ReturnableLineSchema = z.object({
+  originalLineId: z.string(),
+  lineNumber: z.number().int().positive(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  productDisplayName: z.string().nullable(),
+  packDisplayLabel: z.string().nullable(),
+  baseUnitLabel: z.string().nullable(),
+  batchNumber: z.string().nullable(),
+  batchExpiresOn: z.string().nullable(),
+  quantityBasis: QuantityBasisSchema,
+  originalQuantity: z.number().int(),
+  originalQuantityAtoms: z.number().int(),
+  alreadyReturnedAtoms: z.number().int(),
+  returnableAtoms: z.number().int(),
+  returnableQuantity: z.number().int(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int()
+});
+
+export const ReturnableDocumentSchema = z.object({
+  documentId: z.string(),
+  documentNumber: z.string().nullable(),
+  documentDate: z.string(),
+  counterpartyDisplayName: z.string().nullable(),
+  lines: z.array(ReturnableLineSchema).default([])
+});
+
+export const ReturnQuoteSchema = z.object({
+  returnDocumentId: z.string(),
+  revision: z.number().int().positive(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  grandTotalPaise: z.number().int()
+});
+
+/** The only facts a browser may supply when starting a return. */
+export const CreateReturnInputSchema = z.object({
+  returnKind: ReturnKindSchema,
+  originalDocumentId: z.string(),
+  businessDate: z.string()
+});
+
+/**
+ * The only line facts a browser may supply: which original line, how much of it, and — for goods
+ * coming back from a customer — where they were put.
+ */
+export const ReturnLineInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  originalLineId: z.string(),
+  quantity: z.number().int().positive(),
+  disposition: ReturnDispositionSchema.nullable().optional()
+});
+
+export const PostReturnRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string(),
+  taxAdjustmentStatus: TaxAdjustmentStatusSchema.nullable().optional(),
+  taxAdjustmentReason: z.string().nullable().optional(),
+  gstRoute: GstRouteSchema.nullable().optional()
+});
+
+export const StockDispositionInputSchema = z.object({
+  idempotencyKey: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  quantityAtoms: z.number().int().positive(),
+  fromStatus: z.literal("quarantined"),
+  toStatus: z.enum(["sellable", "non_sellable"]),
+  reason: z.string(),
+  occurredOn: z.string()
+});
+
+export const StockDispositionSchema = z.object({
+  id: z.string(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string(),
+  quantityAtoms: z.number().int(),
+  fromStatus: z.string(),
+  toStatus: z.string(),
+  reason: z.string(),
+  occurredOn: z.string()
+});
+
+export const SupplierCreditNoteInputSchema = z.object({
+  creditNoteNumber: z.string(),
+  creditNoteDate: z.string(),
+  creditNoteAmountPaise: z.number().int().nonnegative()
+});
+
+/** Every code the returns API can return, mirroring `api::returns::ReturnError`. */
+export const ReturnErrorCodeSchema = z.enum([
+  "validation_failed",
+  "return_not_found",
+  "return_not_draft",
+  "revision_conflict",
+  "original_document_not_found",
+  "original_document_not_posted",
+  "original_line_mismatch",
+  "over_return",
+  "insufficient_stock",
+  "disposition_required",
+  "disposition_not_allowed",
+  "disposition_denied",
+  "gst_route_required",
+  "gst_route_not_allowed",
+  "tax_adjustment_status_required",
+  "tax_adjustment_status_not_allowed",
+  "supplier_credit_note_route_conflict",
+  "duplicate_supplier_credit_note",
+  "arithmetic_overflow",
+  "idempotency_conflict",
+  "posting_conflict",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied",
+  "service_busy",
+  "internal_error"
+]);
+
+export type ReturnKind = z.infer<typeof ReturnKindSchema>;
+export type ReturnStatus = z.infer<typeof ReturnStatusSchema>;
+export type ReturnDisposition = z.infer<typeof ReturnDispositionSchema>;
+export type TaxAdjustmentStatus = z.infer<typeof TaxAdjustmentStatusSchema>;
+export type GstRoute = z.infer<typeof GstRouteSchema>;
+export type StockStatus = z.infer<typeof StockStatusSchema>;
+export type ReturnDocument = z.infer<typeof ReturnSchema>;
+export type ReturnLine = z.infer<typeof ReturnLineSchema>;
+export type ReturnDetail = z.infer<typeof ReturnDetailSchema>;
+export type SupplierCreditNote = z.infer<typeof SupplierCreditNoteSchema>;
+export type ReturnableLine = z.infer<typeof ReturnableLineSchema>;
+export type ReturnableDocument = z.infer<typeof ReturnableDocumentSchema>;
+export type ReturnQuote = z.infer<typeof ReturnQuoteSchema>;
+export type CreateReturnInput = z.infer<typeof CreateReturnInputSchema>;
+export type ReturnLineInput = z.infer<typeof ReturnLineInputSchema>;
+export type StockDispositionInput = z.infer<typeof StockDispositionInputSchema>;
+export type StockDisposition = z.infer<typeof StockDispositionSchema>;
+export type SupplierCreditNoteInput = z.infer<typeof SupplierCreditNoteInputSchema>;
+export type ReturnErrorCode = z.infer<typeof ReturnErrorCodeSchema>;
+
 
 
 export const UserRoleSchema = z.enum(["owner_admin", "pharmacist", "cashier"]);

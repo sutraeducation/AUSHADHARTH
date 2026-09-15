@@ -17,3 +17,8 @@ retained and linked from its replacement rather than silently rewritten.
 | 010 | Security and privacy baseline |
 | 011 | Local authentication and opaque cookie sessions |
 | 012 | Authenticated reference administration and server-derived audit actors |
+| 013 | Real-service integration testing |
+| 014 | Party identity and tax registration |
+| 015 | Product tax classification |
+| 016 | Commercial and tax rounding |
+| 017 | Returns, credit notes, and the status of returned stock |

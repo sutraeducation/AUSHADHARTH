@@ -575,6 +575,9 @@ function PostDialog({ draft, onClose, onPosted }: {
  */
 function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; readOnlyRole: boolean }) {
   const draft = purchase.status === "draft";
+  // Sending goods back to a supplier is the owner’s commercial decision, so only the owner is
+  // offered the door into it.
+  const canReturn = !readOnlyRole;
   /**
    * A draft has no supplier snapshot — that is written at posting — so its name must come from the
    * current party record. Falling through to the raw party id put a UUID on the screen where the
@@ -599,7 +602,10 @@ function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; re
         <h1>{purchase.supplierInvoiceNumber}</h1>
         <p>{shownSupplier} · Invoice dated {purchase.invoiceDate}</p>
       </div>
-      <span className="read-only-note">{draft ? "Read-only access" : "Posted · read-only"}</span>
+      <div className="page-header__actions">
+        {!draft && canReturn && <Link className="button button--secondary" to={`/app/purchases/${purchase.id}/return`}>Return Items</Link>}
+        <span className="read-only-note">{draft ? "Read-only access" : "Posted · read-only"}</span>
+      </div>
     </header>
 
     {draft && readOnlyRole && <div className="panel-callout" role="status"><strong>This purchase is still a draft</strong><small>Nothing has entered stock and no GST has been recorded. Only an Owner/Admin can change or post it.</small></div>}

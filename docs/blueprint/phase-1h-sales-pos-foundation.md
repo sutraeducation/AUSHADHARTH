@@ -703,8 +703,13 @@ rows; immutable document number and financial year; append-only audit events.
 
 Not implemented. The architecture must never require mutating an original sale: a future Sales Return
 is a **separate compensating document** referencing the original sale and its lines, producing its own
-**positive** inventory movements and its own credit-note number from its own series. Posted-sale
+**positive** inventory movements and its own number from its own series. Posted-sale
 immutability is what makes that possible, which is why it is enforced from day one.
+
+> **Implemented in Phase 1I**, which supersedes this paragraph in one respect: the words above call
+> the return's number a *credit-note* number. Under CGST s.34 a credit note is issued by the person
+> who supplied, and whether a sales return is one at all is a question this software does not decide.
+> See ADR-017 and `docs/blueprint/phase-1i-returns-foundation.md`.
 
 ## 38. Future compatibility and formal freeze criteria
 

@@ -13,6 +13,7 @@ pub mod parties;
 pub mod product_catalog;
 pub mod purchases;
 pub mod reference_masters;
+pub mod returns;
 pub mod sales;
 pub mod store_profile;
 
@@ -52,6 +53,7 @@ pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
         .merge(store_profile::routes())
         .merge(purchases::routes())
         .merge(sales::routes())
+        .merge(returns::routes())
         .with_state(reference_masters::ReferenceState { pool });
 
     if let Some(dist) = web_dist {

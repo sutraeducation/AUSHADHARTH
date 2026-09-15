@@ -1085,7 +1085,7 @@ async fn list_sellable_batches(
         "SELECT batch.id,batch.product_pack_id,batch.batch_number,batch.expires_on,batch.mrp_paise,\
          COALESCE((SELECT SUM(quantity_delta_atoms) FROM inventory_movements \
                    WHERE store_id=?1 AND product_pack_id=batch.product_pack_id \
-                     AND batch_id=batch.id),0) AS available_atoms,\
+                     AND batch_id=batch.id AND stock_status='sellable'),0) AS available_atoms,\
          (batch.expires_on IS NOT NULL AND batch.expires_on < ?2) AS expired \
          FROM product_batches batch \
          WHERE batch.product_pack_id=?3 AND batch.status='active' \
@@ -1427,9 +1427,11 @@ async fn post_within_transaction(
         }
     }
     for (pack_id, batch_id, atoms) in &required {
+        // Sellable only: goods sitting in quarantine after a customer returned them are in the
+        // building, but they are not the counter's to sell until a pharmacist releases them.
         let available: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(quantity_delta_atoms),0) FROM inventory_movements \
-             WHERE store_id=? AND product_pack_id=? AND batch_id IS ?",
+             WHERE store_id=? AND product_pack_id=? AND batch_id IS ? AND stock_status='sellable'",
         )
         .bind(&store_id)
         .bind(pack_id)

@@ -3132,3 +3132,532 @@ async fn real_service_lets_a_cashier_sell_but_refuses_a_hand_written_outward_ove
     assert_eq!(minted.status, 422, "{:?}", minted.body);
     assert_eq!(minted.body["issues"][0]["field"], "movementType");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1I — returns
+// ---------------------------------------------------------------------------------------------
+
+/// Everything a return needs, built over real HTTP: a posted purchase that created the stock, and a
+/// posted sale that took some of it out again.
+struct ReturnWorld {
+    cookie: String,
+    sale_id: String,
+    sale_line_id: String,
+    purchase_id: String,
+    purchase_line_id: String,
+    pack: String,
+    batch: String,
+}
+
+async fn seed_return_world(service: &Service) -> ReturnWorld {
+    let world = seed_sale_world(service, 1).await;
+
+    // One sale of two strips at 80.00: 160.00 taxable, 9.60 each side, 179.20 in all.
+    let sale_id = sale_draft(service, &world, Some(&world.customer)).await;
+    let with_line = sale_line(service, &world, &sale_id, 1, "pack", 2, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let posted = post_sale(
+        service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000f9",
+        17_920,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let sale_line_id = posted.body["lines"][0]["id"]
+        .as_str()
+        .expect("sale line")
+        .to_owned();
+
+    // The purchase that stocked the shelf is the one the seed already posted.
+    let purchases = call(
+        service,
+        "GET",
+        "/api/v1/purchases",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(purchases.status, 200, "{:?}", purchases.body);
+    let purchase_id = purchases.body[0]["id"]
+        .as_str()
+        .expect("purchase id")
+        .to_owned();
+    let purchase = call(
+        service,
+        "GET",
+        &format!("/api/v1/purchases/{purchase_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(purchase.status, 200, "{:?}", purchase.body);
+    let purchase_line_id = purchase.body["lines"][0]["id"]
+        .as_str()
+        .expect("purchase line")
+        .to_owned();
+
+    ReturnWorld {
+        cookie: world.cookie,
+        sale_id,
+        sale_line_id,
+        purchase_id,
+        purchase_line_id,
+        pack: world.pack,
+        batch: world.batch,
+    }
+}
+
+async fn sellable_atoms(service: &Service, world: &ReturnWorld) -> i64 {
+    let batches = call(
+        service,
+        "GET",
+        &format!(
+            "/api/v1/packs/{}/sellable-batches?asOf={SALE_DATE}",
+            world.pack
+        ),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(batches.status, 200, "{:?}", batches.body);
+    batches
+        .body
+        .as_array()
+        .expect("batches")
+        .iter()
+        .find(|row| row["id"] == world.batch.as_str())
+        .and_then(|row| row["availableAtoms"].as_i64())
+        .expect("a sellable balance")
+}
+
+/// A sale corrected by a compensating document, across a real socket: the invoice is reversed to the
+/// paisa, a credit-note number is issued from its own series, and the goods come back into
+/// quarantine rather than onto the shelf.
+#[tokio::test]
+async fn real_service_returns_goods_from_a_sale_into_quarantine_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    // 100 atoms received, 20 sold.
+    assert_eq!(sellable_atoms(&service, &world).await, 80);
+
+    let returnable = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{}/returnable-lines", world.sale_id),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(returnable.status, 200, "{:?}", returnable.body);
+    assert_eq!(returnable.body["documentNumber"], "INV/2627/000001");
+    assert_eq!(returnable.body["lines"][0]["returnableQuantity"], 2);
+    assert_eq!(returnable.body["lines"][0]["alreadyReturnedAtoms"], 0);
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "sales_return",
+            "originalDocumentId": world.sale_id,
+            "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let return_id = draft.body["id"].as_str().expect("return id").to_owned();
+
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.sale_line_id,
+            "quantity": 1,
+            "disposition": "quarantined"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    // Half the line: 80.00 taxable, 4.80 each side, 89.60 in all.
+    assert_eq!(with_line.body["lines"][0]["taxableValuePaise"], 8_000);
+    assert_eq!(with_line.body["lines"][0]["lineTotalPaise"], 8_960);
+
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/returns/{return_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    assert_eq!(quote.body["grandTotalPaise"], 8_960);
+
+    let posted = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/post"),
+        Some(json!({
+            "expectedRevision": 2,
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000fa01",
+            "taxAdjustmentStatus": "commercial_only",
+            "taxAdjustmentReason": "Tax was passed on to the customer"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["documentNumber"], "SR/2627/000001");
+    assert_eq!(posted.body["originalDocumentNumber"], "INV/2627/000001");
+    assert_eq!(posted.body["taxTreatment"], "intra_state");
+    assert_eq!(posted.body["taxAdjustmentStatus"], "commercial_only");
+    assert_eq!(posted.body["grandTotalPaise"], 8_960);
+    assert!(
+        posted.body["documentNumber"].as_str().unwrap().len() <= 16,
+        "the serial must fit the statutory sixteen characters"
+    );
+
+    // The goods are back in the building and NOT on the shelf.
+    assert_eq!(
+        sellable_atoms(&service, &world).await,
+        80,
+        "a return must not create sellable stock"
+    );
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(movements.status, 200, "{:?}", movements.body);
+    let quarantined: Vec<&Value> = movements
+        .body
+        .as_array()
+        .expect("movements")
+        .iter()
+        .filter(|row| row["movementType"] == "sales_return")
+        .collect();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0]["quantityDeltaAtoms"], 10);
+    assert_eq!(quarantined[0]["stockStatus"], "quarantined");
+    assert_eq!(
+        quarantined[0]["returnLineId"],
+        posted.body["lines"][0]["id"]
+    );
+
+    // Stock Overview separates the two rather than merging them into one misleading figure.
+    let stock = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.status, 200, "{:?}", stock.body);
+    let rows = stock.body.as_array().expect("balances");
+    let sellable = rows
+        .iter()
+        .find(|row| row["stockStatus"] == "sellable")
+        .expect("a sellable row");
+    let quarantine = rows
+        .iter()
+        .find(|row| row["stockStatus"] == "quarantined")
+        .expect("a quarantined row");
+    assert_eq!(sellable["balanceAtoms"], 80);
+    assert_eq!(quarantine["balanceAtoms"], 10);
+
+    // A pharmacist releases half of it, and only then does the counter see it.
+    let released = call(
+        &service,
+        "POST",
+        "/api/v1/stock-dispositions",
+        Some(json!({
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000fa02",
+            "productPackId": world.pack,
+            "batchId": world.batch,
+            "quantityAtoms": 4,
+            "fromStatus": "quarantined",
+            "toStatus": "sellable",
+            "reason": "Sealed strip, inspected and found fit for sale",
+            "occurredOn": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(released.status, 201, "{:?}", released.body);
+    assert_eq!(sellable_atoms(&service, &world).await, 84);
+}
+
+/// Goods going back to a supplier, across a real socket — and the proof that the original invoice
+/// having bought them is not proof they are still there.
+#[tokio::test]
+async fn real_service_returns_goods_to_a_supplier_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    assert_eq!(sellable_atoms(&service, &world).await, 80);
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "purchase_return",
+            "originalDocumentId": world.purchase_id,
+            "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let return_id = draft.body["id"].as_str().expect("return id").to_owned();
+
+    // Ten strips were bought and two were sold, so ten cannot go back.
+    let greedy = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.purchase_line_id,
+            "quantity": 10
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(greedy.status, 201, "{:?}", greedy.body);
+    let refused = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/post"),
+        Some(json!({
+            "expectedRevision": 2,
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000fb01",
+            "gstRoute": "supplier_credit_note"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "insufficient_stock");
+    assert_eq!(refused.body["availableAtoms"], 80);
+    assert_eq!(
+        sellable_atoms(&service, &world).await,
+        80,
+        "a refused return moves nothing"
+    );
+
+    // Eight strips is what remains, and goes back.
+    let ok_draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "purchase_return",
+            "originalDocumentId": world.purchase_id,
+            "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(ok_draft.status, 201, "{:?}", ok_draft.body);
+    let ok_id = ok_draft.body["id"].as_str().expect("return id").to_owned();
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{ok_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.purchase_line_id,
+            "quantity": 8
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+
+    let posted = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{ok_id}/post"),
+        Some(json!({
+            "expectedRevision": 2,
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000fb02",
+            "gstRoute": "supplier_credit_note"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    // Its own series, and never called a debit note.
+    assert_eq!(posted.body["documentNumber"], "PR/2627/000001");
+    assert_eq!(posted.body["returnKind"], "purchase_return");
+    assert_eq!(posted.body["gstRoute"], "supplier_credit_note");
+    assert_eq!(posted.body["taxAdjustmentStatus"], Value::Null);
+    // Eight of ten strips at 60.00: 480.00 taxable, 28.80 each side, 537.60 in all.
+    assert_eq!(posted.body["taxableValuePaise"], 48_000);
+    assert_eq!(posted.body["grandTotalPaise"], 53_760);
+    assert_eq!(sellable_atoms(&service, &world).await, 0);
+
+    // The supplier's credit note arrives later and is recorded without touching the posted return.
+    let evidence = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{ok_id}/supplier-credit-notes"),
+        Some(json!({
+            "creditNoteNumber": "SUPP-CN-4471",
+            "creditNoteDate": "2026-09-20",
+            "creditNoteAmountPaise": 53_760
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(evidence.status, 201, "{:?}", evidence.body);
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/returns/{ok_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    assert_eq!(
+        detail.body["supplierCreditNotes"][0]["creditNoteNumber"],
+        "SUPP-CN-4471"
+    );
+    assert_eq!(detail.body["grandTotalPaise"], 53_760);
+}
+
+/// Everything a return can be refused for, over real HTTP, each with a typed and safe code.
+#[tokio::test]
+async fn real_service_refuses_ineligible_returns_with_safe_codes_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "sales_return",
+            "originalDocumentId": world.sale_id,
+            "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let return_id = draft.body["id"].as_str().expect("return id").to_owned();
+
+    // More than was ever sold.
+    let over = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.sale_line_id,
+            "quantity": 3,
+            "disposition": "quarantined"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(over.status, 409, "{:?}", over.body);
+    assert_eq!(over.body["code"], "over_return");
+    assert_eq!(over.body["returnableAtoms"], 20);
+
+    // Goods coming back must say where they went, and can never say they are sellable.
+    let silent = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.sale_line_id,
+            "quantity": 1
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(silent.status, 409, "{:?}", silent.body);
+    assert_eq!(silent.body["code"], "disposition_required");
+
+    let sellable = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.sale_line_id,
+            "quantity": 1,
+            "disposition": "sellable"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(sellable.status, 422, "{:?}", sellable.body);
+    assert_eq!(sellable.body["issues"][0]["field"], "disposition");
+
+    // A line from another document cannot be attached to this one.
+    let stranger = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.purchase_line_id,
+            "quantity": 1,
+            "disposition": "quarantined"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stranger.status, 409, "{:?}", stranger.body);
+    assert_eq!(stranger.body["code"], "original_line_mismatch");
+
+    // And a sales return must state its tax character rather than have it guessed.
+    let good = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": world.sale_line_id,
+            "quantity": 1,
+            "disposition": "quarantined"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(good.status, 201, "{:?}", good.body);
+    let silent_tax = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/post"),
+        Some(json!({
+            "expectedRevision": 2,
+            "idempotencyKey": "01997a00-0000-7000-8000-00000000fc01"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(silent_tax.status, 409, "{:?}", silent_tax.body);
+    assert_eq!(silent_tax.body["code"], "tax_adjustment_status_required");
+
+    assert_eq!(
+        sellable_atoms(&service, &world).await,
+        80,
+        "no refusal moved any stock"
+    );
+}

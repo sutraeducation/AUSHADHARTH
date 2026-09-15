@@ -23,10 +23,10 @@ async function mockInventoryService(page: Page, options: { role?: "owner_admin" 
   const balances = () => {
     const totals = new Map<string, Record<string, unknown>>();
     for (const movement of state.movements) {
-      const key = `${movement.productPackId}|${movement.batchId ?? ""}`;
+      const key = `${movement.productPackId}|${movement.batchId ?? ""}|${movement.stockStatus}`;
       const existing = totals.get(key);
       if (existing) (existing.balanceAtoms as number) += movement.quantityDeltaAtoms as number;
-      else totals.set(key, { productId: movement.productId, productPackId: movement.productPackId, batchId: movement.batchId, balanceAtoms: movement.quantityDeltaAtoms });
+      else totals.set(key, { productId: movement.productId, productPackId: movement.productPackId, batchId: movement.batchId, stockStatus: movement.stockStatus, balanceAtoms: movement.quantityDeltaAtoms });
     }
     return [...totals.values()].filter((row) => row.balanceAtoms !== 0);
   };
@@ -48,7 +48,7 @@ async function mockInventoryService(page: Page, options: { role?: "owner_admin" 
       // A replayed key returns the stored movement rather than duplicating stock.
       const replay = state.keys.get(String(body.idempotencyKey));
       if (replay) return route.fulfill({ json: replay });
-      const movement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, saleLineId: null, idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
+      const movement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, saleLineId: null, returnLineId: null, stockDispositionId: null, stockStatus: "sellable", idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
       state.movements.push(movement);
       state.keys.set(String(body.idempotencyKey), movement);
       return route.fulfill({ status: 201, json: movement });

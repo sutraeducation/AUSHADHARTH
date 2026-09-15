@@ -433,3 +433,12 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
   .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "customer"; }
   .pos-summary { position: static; }
 }
+
+/* Phase 1I returns. A stock status is a fact the reader must not have to decode, so each one is
+   named in words and coloured by what it means for selling. */
+.stock-status { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .64rem; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
+.stock-status--sellable { color: var(--primary-900); background: var(--primary-100); }
+.stock-status--quarantined { color: #8a5a00; background: #fdf1d8; }
+.stock-status--non_sellable { color: var(--danger-700); background: var(--danger-100); }
+/* Several actions can sit beside a page title without crowding it at a phone width. */
+.page-header__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
