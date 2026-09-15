@@ -42,6 +42,10 @@ export function PriceControlSection({ product, canMutate }: { product: ProductDe
   const queryClient = useQueryClient();
   // This PC's calendar date, for the same reason Phase 1F uses it: the service falls back to UTC,
   // which is a day behind in India for the first hours of every business day.
+  //
+  // It is what this browser ASKS about. What the panel then states is the `asOf` the service
+  // answered with, which is the date the ceiling was actually resolved against — the browser's
+  // clock is a request, never the fact on the screen.
   const asOf = businessToday();
   const control = useQuery({
     queryKey: ["product-price-control", product.id, asOf],
@@ -85,7 +89,7 @@ export function PriceControlSection({ product, canMutate }: { product: ProductDe
         </div>}
 
         {control.data.priceControlStatus === "controlled" && !control.data.applicableCeiling && <div className="panel-callout" role="alert">
-          <strong>No ceiling is in force on {asOf}</strong>
+          <strong>No ceiling is in force on {control.data.asOf}</strong>
           <small>This product is marked price-controlled, but its formulation has no effective ceiling version covering today. A future sale must refuse rather than treat the product as unconstrained. Add the notified version under Reference Data · Medicine Price Control.</small>
         </div>}
 
@@ -95,7 +99,7 @@ export function PriceControlSection({ product, canMutate }: { product: ProductDe
         </div>}
 
         <p className="panel-note">
-          The ceiling is resolved for {asOf} and belongs to the formulation's version history, never to this product.
+          The ceiling is resolved for {control.data.asOf} and belongs to the formulation's version history, never to this product.
           A notified ceiling is exclusive of GST; a batch's MRP is the printed price including it. The two are different facts and are never compared with each other.
         </p>
       </>}
