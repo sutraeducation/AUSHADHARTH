@@ -194,6 +194,7 @@ struct MovementResponse {
     return_line_id: Option<String>,
     /// The disposition transfer that moved this quantity between stock statuses.
     stock_disposition_id: Option<String>,
+    stock_operation_line_id: Option<String>,
     /// Which stock this movement belongs to.
     stock_status: String,
     idempotency_key: String,
@@ -557,7 +558,7 @@ fn optional_uuid(value: Option<String>, field: &str) -> Result<Option<String>, I
 }
 
 const MOVEMENT_COLUMNS: &str = "id,store_id,product_id,product_pack_id,batch_id,movement_type,quantity_delta_atoms,\
-     occurred_on,reason,reverses_movement_id,purchase_line_id,sale_line_id,return_line_id,stock_disposition_id,stock_status,idempotency_key,posted_by_user_id,posted_at_utc";
+     occurred_on,reason,reverses_movement_id,purchase_line_id,sale_line_id,return_line_id,stock_disposition_id,stock_operation_line_id,stock_status,idempotency_key,posted_by_user_id,posted_at_utc";
 
 async fn fetch_movement(pool: &SqlitePool, id: &str) -> Result<MovementResponse, InventoryError> {
     sqlx::query_as::<_, MovementResponse>(&format!(

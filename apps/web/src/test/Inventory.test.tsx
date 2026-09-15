@@ -93,7 +93,7 @@ function inventoryService(options: Options = {}) {
       const replay = state.seenKeys.get(String(body.idempotencyKey));
       if (replay) return response(replay);
       if (options.postError) return failure(options.postError.code, options.postError.status, options.postError.extra);
-      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, saleLineId: null, returnLineId: null, stockDispositionId: null, stockStatus: "sellable", idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
+      const movement: InventoryMovement = { id: `${IDs.movement}-${state.movements.length}`, storeId: IDs.store, productId: IDs.product, productPackId: body.productPackId, batchId: body.batchId ?? null, movementType: body.movementType, quantityDeltaAtoms: body.quantityDeltaAtoms, occurredOn: body.occurredOn, reason: body.reason ?? null, reversesMovementId: body.reversesMovementId ?? null, purchaseLineId: null, saleLineId: null, returnLineId: null, stockDispositionId: null, stockOperationLineId: null, stockStatus: "sellable", idempotencyKey: body.idempotencyKey, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z" };
       state.movements.push(movement);
       state.seenKeys.set(movement.idempotencyKey, movement);
       return response(movement, 201);
@@ -122,7 +122,7 @@ function bodiesFor(fetchMock: ReturnType<typeof inventoryService>["fetchMock"], 
   return fetchMock.mock.calls.filter(([input, init]) => predicate(String(input), init?.method ?? "GET")).map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
 }
 function movement(overrides: Partial<InventoryMovement> = {}): InventoryMovement {
-  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, purchaseLineId: null, saleLineId: null, returnLineId: null, stockDispositionId: null, stockStatus: "sellable", idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
+  return { id: IDs.movement, storeId: IDs.store, productId: IDs.product, productPackId: IDs.pack, batchId: null, movementType: "opening_stock", quantityDeltaAtoms: 50, occurredOn: "2026-04-01", reason: null, reversesMovementId: null, purchaseLineId: null, saleLineId: null, returnLineId: null, stockDispositionId: null, stockOperationLineId: null, stockStatus: "sellable", idempotencyKey: IDs.movement, postedByUserId: IDs.user, postedAtUtc: "2026-04-01T00:00:00.000Z", ...overrides };
 }
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -384,13 +384,37 @@ describe("Inventory ledger UI", () => {
     expect(alert).not.toHaveTextContent("raw backend detail");
   });
 
-  it("hides posting from pharmacist and cashier", async () => {
-    for (const role of ["pharmacist", "cashier"] as const) {
-      renderApp("/app/inventory/stock", inventoryService({ role, movements: [movement()] }));
-      expect(await screen.findByRole("heading", { name: "Inventory" })).toBeInTheDocument();
-      expect(screen.getByText("Read-only access")).toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: "Post Opening Stock" })).not.toBeInTheDocument();
-      cleanup();
+  /**
+   * Phase 1D gave Inventory one button and one authority: the owner posted, everyone else read.
+   * Phase 1J splits that, because counting a shelf and writing off a crushed strip are pharmacy
+   * floor work while opening stock, a blanket adjustment and the end of physical custody are not.
+   * A cashier still mutates nothing by any route.
+   */
+  it("gives the pharmacist floor work, the owner everything, and the cashier nothing", async () => {
+    renderApp("/app/inventory/stock", inventoryService({ role: "cashier", movements: [movement()] }));
+    expect(await screen.findByRole("heading", { name: "Inventory" })).toBeInTheDocument();
+    expect(screen.getByText("Read-only access")).toBeInTheDocument();
+    for (const label of ["Post Opening Stock", "Physical Count", "Mark Damaged", "Adjust Stock", "Remove / Dispose"]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+    }
+    cleanup();
+
+    renderApp("/app/inventory/stock", inventoryService({ role: "pharmacist", movements: [movement()] }));
+    expect(await screen.findByRole("heading", { name: "Inventory" })).toBeInTheDocument();
+    for (const label of ["Physical Count", "Mark Damaged", "Handle Expired Stock", "Quarantine"]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+    }
+    // Opening stock, the blanket adjustment and disposal stay with the owner.
+    for (const label of ["Post Opening Stock", "Adjust Stock", "Remove / Dispose"]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText("Read-only access")).not.toBeInTheDocument();
+    cleanup();
+
+    renderApp("/app/inventory/stock", inventoryService({ role: "owner_admin", movements: [movement()] }));
+    expect(await screen.findByRole("heading", { name: "Inventory" })).toBeInTheDocument();
+    for (const label of ["Post Opening Stock", "Physical Count", "Adjust Stock", "Mark Damaged", "Handle Expired Stock", "Quarantine", "Remove / Dispose"]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
   });
 

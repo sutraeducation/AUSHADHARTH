@@ -113,6 +113,14 @@ export function safeErrorMessage(code?: string): string {
     case "price_control_incomparable": return "This medicine's ceiling price cannot be compared with the price charged. Check the ceiling's unit.";
     case "tender_mismatch": return "The payment must be a single amount equal to the invoice total.";
     case "return_not_found": return "This return no longer exists.";
+    // Phase 1J — stock operations. Each message says what the operator can do next, because a
+    // refusal that only says no leaves somebody standing at a shelf with a crushed strip.
+    case "stock_operation_not_found": return "That stock operation no longer exists.";
+    case "stock_operation_not_draft": return "This has already been posted. Record a later operation to correct it.";
+    case "stock_operation_line_conflict": return "That line does not belong on this kind of operation. Start the operation that matches what happened.";
+    case "duplicate_count_line": return "This count already has a line for that item, batch and stock status.";
+    case "stock_operation_empty": return "Add at least one line before posting.";
+    case "batch_not_expired": return "That batch has not reached its expiry date yet.";
     case "return_not_draft": return "A posted return cannot be changed. Correct it with a later document.";
     case "original_document_not_found": return "The document this return corrects no longer exists.";
     case "original_document_not_posted": return "Only a posted document can be returned against.";

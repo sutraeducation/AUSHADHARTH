@@ -15,9 +15,17 @@ import {
 } from "../products/productApi";
 import { listMovements, listStock, newIdempotencyKey, postMovement } from "./inventoryApi";
 import { createStockDisposition } from "../returns/returnApi";
+import {
+  StockOperationDialog,
+  StockOperationHistory,
+  kindsForRole
+} from "./StockOperations";
+import { OPERATION_KIND_LABELS } from "./stockOperationApi";
+import type { StockOperationKind } from "@aushadharth/contracts";
 
 const SECTIONS = [
   { slug: "stock", title: "Stock Overview", description: "Derived balances by Product, Pack, Batch, and stock status. Only sellable stock can be billed." },
+  { slug: "operations", title: "Stock Operations", description: "Counts, damage, expiry, quarantine and disposals the store has recorded." },
   { slug: "ledger", title: "Stock Ledger", description: "Every posted movement, newest first." }
 ] as const;
 
@@ -26,6 +34,8 @@ export function InventoryPage() {
   const slug = section ?? "stock";
   const auth = useAuth();
   const canPost = auth.status?.user?.role === "owner_admin";
+  const kinds = kindsForRole(auth.status?.user?.role);
+  const [operation, setOperation] = useState<StockOperationKind | null>(null);
   const queryClient = useQueryClient();
   const [posting, setPosting] = useState(false);
   usePageTitle(SECTIONS.find((item) => item.slug === slug)?.title ?? "Inventory");
@@ -33,13 +43,19 @@ export function InventoryPage() {
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["inventory", "stock"] });
     void queryClient.invalidateQueries({ queryKey: ["inventory", "movements"] });
+    void queryClient.invalidateQueries({ queryKey: ["stock-operations"] });
   };
   return <>
     <header className="page-header"><div><p className="eyebrow">INVENTORY</p><h1>Inventory</h1><p>Quantity is derived from the movement ledger. No balance is ever stored.</p></div>
-      {canPost ? <button className="button button--primary" type="button" onClick={() => setPosting(true)}>Post Opening Stock</button> : <span className="read-only-note">Read-only access</span>}
+      <div className="page-header__actions">
+        {kinds.map((kind) => <button key={kind} className="button button--secondary" type="button" onClick={() => setOperation(kind)}>{OPERATION_KIND_LABELS[kind]}</button>)}
+        {canPost && <button className="button button--primary" type="button" onClick={() => setPosting(true)}>Post Opening Stock</button>}
+        {kinds.length === 0 && <span className="read-only-note">Read-only access</span>}
+      </div>
     </header>
     <nav className="inventory-tabs" aria-label="Inventory sections">{SECTIONS.map((item) => <NavLink key={item.slug} to={`/app/inventory/${item.slug}`} className={({ isActive }) => `inventory-tab ${isActive ? "inventory-tab--active" : ""}`}>{item.title}</NavLink>)}</nav>
-    {slug === "stock" ? <StockOverview /> : <StockLedger />}
+    {slug === "stock" ? <StockOverview /> : slug === "operations" ? <StockOperationHistory /> : <StockLedger />}
+    {operation && <StockOperationDialog kind={operation} onClose={() => { setOperation(null); refresh(); }} />}
     {posting && <PostMovementDialog onClose={() => setPosting(false)} onPosted={() => { setPosting(false); refresh(); }} />}
   </>;
 }
@@ -53,8 +69,29 @@ function StockOverview() {
   if (stock.data.length === 0) return <Empty title="No stock recorded" text="Post opening stock to establish starting quantities." />;
   return <section className="master-panel" aria-labelledby="stock-title"><h2 id="stock-title" className="sr-only">Stock balances</h2>
     {products.isError && <InlineQueryError label="Product names could not be loaded." onRetry={() => void products.refetch()} />}
+    <CustodySummary rows={stock.data} />
     <div className="table-scroll"><table className="data-table"><thead><tr><th scope="col">Product</th><th scope="col">Pack</th><th scope="col">Batch</th><th scope="col">Status</th><th scope="col">Balance</th><th scope="col">Decision</th></tr></thead><tbody>{stock.data.map((row) => <BalanceRow key={`${row.productPackId}-${row.batchId ?? "none"}-${row.stockStatus}`} row={row} productName={productName(products.data, row.productId, products.isError)} />)}</tbody></table></div>
   </section>;
+}
+
+/**
+ * What the store physically holds, split by what it may do with it.
+ *
+ * Sellable, quarantined and non-sellable are all goods in the building; only the first may be
+ * billed. Showing the three without their total invites the reading that written-off stock has
+ * gone somewhere, which is exactly the confusion Phase 1J exists to remove — goods leave only
+ * when somebody records that they left.
+ */
+function CustodySummary({ rows }: { rows: StockBalance[] }) {
+  const totals = { sellable: 0, quarantined: 0, non_sellable: 0 };
+  for (const row of rows) totals[row.stockStatus] += row.balanceAtoms;
+  const custody = totals.sellable + totals.quarantined + totals.non_sellable;
+  return <dl className="detail-grid" aria-label="Stock in the building">
+    <div><dt>Sellable</dt><dd>{totals.sellable}</dd></div>
+    <div><dt>Quarantined</dt><dd>{totals.quarantined}</dd></div>
+    <div><dt>Not sellable</dt><dd>{totals.non_sellable}</dd></div>
+    <div><dt>In the building</dt><dd><strong>{custody}</strong></dd></div>
+  </dl>;
 }
 
 function BalanceRow({ row, productName }: { row: StockBalance; productName: string }) {
@@ -118,6 +155,7 @@ function movementReason(movement: InventoryMovement) {
   if (movement.saleLineId) return <span>Sold at the counter<small className="row-subtext">Recorded by posting a sale</small></span>;
   if (movement.returnLineId) return <span>{movement.movementType === "sales_return" ? "Returned by a customer" : "Returned to the supplier"}<small className="row-subtext">Recorded by posting a return</small></span>;
   if (movement.stockDispositionId) return <span>Stock status change<small className="row-subtext">{movement.reason || "Authorised by a pharmacist"}</small></span>;
+  if (movement.stockOperationLineId) return <span>{movement.movementType === "stock_count" ? "Counted on the shelf" : movement.movementType === "stock_removal" ? "Physically removed" : "Stock operation"}<small className="row-subtext">{movement.reason || "Recorded by a stock operation"}</small></span>;
   return movement.reason || "—";
 }
 
@@ -128,7 +166,9 @@ const MOVEMENT_LABELS: Record<InventoryMovement["movementType"], string> = {
   sale: "Sale",
   sales_return: "Sales return",
   purchase_return: "Purchase return",
-  disposition_transfer: "Stock status change"
+  disposition_transfer: "Stock status change",
+  stock_count: "Physical count",
+  stock_removal: "Removed from the store"
 };
 
 /**

@@ -666,7 +666,8 @@ export const StockStatusSchema = z.enum(["sellable", "quarantined", "non_sellabl
 
 export const MovementTypeSchema = z.enum([
   "opening_stock", "adjustment", "purchase", "sale",
-  "sales_return", "purchase_return", "disposition_transfer"
+  "sales_return", "purchase_return", "disposition_transfer",
+  "stock_count", "stock_removal"
 ]);
 
 export const PostMovementRequestSchema = z.object({
@@ -699,6 +700,7 @@ export const InventoryMovementSchema = z.object({
   returnLineId: z.string().nullable(),
   /** The disposition transfer that moved this quantity between stock statuses, when one did. */
   stockDispositionId: z.string().nullable(),
+  stockOperationLineId: z.string().nullable(),
   /** Which stock this movement belongs to. The counter may only sell `sellable`. */
   stockStatus: StockStatusSchema,
   idempotencyKey: z.string(),
@@ -1671,3 +1673,166 @@ export type SetupRequest = z.infer<typeof SetupRequestSchema>;
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type DashboardSummary = z.infer<typeof DashboardSummarySchema>;
 export type AuthErrorResponse = z.infer<typeof AuthErrorResponseSchema>;
+
+/**
+ * Phase 1J — stock operations.
+ *
+ * Operator intent is the kind; the inventory cause is the reason. Both are closed vocabularies,
+ * because everything downstream — registers, valuation, authorisation — reads them rather than
+ * reading a note somebody typed.
+ */
+export const StockOperationKindSchema = z.enum([
+  "physical_count",
+  "adjustment",
+  "damage",
+  "expiry",
+  "quarantine",
+  "removal"
+]);
+
+export const StockOperationReasonSchema = z.enum([
+  "physical_count_gain",
+  "physical_count_loss",
+  "damage",
+  "breakage",
+  "expiry",
+  "theft_or_loss",
+  "data_correction",
+  "quality_hold",
+  "disposal"
+]);
+
+export const StockOperationDirectionSchema = z.enum(["count", "increase", "decrease", "transfer"]);
+
+export const StockOperationLineSchema = z.object({
+  id: z.string(),
+  stockOperationId: z.string(),
+  lineNumber: z.number().int(),
+  productId: z.string(),
+  productPackId: z.string(),
+  batchId: z.string().nullable(),
+  stockStatus: StockStatusSchema,
+  targetStockStatus: StockStatusSchema.nullable(),
+  direction: StockOperationDirectionSchema,
+  reasonCode: StockOperationReasonSchema,
+  /** Physical count only: what the operator counted. */
+  countedAtoms: z.number().int().nullable(),
+  /** Everything else: the quantity asked for. */
+  quantityAtoms: z.number().int().nullable(),
+  quantityBasis: z.enum(["pack", "base_unit"]),
+  quantityPacks: z.number().int().nullable(),
+  /** Written at posting: the signed effect the server computed. Null while the draft is open. */
+  appliedDeltaAtoms: z.number().int().nullable(),
+  note: z.string().nullable(),
+  productDisplayName: z.string().nullable(),
+  packDisplayLabel: z.string().nullable(),
+  baseUnitLabel: z.string().nullable(),
+  batchNumber: z.string().nullable(),
+  batchExpiresOn: z.string().nullable(),
+  quantityScale: z.number().int(),
+  baseQuantityAtoms: z.number().int()
+});
+
+export const StockOperationSchema = z.object({
+  id: z.string(),
+  storeId: z.string(),
+  operationKind: StockOperationKindSchema,
+  businessDate: z.string(),
+  status: z.enum(["draft", "posted"]),
+  revision: z.number().int(),
+  note: z.string().nullable(),
+  createdByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string(),
+  postedByUserId: z.string().nullable(),
+  postedAtUtc: z.string().nullable()
+});
+
+export const StockOperationDetailSchema = StockOperationSchema.extend({
+  lines: StockOperationLineSchema.array()
+});
+
+export const CreateStockOperationInputSchema = z.object({
+  operationKind: StockOperationKindSchema,
+  businessDate: z.string(),
+  note: z.string().nullable().optional()
+});
+
+export const StockOperationLineInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  productPackId: z.string(),
+  batchId: z.string().nullable().optional(),
+  stockStatus: StockStatusSchema,
+  targetStockStatus: StockStatusSchema.nullable().optional(),
+  reasonCode: StockOperationReasonSchema,
+  countedQuantity: z.number().int().nonnegative().nullable().optional(),
+  quantity: z.number().int().positive().nullable().optional(),
+  quantityBasis: z.enum(["pack", "base_unit"]),
+  direction: z.enum(["increase", "decrease"]).nullable().optional(),
+  note: z.string().nullable().optional()
+});
+
+/**
+ * A preview, and only a preview. Posting recomputes every figure here under its write lock, so a
+ * quote that has gone stale cannot cause a wrong posting — only a surprised operator.
+ */
+export const StockOperationQuoteLineSchema = z.object({
+  lineId: z.string(),
+  lineNumber: z.number().int(),
+  productDisplayName: z.string().nullable(),
+  batchNumber: z.string().nullable(),
+  stockStatus: StockStatusSchema,
+  targetStockStatus: StockStatusSchema.nullable(),
+  reasonCode: StockOperationReasonSchema,
+  currentAtoms: z.number().int(),
+  requestedAtoms: z.number().int(),
+  resultingAtoms: z.number().int(),
+  targetCurrentAtoms: z.number().int().nullable(),
+  targetResultingAtoms: z.number().int().nullable(),
+  sufficient: z.boolean()
+});
+
+export const StockOperationQuoteSchema = z.object({
+  operationId: z.string(),
+  operationKind: StockOperationKindSchema,
+  lines: StockOperationQuoteLineSchema.array(),
+  postable: z.boolean()
+});
+
+export const PostStockOperationInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string()
+});
+
+/** Every code the Store Service can return from a stock-operation route. */
+export const StockOperationErrorCodeSchema = z.enum([
+  "validation_failed",
+  "stock_operation_not_found",
+  "stock_operation_not_draft",
+  "revision_conflict",
+  "stock_operation_line_conflict",
+  "duplicate_count_line",
+  "insufficient_stock",
+  "stock_operation_empty",
+  "idempotency_conflict",
+  "arithmetic_overflow",
+  "batch_not_expired",
+  "service_busy",
+  "internal_error",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied"
+]);
+
+export type StockOperationKind = z.infer<typeof StockOperationKindSchema>;
+export type StockOperationReason = z.infer<typeof StockOperationReasonSchema>;
+export type StockOperationDirection = z.infer<typeof StockOperationDirectionSchema>;
+export type StockOperationLine = z.infer<typeof StockOperationLineSchema>;
+export type StockOperation = z.infer<typeof StockOperationSchema>;
+export type StockOperationDetail = z.infer<typeof StockOperationDetailSchema>;
+export type CreateStockOperationInput = z.infer<typeof CreateStockOperationInputSchema>;
+export type StockOperationLineInput = z.infer<typeof StockOperationLineInputSchema>;
+export type StockOperationQuote = z.infer<typeof StockOperationQuoteSchema>;
+export type StockOperationQuoteLine = z.infer<typeof StockOperationQuoteLineSchema>;
+export type PostStockOperationInput = z.infer<typeof PostStockOperationInputSchema>;
+export type StockOperationErrorCode = z.infer<typeof StockOperationErrorCodeSchema>;

@@ -3661,3 +3661,408 @@ async fn real_service_refuses_ineligible_returns_with_safe_codes_over_http() {
         "no refusal moved any stock"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1J — stock operations over the real transport
+// ---------------------------------------------------------------------------------------------
+
+/// Seeds a second counter user and signs them in, so role rules are exercised across a real login
+/// rather than asserted against a handler in isolation.
+async fn sign_in_as(service: &Service, role: &str, identifier: &str, id: &str) -> String {
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    let owner_hash: String = sqlx::query_scalar("SELECT password_hash FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("owner hash");
+    sqlx::query(
+        "INSERT INTO users (id,login_identifier,normalized_login_identifier,display_name,\
+         password_hash,role,created_at_utc,updated_at_utc) \
+         VALUES (?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind(id)
+    .bind(identifier)
+    .bind(identifier)
+    .bind(format!("Stock {role}"))
+    .bind(&owner_hash)
+    .bind(role)
+    .execute(&pool)
+    .await
+    .expect("seed a counter user");
+    pool.close().await;
+
+    let login = call(
+        service,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({ "loginIdentifier": identifier, "password": "Integration-Password-42" })),
+        None,
+    )
+    .await;
+    assert_eq!(login.status, 200, "{:?}", login.body);
+    session_cookie(&login.headers)
+}
+
+/// The balance of one status at one lot, derived exactly as the service derives it.
+async fn status_atoms(service: &Service, world: &ReturnWorld, status: &str) -> i64 {
+    let stock = call(
+        service,
+        "GET",
+        "/api/v1/inventory/stock",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stock.status, 200, "{:?}", stock.body);
+    stock
+        .body
+        .as_array()
+        .expect("stock rows")
+        .iter()
+        .find(|row| row["batchId"] == world.batch.as_str() && row["stockStatus"] == status)
+        .and_then(|row| row["balanceAtoms"].as_i64())
+        .unwrap_or(0)
+}
+
+/// Builds and posts a one-line stock operation, returning the posted document.
+async fn run_operation(service: &Service, cookie: &str, kind: &str, line: Value) -> Reply {
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/stock-operations",
+        Some(json!({ "operationKind": kind, "businessDate": SALE_DATE })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{kind}: {:?}", created.body);
+    let id = created.body["id"]
+        .as_str()
+        .expect("operation id")
+        .to_owned();
+
+    let mut body = line;
+    body["expectedRevision"] = json!(1);
+    let added = call(
+        service,
+        "POST",
+        &format!("/api/v1/stock-operations/{id}/lines"),
+        Some(body),
+        Some(cookie),
+    )
+    .await;
+    if added.status != 201 {
+        return added;
+    }
+    let revision = added.body["revision"].as_i64().expect("revision");
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/stock-operations/{id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": uuid::Uuid::now_v7().to_string()
+        })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// A shelf counted short, across a real socket. The operator sends what they counted; the service
+/// decides the variance and writes the movement.
+#[tokio::test]
+async fn real_service_counts_a_shelf_and_computes_the_variance_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    let before = status_atoms(&service, &world, "sellable").await;
+    assert!(before > 20, "expected stock to count, found {before}");
+
+    let pharmacist = sign_in_as(
+        &service,
+        "pharmacist",
+        "stock.pharmacist",
+        "01997a00-0000-7000-8000-000000000301",
+    )
+    .await;
+
+    let posted = run_operation(
+        &service,
+        &pharmacist,
+        "physical_count",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "reasonCode": "physical_count_gain", "countedQuantity": before - 7,
+            "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["lines"][0]["appliedDeltaAtoms"], -7);
+    // The reason is the arithmetic's, not the request's.
+    assert_eq!(posted.body["lines"][0]["reasonCode"], "physical_count_loss");
+    assert_eq!(status_atoms(&service, &world, "sellable").await, before - 7);
+
+    // A count that matches records the check and moves nothing.
+    let settled = status_atoms(&service, &world, "sellable").await;
+    let quiet = run_operation(
+        &service,
+        &pharmacist,
+        "physical_count",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "reasonCode": "physical_count_gain", "countedQuantity": settled,
+            "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(quiet.status, 200, "{:?}", quiet.body);
+    assert_eq!(quiet.body["lines"][0]["appliedDeltaAtoms"], 0);
+    assert_eq!(status_atoms(&service, &world, "sellable").await, settled);
+}
+
+/// Damage and quarantine over the real transport: goods stop being sellable without leaving.
+#[tokio::test]
+async fn real_service_writes_damaged_stock_off_without_losing_it_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    let pharmacist = sign_in_as(
+        &service,
+        "pharmacist",
+        "damage.pharmacist",
+        "01997a00-0000-7000-8000-000000000302",
+    )
+    .await;
+    let sellable = status_atoms(&service, &world, "sellable").await;
+    let custody = sellable
+        + status_atoms(&service, &world, "quarantined").await
+        + status_atoms(&service, &world, "non_sellable").await;
+
+    let posted = run_operation(
+        &service,
+        &pharmacist,
+        "damage",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "non_sellable", "reasonCode": "breakage",
+            "quantity": 10, "quantityBasis": "base_unit", "note": "Crushed in the crate"
+        }),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(
+        status_atoms(&service, &world, "sellable").await,
+        sellable - 10
+    );
+    assert_eq!(status_atoms(&service, &world, "non_sellable").await, 10);
+    // Nothing was destroyed by writing it off.
+    let after = status_atoms(&service, &world, "sellable").await
+        + status_atoms(&service, &world, "quarantined").await
+        + status_atoms(&service, &world, "non_sellable").await;
+    assert_eq!(after, custody);
+
+    // Holding stock back is the other honest outcome, and it needs a stated reason.
+    let silent = run_operation(
+        &service,
+        &pharmacist,
+        "quarantine",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "quarantined", "reasonCode": "quality_hold",
+            "quantity": 10, "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(silent.status, 422, "{:?}", silent.body);
+
+    let held = run_operation(
+        &service,
+        &pharmacist,
+        "quarantine",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "quarantined", "reasonCode": "quality_hold",
+            "quantity": 10, "quantityBasis": "base_unit", "note": "Supplier advisory pending"
+        }),
+    )
+    .await;
+    assert_eq!(held.status, 200, "{:?}", held.body);
+    assert_eq!(status_atoms(&service, &world, "quarantined").await, 10);
+}
+
+/// Expiry classification, and the rule that a live lot cannot be written off as expired.
+#[tokio::test]
+async fn real_service_classifies_an_expired_lot_and_refuses_a_live_one_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    let pharmacist = sign_in_as(
+        &service,
+        "pharmacist",
+        "expiry.pharmacist",
+        "01997a00-0000-7000-8000-000000000303",
+    )
+    .await;
+
+    let refused = run_operation(
+        &service,
+        &pharmacist,
+        "expiry",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "non_sellable", "reasonCode": "expiry",
+            "quantity": 10, "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "batch_not_expired");
+
+    // Once the lot has genuinely expired the same operation is the right record to make.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    sqlx::query("UPDATE product_batches SET expires_on='2026-01-31' WHERE id=?")
+        .bind(&world.batch)
+        .execute(&pool)
+        .await
+        .expect("age the lot");
+    pool.close().await;
+
+    let sellable = status_atoms(&service, &world, "sellable").await;
+    let posted = run_operation(
+        &service,
+        &pharmacist,
+        "expiry",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "non_sellable", "reasonCode": "expiry",
+            "quantity": 10, "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(
+        status_atoms(&service, &world, "sellable").await,
+        sellable - 10
+    );
+    assert_eq!(status_atoms(&service, &world, "non_sellable").await, 10);
+}
+
+/// Physical custody ending, which is the only operation that reduces the total in the building.
+#[tokio::test]
+async fn real_service_ends_custody_only_for_written_off_stock_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    let pharmacist = sign_in_as(
+        &service,
+        "pharmacist",
+        "removal.pharmacist",
+        "01997a00-0000-7000-8000-000000000304",
+    )
+    .await;
+
+    // Write something off first, because nothing else can be removed.
+    let written_off = run_operation(
+        &service,
+        &pharmacist,
+        "damage",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "targetStockStatus": "non_sellable", "reasonCode": "damage",
+            "quantity": 20, "quantityBasis": "base_unit", "note": "Water damage"
+        }),
+    )
+    .await;
+    assert_eq!(written_off.status, 200, "{:?}", written_off.body);
+
+    // A pharmacist may write stock off but may not say it has left the building.
+    let denied = call(
+        &service,
+        "POST",
+        "/api/v1/stock-operations",
+        Some(json!({ "operationKind": "removal", "businessDate": SALE_DATE })),
+        Some(&pharmacist),
+    )
+    .await;
+    assert_eq!(denied.status, 403, "{:?}", denied.body);
+
+    let sellable = status_atoms(&service, &world, "sellable").await;
+    let posted = run_operation(
+        &service,
+        &world.cookie,
+        "removal",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "non_sellable",
+            "reasonCode": "disposal", "quantity": 20, "quantityBasis": "base_unit",
+            "note": "Collected by the authorised disposal contractor"
+        }),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(status_atoms(&service, &world, "non_sellable").await, 0);
+    // The shelf is untouched: removal took only what had already been written off.
+    assert_eq!(status_atoms(&service, &world, "sellable").await, sellable);
+
+    // And it can never reach the shelf.
+    let refused = run_operation(
+        &service,
+        &world.cookie,
+        "removal",
+        json!({
+            "productPackId": world.pack, "batchId": world.batch, "stockStatus": "sellable",
+            "reasonCode": "disposal", "quantity": 5, "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "stock_operation_line_conflict");
+}
+
+/// A cashier mutates no stock by any route, and every refusal arrives as a typed code.
+#[tokio::test]
+async fn real_service_refuses_every_stock_operation_to_a_cashier_over_http() {
+    let service = start().await;
+    let world = seed_return_world(&service).await;
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "stock.cashier",
+        "01997a00-0000-7000-8000-000000000305",
+    )
+    .await;
+
+    for kind in [
+        "physical_count",
+        "adjustment",
+        "damage",
+        "expiry",
+        "quarantine",
+        "removal",
+    ] {
+        let refused = call(
+            &service,
+            "POST",
+            "/api/v1/stock-operations",
+            Some(json!({ "operationKind": kind, "businessDate": SALE_DATE })),
+            Some(&cashier),
+        )
+        .await;
+        assert_eq!(refused.status, 403, "{kind}: {:?}", refused.body);
+    }
+
+    // Reading is still theirs.
+    let listed = call(
+        &service,
+        "GET",
+        "/api/v1/stock-operations",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(listed.status, 200, "{:?}", listed.body);
+
+    // And an unauthenticated caller gets nothing at all.
+    let anonymous = call(&service, "GET", "/api/v1/stock-operations", None, None).await;
+    assert_eq!(anonymous.status, 401, "{:?}", anonymous.body);
+    let _ = world;
+}

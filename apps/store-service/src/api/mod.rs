@@ -15,6 +15,7 @@ pub mod purchases;
 pub mod reference_masters;
 pub mod returns;
 pub mod sales;
+pub mod stock_operations;
 pub mod store_profile;
 
 #[derive(Debug, Serialize)]
@@ -54,6 +55,7 @@ pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
         .merge(purchases::routes())
         .merge(sales::routes())
         .merge(returns::routes())
+        .merge(stock_operations::routes())
         .with_state(reference_masters::ReferenceState { pool });
 
     if let Some(dist) = web_dist {

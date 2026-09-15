@@ -22,3 +22,4 @@ retained and linked from its replacement rather than silently rewritten.
 | 015 | Product tax classification |
 | 016 | Commercial and tax rounding |
 | 017 | Returns, credit notes, and the status of returned stock |
+| 018 | Stock custody, operations, and the end of physical custody |
