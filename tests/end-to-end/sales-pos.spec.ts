@@ -276,6 +276,15 @@ test.describe("Phase 1H point of sale", () => {
     await expect(page.getByLabel("Product or barcode")).toBeFocused();
 
     await page.keyboard.type("Crocin");
+    // A counter hand types, sees the name come up, and then presses Enter. This test used to send
+    // Enter in the same breath as the last keystroke, which is a thing no person does: the search
+    // is asynchronous, and `searchKeyDown` deliberately does nothing while it is still in flight,
+    // so roughly one run in three pressed Enter against an empty match list and the box still read
+    // "Crocin". Waiting for the suggestion is waiting for exactly what the operator waits for.
+    await expect(
+      page.getByRole("listbox", { name: "Matching products" })
+        .getByRole("button", { name: "Crocin 500 mg Tablet", exact: true })
+    ).toBeVisible();
     await page.keyboard.press("Enter");
 
     // The product is taken, and its only pack selects itself.
