@@ -29,6 +29,19 @@ function locateRepositoryFile(relativePath: string): string {
 }
 
 /**
+ * Rust source with newlines normalised.
+ *
+ * The block below is located by searching for a closing brace on its own line. Read straight off
+ * the disk that search asks what newline convention this checkout happens to use, which is a
+ * question about the operating system rather than about the Store Service. A Windows working tree
+ * with CRLF files would fail every assertion in this file while the repository content was
+ * identical. The repository now pins LF in .gitattributes; this makes the test correct either way.
+ */
+function readSource(path: string): string {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
+/**
  * `internal_error` is the one code whose correct presentation IS the generic fallback: an
  * unclassified server fault has nothing specific that can be safely said about it.
  */
@@ -37,7 +50,7 @@ const FALLBACK_IS_CORRECT = new Set(["internal_error"]);
 const FALLBACK = safeErrorMessage("a-code-the-mapper-has-never-heard-of");
 
 function responseCodes(): string[] {
-  const source = readFileSync(SALES_RS, "utf8");
+  const source = readSource(SALES_RS);
   const start = source.indexOf("impl IntoResponse for SaleError {");
   expect(start, `no SaleError response block in ${SALES_RS}`).toBeGreaterThan(-1);
   const end = source.indexOf("\n}\n", start);

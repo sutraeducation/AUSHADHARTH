@@ -1,0 +1,44 @@
+# Line endings belong to the repository, not to whichever machine checked it out.
+#
+# Without this file, `core.autocrlf=true` — the Git for Windows default — hands a
+# Windows developer CRLF working files while every blob in this repository is LF.
+# Git hides the difference, so the tree looks clean and the build looks fine, and
+# then anything that reads source text off the disk quietly behaves differently on
+# one machine than another. That is not a formatting preference; it is a
+# reproducibility defect, and it cost a real debugging session.
+#
+# `text=auto eol=lf` normalises on the way in and checks out LF everywhere. It
+# matches the `end_of_line = lf` this repository already declares in
+# .editorconfig, so the two now agree instead of only one of them being enforced.
+* text=auto eol=lf
+
+# Windows batch interpreters are the one genuine exception: cmd.exe can mis-seek
+# `goto`/`:label` in a batch file that uses bare LF. Nothing here needs these
+# today — they are declared so that the first one added is correct by default.
+# PowerShell is deliberately absent: it reads LF correctly.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never run an end-of-line filter over these. The repository tracks no binary
+# file today, which is exactly why the rules belong here now: the first logo,
+# font or fixture database someone commits must not be corrupted by a heuristic
+# that guessed "text".
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+
+# Fixture and backup databases are binary and must survive byte-for-byte; a
+# normalised SQLite file is a corrupted SQLite file.
+*.sqlite3 binary
+*.sqlite  binary
+*.db      binary

@@ -28,6 +28,19 @@ function locateRepositoryFile(relativePath: string): string {
 }
 
 /**
+ * Rust source with newlines normalised.
+ *
+ * The block below is located by searching for a closing brace on its own line. Read straight off
+ * the disk that search asks what newline convention this checkout happens to use, which is a
+ * question about the operating system rather than about the Store Service. A Windows working tree
+ * with CRLF files would fail every assertion in this file while the repository content was
+ * identical. The repository now pins LF in .gitattributes; this makes the test correct either way.
+ */
+function readSource(path: string): string {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
+/**
  * `internal_error` is the one code whose correct presentation IS the generic fallback: an
  * unclassified server fault has nothing specific that can be safely said about it.
  */
@@ -36,7 +49,7 @@ const FALLBACK_IS_CORRECT = new Set(["internal_error"]);
 const FALLBACK = safeErrorMessage("a-code-the-mapper-has-never-heard-of");
 
 function responseCodes(): string[] {
-  const source = readFileSync(RETURNS_RS, "utf8");
+  const source = readSource(RETURNS_RS);
   const start = source.indexOf("impl IntoResponse for ReturnError {");
   expect(start, `no ReturnError response block in ${RETURNS_RS}`).toBeGreaterThan(-1);
   const end = source.indexOf("\n}\n", start);
@@ -120,7 +133,7 @@ describe("return error mapping", () => {
     expect(returnCodes.filter((code) => code.includes("debit"))).toEqual([]);
     expect(saleCodes.filter((code) => code.includes("debit"))).toEqual([]);
     // And the service source itself never calls our document one.
-    const source = readFileSync(RETURNS_RS, "utf8").toLowerCase();
+    const source = readSource(RETURNS_RS).toLowerCase();
     expect(source).not.toContain("debit_note");
   });
 });
