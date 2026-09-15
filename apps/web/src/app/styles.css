@@ -442,3 +442,24 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .stock-status--non_sellable { color: var(--danger-700); background: var(--danger-100); }
 /* Several actions can sit beside a page title without crowding it at a phone width. */
 .page-header__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* Data Safety. The restore panel is deliberately set apart: it is the one screen in the product
+   whose confirm button destroys data, and it should not look like the ones that do not. */
+.catalog-inline-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 18px; padding: 12px 14px; border: 1px solid var(--primary-100); border-radius: 8px; background: var(--primary-50); color: var(--primary-900); font-size: .7rem; }
+.master-panel--danger { border-color: var(--danger-100); }
+.master-panel--danger > h2 { color: var(--danger-700); }
+.master-panel--danger > p { margin: 8px 19px 0; color: var(--ink-700); font-size: .7rem; line-height: 1.55; }
+.master-panel--danger > .button { margin: 14px 19px 18px; }
+.restore-panel { margin: 14px 19px 18px; padding: 15px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
+.restore-panel > .button { margin-right: 8px; }
+.restore-panel h3 { margin: 0 0 6px; font-size: .82rem; }
+.restore-panel .detail-grid { margin-top: 14px; }
+.restore-confirm { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.restore-warning { margin: 0 0 12px; padding: 11px 13px; border: 1px solid var(--danger-100); border-radius: 8px; background: #fff3f2; color: var(--danger-700); font-size: .7rem; line-height: 1.5; }
+.restore-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.button--danger { color: white; background: var(--danger-700); border-color: var(--danger-700); }
+.button--danger:hover:not(:disabled) { filter: brightness(.92); }
+.button--ghost { border-color: transparent; color: var(--ink-700); background: none; }
+.button--ghost:hover:not(:disabled) { background: var(--primary-50); }
+.entry-choice { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.entry-choice .button { width: 100%; }

@@ -9,7 +9,7 @@ import {
   type SessionResponse,
   type SetupRequest
 } from "@aushadharth/contracts";
-import { localServiceRequest } from "../platform/localService";
+import { LocalServiceError, localServiceRequest } from "../platform/localService";
 
 export type StartupState =
   | "BOOTING"
@@ -17,6 +17,10 @@ export type StartupState =
   | "COMPATIBILITY_ERROR"
   | "SETUP_REQUIRED"
   | "AUTH_REQUIRED"
+  // The database this service had open has been replaced and it is waiting to be restarted.
+  // Distinct from being unavailable: nothing is wrong, and telling somebody to restart is a very
+  // different instruction from telling them their service has failed.
+  | "RESTORE_IN_PROGRESS"
   | "AUTHENTICATED";
 
 interface AuthContextValue {
@@ -47,7 +51,7 @@ async function fetchStartup(): Promise<AuthStatusResponse> {
     }
     return AuthStatusResponseSchema.parse(statusRaw);
   } catch (error) {
-    if (error instanceof CompatibilityFailure) throw error;
+    if (error instanceof CompatibilityFailure || error instanceof LocalServiceError) throw error;
     throw new CompatibilityFailure("The local service is not compatible with this web application.");
   }
 }
@@ -67,7 +71,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     : startup.isError
       ? startup.error instanceof CompatibilityFailure
         ? "COMPATIBILITY_ERROR"
-        : "LOCAL_SERVICE_UNAVAILABLE"
+        : startup.error instanceof LocalServiceError && startup.error.code === "service_restoring"
+          ? "RESTORE_IN_PROGRESS"
+          : "LOCAL_SERVICE_UNAVAILABLE"
       : startup.data.setupRequired
         ? "SETUP_REQUIRED"
         : startup.data.authenticated

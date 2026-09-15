@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod catalog;
 pub mod money;
 pub mod parties;

@@ -1836,3 +1836,131 @@ export type StockOperationQuote = z.infer<typeof StockOperationQuoteSchema>;
 export type StockOperationQuoteLine = z.infer<typeof StockOperationQuoteLineSchema>;
 export type PostStockOperationInput = z.infer<typeof PostStockOperationInputSchema>;
 export type StockOperationErrorCode = z.infer<typeof StockOperationErrorCodeSchema>;
+
+/* ------------------------------------------------------------------------------------------------
+ * Backup and restore
+ *
+ * The browser is never authoritative here and never names a path: a backup is addressed by id, a
+ * prepared restore by an opaque token, and the file itself is chosen by the operating system's own
+ * dialogs. These shapes exist so the web app can describe what the service reports, not so it can
+ * instruct it.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Why a backup exists. A safety copy is taken by the service, never by an operator. */
+export const BackupKindSchema = z.enum(["manual", "pre_restore_safety"]);
+
+export const BackupSummarySchema = z.object({
+  backupId: z.string(),
+  filename: z.string(),
+  createdAtUtc: z.string(),
+  bytes: z.number().int().nonnegative(),
+  backupKind: z.string()
+});
+
+export const BackupStatusSchema = z.object({
+  /**
+   * Installation-local and never restored. A backup taken on another machine must not make this one
+   * look safe.
+   */
+  lastSuccessfulBackupAtUtc: z.string().nullable(),
+  reminderThresholdDays: z.number().int().positive(),
+  backupOverdue: z.boolean(),
+  backups: BackupSummarySchema.array()
+});
+
+/**
+ * A backup being produced.
+ *
+ * The stage is a name, not a percentage: the snapshot cannot report its own progress, and a bar that
+ * moves on a timer would be a lie told to somebody waiting on their data.
+ */
+export const BackupJobSchema = z.object({
+  jobId: z.string(),
+  stage: z.string(),
+  backupId: z.string().nullable(),
+  filename: z.string().nullable(),
+  bytes: z.number().int().nonnegative().nullable(),
+  errorCode: z.string().nullable()
+});
+
+export const BackupDownloadSchema = z.object({
+  backupId: z.string(),
+  filename: z.string(),
+  bytes: z.number().int().nonnegative(),
+  /** Served by the Store Service; the browser never constructs this itself. */
+  url: z.string()
+});
+
+/** What a candidate proved about itself before anybody was offered the choice to restore it. */
+export const BackupInspectionSchema = z.object({
+  product: z.string(),
+  backupFormatVersion: z.number().int(),
+  storeDisplayName: z.string(),
+  createdAtUtc: z.string(),
+  applicationVersion: z.string(),
+  schemaVersion: z.number().int(),
+  currentSchemaVersion: z.number().int(),
+  bytes: z.number().int().nonnegative(),
+  checksumVerified: z.boolean(),
+  compatibility: z.enum(["ready", "upgrade_required"]),
+  migrationRequired: z.boolean()
+});
+
+export const PreparedRestoreSchema = z.object({
+  candidateToken: z.string(),
+  expiresInSeconds: z.number().int().positive(),
+  report: BackupInspectionSchema
+});
+
+export const RestoreCommitInputSchema = z.object({
+  candidateToken: z.string(),
+  /** Required on an established installation; absent on a first run, where no account exists yet. */
+  password: z.string().optional()
+});
+
+export const RestoreCommittedSchema = z.object({
+  restoreId: z.string(),
+  /** Always true today: the replaced database can only be reopened by restarting the service. */
+  restartRequired: z.boolean(),
+  safetyBackup: z.string().nullable()
+});
+
+/** Every code the Store Service can return from a backup or restore route. */
+export const BackupErrorCodeSchema = z.enum([
+  "validation_failed",
+  "backup_format_unsupported",
+  "backup_corrupt",
+  "backup_product_mismatch",
+  "backup_invalid_database",
+  "backup_too_new",
+  "backup_partially_migrated",
+  "backup_checksum_mismatch",
+  "backup_too_large",
+  "insufficient_disk_space",
+  "candidate_not_found",
+  "candidate_expired",
+  "backup_not_found",
+  "setup_already_complete",
+  "service_restoring",
+  "restore_failed",
+  "invalid_password",
+  "backup_unavailable",
+  "internal_error",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied"
+]);
+
+/** The largest file the service will accept as a backup: two gibibytes. */
+export const MAXIMUM_BACKUP_BYTES = 2_147_483_648;
+
+export type BackupKind = z.infer<typeof BackupKindSchema>;
+export type BackupSummary = z.infer<typeof BackupSummarySchema>;
+export type BackupStatus = z.infer<typeof BackupStatusSchema>;
+export type BackupJob = z.infer<typeof BackupJobSchema>;
+export type BackupDownload = z.infer<typeof BackupDownloadSchema>;
+export type BackupInspection = z.infer<typeof BackupInspectionSchema>;
+export type PreparedRestore = z.infer<typeof PreparedRestoreSchema>;
+export type RestoreCommitInput = z.infer<typeof RestoreCommitInputSchema>;
+export type RestoreCommitted = z.infer<typeof RestoreCommittedSchema>;
+export type BackupErrorCode = z.infer<typeof BackupErrorCodeSchema>;

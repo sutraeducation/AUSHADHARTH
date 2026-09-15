@@ -13,6 +13,91 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// it instead of restating a wall-clock literal.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One migration this build carries, as the backup manifest records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedMigration {
+    pub version: i64,
+    pub description: String,
+    pub checksum: String,
+}
+
+/// Every migration compiled into this binary, in order.
+///
+/// A restore compares this against what a backup claims was applied to it. Comparing whole chains
+/// rather than a single version number is what catches a database from a fork, a tampered
+/// migration, and a backup from a future build — three different problems that a version number
+/// alone would report identically, or miss.
+pub fn embedded_migrations() -> Vec<EmbeddedMigration> {
+    MIGRATOR
+        .iter()
+        .map(|migration| EmbeddedMigration {
+            version: migration.version,
+            description: migration.description.to_string(),
+            checksum: hex_lower(&migration.checksum),
+        })
+        .collect()
+}
+
+pub fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The highest migration this build knows how to apply.
+pub fn latest_schema_version() -> i64 {
+    MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or_default()
+}
+
+/// Opens an existing database WITHOUT migrating it.
+///
+/// Used to inspect a restore candidate before deciding whether it may be migrated at all. The
+/// normal [`connect`] would migrate on open, which is precisely what must not happen to a file
+/// whose provenance has not yet been established.
+pub async fn open_existing_unmigrated(database_path: &Path) -> anyhow::Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(BUSY_TIMEOUT)
+        .disable_statement_logging();
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .context("failed to open candidate database")
+}
+
+/// Closes a pool after folding the write-ahead log back into the database file.
+///
+/// Two separate hazards make this necessary before a database file is moved, copied or hashed.
+/// SQLite normally checkpoints when the last connection closes, but `SqlitePool::close` returns
+/// before that work has finished — measured on Windows, the file handle is still held for a few
+/// tens of milliseconds afterwards. A copy taken in that window catches the database mid-
+/// checkpoint, and a rename fails outright with a sharing violation. Checkpointing explicitly,
+/// while the pool is unquestionably still alive, removes the first hazard entirely: afterwards the
+/// single file is the whole database and the log is empty.
+pub async fn checkpoint_and_close(pool: &SqlitePool) -> anyhow::Result<()> {
+    let outcome = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await
+        .context("failed to fold the write-ahead log into the database");
+    // Closed either way: leaving a pool open after a failed checkpoint helps nobody.
+    pool.close().await;
+    outcome.map(|_| ())
+}
+
+/// Applies this build's migrations to a candidate that has already been proven to be ours.
+pub async fn migrate_candidate(pool: &SqlitePool) -> anyhow::Result<()> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .context("candidate migration failed")?;
+    Ok(())
+}
+
 pub async fn connect(database_path: &Path) -> anyhow::Result<SqlitePool> {
     let parent = database_path
         .parent()

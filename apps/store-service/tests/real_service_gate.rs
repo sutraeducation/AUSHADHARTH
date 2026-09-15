@@ -4066,3 +4066,468 @@ async fn real_service_refuses_every_stock_operation_to_a_cashier_over_http() {
     assert_eq!(anonymous.status, 401, "{:?}", anonymous.body);
     let _ = world;
 }
+
+// -------------------------------------------------------------------------------------------------
+// Backup and restore across the same real boundary
+//
+// The container is framed by the service, streamed out through the real file route, sent back in as
+// a real octet-stream upload, and the swap is performed on a real file on a real filesystem. None of
+// it is exercised in-process: the only thing these tests trust is what came back over the socket.
+// -------------------------------------------------------------------------------------------------
+
+/// The service as `main.rs` builds it: with a backups directory, inside the same disposable tree.
+struct BackupService {
+    service: Service,
+    backups: std::path::PathBuf,
+}
+
+async fn start_with_backups() -> BackupService {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let database_path = temp.path().join("database").join("integration.sqlite3");
+    let backups = temp.path().join("backups");
+    std::fs::create_dir_all(database_path.parent().expect("database directory"))
+        .expect("create database directory");
+    std::fs::create_dir_all(&backups).expect("create backups directory");
+    let pool = database::connect(&database_path)
+        .await
+        .expect("migrated database");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let address = listener.local_addr().expect("bound address");
+    let router = api::router_with_backups(
+        pool,
+        None,
+        Some(std::sync::Arc::new(api::backups::BackupService::new(
+            backups.clone(),
+            database_path.clone(),
+        ))),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    BackupService {
+        service: Service {
+            address,
+            database_path,
+            _temp: temp,
+        },
+        backups,
+    }
+}
+
+/// Sends raw bytes with an explicit content type, and returns the response with its body unparsed.
+async fn call_bytes(
+    service: &Service,
+    path: &str,
+    content_type: &str,
+    payload: &[u8],
+    cookie: Option<&str>,
+) -> (u16, String, Vec<u8>) {
+    try_call_bytes(service, path, content_type, payload, cookie)
+        .await
+        .expect("the connection closed before any response was read")
+}
+
+async fn try_call_bytes(
+    service: &Service,
+    path: &str,
+    content_type: &str,
+    payload: &[u8],
+    cookie: Option<&str>,
+) -> Option<(u16, String, Vec<u8>)> {
+    let mut stream = TcpStream::connect(service.address)
+        .await
+        .expect("connect to service");
+    let mut head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
+        service.address.port(),
+        payload.len()
+    );
+    if let Some(cookie) = cookie {
+        head.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut request = head.into_bytes();
+    request.extend_from_slice(payload);
+    // A server that has already refused may reset while this is still writing, and that is the
+    // refusal rather than a failure to deliver one.
+    let _ = stream.write_all(&request).await;
+    try_read_raw(stream).await
+}
+
+/// A GET whose body is not JSON — the backup download.
+async fn get_bytes(service: &Service, path: &str, cookie: Option<&str>) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(service.address)
+        .await
+        .expect("connect to service");
+    let mut head = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
+        service.address.port()
+    );
+    if let Some(cookie) = cookie {
+        head.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write request");
+    read_raw(stream).await
+}
+
+async fn read_raw(stream: TcpStream) -> (u16, String, Vec<u8>) {
+    try_read_raw(stream)
+        .await
+        .expect("the connection closed before any response was read")
+}
+
+/// The same read, for an exchange the server may legitimately cut short.
+///
+/// Axum's default body limit refuses an oversized request before reading it, and closing a socket
+/// with unread bytes still in it makes Windows send a reset that discards the response. `None` is
+/// therefore "refused so firmly the answer never arrived", which for an ordinary JSON route is
+/// correct behaviour — and is precisely why the backup routes drain a refused upload instead.
+async fn try_read_raw(mut stream: TcpStream) -> Option<(u16, String, Vec<u8>)> {
+    let mut raw = Vec::new();
+    if stream.read_to_end(&mut raw).await.is_err() && raw.is_empty() {
+        return None;
+    }
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("http response framing");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let mut body = raw[split + 4..].to_vec();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .expect("status code");
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body = unchunk_bytes(&body);
+    }
+    Some((status, head, body))
+}
+
+/// Chunked framing for a body that is not text and must survive byte-for-byte.
+fn unchunk_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") else {
+            break;
+        };
+        let Ok(size_text) = std::str::from_utf8(&rest[..line_end]) else {
+            break;
+        };
+        let Ok(size) = usize::from_str_radix(size_text.trim(), 16) else {
+            break;
+        };
+        let start = line_end + 2;
+        if size == 0 || rest.len() < start + size {
+            break;
+        }
+        out.extend_from_slice(&rest[start..start + size]);
+        rest = &rest[start + size..];
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
+    }
+    out
+}
+
+async fn owner_session(service: &Service) -> String {
+    let setup = call(
+        service,
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({
+            "storeDisplayName": "Backup Pharmacy",
+            "ownerDisplayName": "Backup Owner",
+            "loginIdentifier": "backup.owner",
+            "password": "Integration-Password-42"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, 201, "{:?}", setup.body);
+    session_cookie(&setup.headers)
+}
+
+/// The whole journey, end to end, over the socket: take a backup, download it, change the data,
+/// upload the backup back, replace the database, restart, and find the pharmacy as it was.
+#[tokio::test]
+async fn real_service_backs_up_and_restores_a_pharmacy_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let cookie = owner_session(service).await;
+
+    // A fact recorded before the backup, which must come back afterwards.
+    let party = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Pre-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(party.status, 201, "{:?}", party.body);
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let backup_id = created.body["backupId"]
+        .as_str()
+        .expect("backup id")
+        .to_owned();
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+
+    // The download is resolved by id and then streamed by the real file route.
+    let resolved = call(
+        service,
+        "GET",
+        &format!("/api/v1/backups/{backup_id}/download"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(resolved.status, 200, "{:?}", resolved.body);
+    let url = resolved.body["url"]
+        .as_str()
+        .expect("download url")
+        .to_owned();
+    let (status, headers, downloaded) = get_bytes(service, &url, Some(&cookie)).await;
+    assert_eq!(status, 200);
+    assert!(
+        headers.to_ascii_lowercase().contains("content-disposition"),
+        "a backup must be offered as a download: {headers}"
+    );
+    let on_disk = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+    assert_eq!(
+        downloaded, on_disk,
+        "the streamed backup is not byte-identical to the file"
+    );
+
+    // Something happens after the backup that the restore must undo.
+    let later = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Post-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(later.status, 201, "{:?}", later.body);
+
+    // The bytes that came back down the socket are the bytes sent up again.
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &downloaded,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    assert_eq!(prepared["report"]["compatibility"], "ready");
+    assert_eq!(prepared["report"]["checksumVerified"], true);
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    assert_eq!(committed.body["restartRequired"], true);
+    assert!(committed.body["safetyBackup"].is_string());
+
+    // The running service now refuses everything, including its own health route, and says why.
+    let refused = call(service, "GET", "/api/v1/auth/status", None, Some(&cookie)).await;
+    assert_eq!(refused.status, 503);
+    assert_eq!(refused.body["code"], "service_restoring");
+
+    // Restart, exactly as main.rs does it.
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT display_name FROM parties ORDER BY display_name")
+            .fetch_all(&reopened)
+            .await
+            .expect("parties");
+    assert_eq!(
+        names,
+        vec!["Pre-Backup Supplier".to_owned()],
+        "the restore did not put the pharmacy back as it was"
+    );
+    let live_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions WHERE revoked_at_utc IS NULL")
+            .fetch_one(&reopened)
+            .await
+            .expect("sessions");
+    assert_eq!(live_sessions, 0, "a session survived a restore");
+    let lineage: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM restore_provenance")
+        .fetch_one(&reopened)
+        .await
+        .expect("provenance");
+    assert_eq!(lineage, 1);
+    reopened.close().await;
+}
+
+/// Refusals at the boundary: the wrong content type, an oversized declaration, and no session.
+#[tokio::test]
+async fn real_service_refuses_backup_uploads_that_break_the_rules_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let cookie = owner_session(service).await;
+
+    // A form encoding is refused before a byte of the body is read: this is the CSRF defence.
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/inspect",
+        "multipart/form-data; boundary=x",
+        b"whatever",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, 422, "{}", String::from_utf8_lossy(&body));
+
+    // Rubbish of the right content type is refused as a damaged backup, not as a server fault.
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/inspect",
+        "application/octet-stream",
+        b"this is a letter, not a backup",
+        Some(&cookie),
+    )
+    .await;
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    assert_eq!(status, 409, "{parsed:?}");
+    assert!(
+        ["backup_corrupt", "backup_product_mismatch"]
+            .contains(&parsed["code"].as_str().unwrap_or_default()),
+        "{parsed:?}"
+    );
+
+    // The backup routes carry their own body limit, and the rest of the product keeps Axum's
+    // default. Three megabytes is past that default and nowhere near the backup ceiling, so one
+    // payload proves both halves: accepted as a damaged backup here, refused outright there.
+    let oversized = vec![b'x'; 3 * 1024 * 1024];
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/inspect",
+        "application/octet-stream",
+        &oversized,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        409,
+        "the backup route did not accept a body past the global default: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The same length sent at an ordinary route is refused, which is the proof that raising the
+    // limit for backups did not raise it for the whole product. The refusal may arrive as 413 or as
+    // a reset — Axum declines before reading — and either way it was not accepted.
+    if let Some((status, _, _)) = try_call_bytes(
+        service,
+        "/api/v1/parties",
+        "application/json",
+        &oversized,
+        Some(&cookie),
+    )
+    .await
+    {
+        assert_eq!(
+            status, 413,
+            "the global body limit was raised for every route"
+        );
+    }
+
+    // And none of it is reachable without a session.
+    let (status, _, _) = call_bytes(
+        service,
+        "/api/v1/backups/inspect",
+        "application/octet-stream",
+        b"anything",
+        None,
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, _, _) = get_bytes(service, "/api/v1/backup-files/anything.aushbackup", None).await;
+    assert_eq!(status, 401);
+}
+
+/// The first-run door is shut the moment an installation has anything in it.
+#[tokio::test]
+async fn real_service_refuses_a_first_run_restore_once_the_pharmacy_exists_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let cookie = owner_session(service).await;
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+    let bytes = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+
+    // No cookie at all, which is exactly how a genuine first run would arrive.
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/setup/restore/prepare",
+        "application/octet-stream",
+        &bytes,
+        None,
+    )
+    .await;
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    assert_eq!(status, 403, "{parsed:?}");
+    assert_eq!(parsed["code"], "setup_already_complete");
+}

@@ -743,6 +743,86 @@ fn with_session_cookie<T: Serialize>(
     (status, [(header::SET_COOKIE, cookie)], Json(body)).into_response()
 }
 
+/// The same guard, for the one kind of request that cannot be JSON.
+///
+/// Requiring `application/json` is not decoration: a cross-site HTML form can only send
+/// `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`, so demanding JSON
+/// shuts that door on every normal mutation. A backup upload cannot be JSON, so it demands
+/// `application/octet-stream` — which is equally impossible for a form to send, and therefore
+/// keeps exactly the protection it replaces. Choosing multipart here would have given it away.
+pub(crate) fn validate_binary_mutation_request(headers: &HeaderMap) -> Result<(), AuthError> {
+    validate_host(headers)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("application/octet-stream")
+    {
+        return Err(AuthError::Validation(
+            "contentType",
+            "must be application/octet-stream",
+        ));
+    }
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        == Some("cross-site")
+    {
+        return Err(AuthError::Validation("origin", "is not allowed"));
+    }
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        && !is_loopback_origin(origin)
+    {
+        return Err(AuthError::Validation("origin", "is not allowed"));
+    }
+    Ok(())
+}
+
+/// Re-verifies a signed-in user's own password.
+///
+/// Used only where a session alone is too weak a claim — a restore destroys the current database,
+/// and a session left open at a counter should not be enough to do that. Reuses the existing
+/// Argon2 path rather than introducing a second password mechanism.
+pub(crate) async fn confirm_password(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    password: &str,
+) -> Result<bool, AuthError> {
+    let encoded: Option<String> = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| AuthError::Internal)?;
+    match encoded {
+        Some(hash) => verify_password_blocking(password.to_owned(), hash).await,
+        None => {
+            // Constant-ish work even when the user has vanished, so timing says nothing.
+            verify_against_dummy(password)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Revokes every session that is still live.
+///
+/// A restored database carries the sessions that were open on the machine the backup came from.
+/// They were issued against a database that no longer exists, and the file may have travelled on a
+/// USB stick since; none of them may survive.
+pub(crate) async fn revoke_all_sessions(pool: &sqlx::SqlitePool) -> Result<u64, AuthError> {
+    let result = sqlx::query(
+        "UPDATE user_sessions SET revoked_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE revoked_at_utc IS NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|_| AuthError::Internal)?;
+    Ok(result.rows_affected())
+}
+
 pub(crate) fn validate_mutation_request(headers: &HeaderMap) -> Result<(), AuthError> {
     validate_host(headers)?;
     let content_type = headers

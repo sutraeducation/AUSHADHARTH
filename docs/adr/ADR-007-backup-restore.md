@@ -1,7 +1,9 @@
 # ADR-007: Backup and restore foundation
 
 ## Status
-Accepted direction; implementation deferred.
+Accepted direction; implemented by [ADR-019](ADR-019-backup-and-restore-implementation.md), which
+supersedes the encryption requirement below for local backups only. Retained unchanged as the record
+of the original direction.
 
 ## Context
 The customer owns locally stored business data and must recover from disk,

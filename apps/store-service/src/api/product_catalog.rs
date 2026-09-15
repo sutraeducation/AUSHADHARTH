@@ -6265,7 +6265,10 @@ mod price_control_tests {
             })
             .unwrap();
         let response = routes()
-            .with_state(ReferenceState { pool })
+            .with_state(ReferenceState {
+                pool,
+                backups: None,
+            })
             .oneshot(request)
             .await
             .unwrap();

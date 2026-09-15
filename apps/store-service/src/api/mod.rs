@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
@@ -8,6 +8,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::{API_VERSION, APPLICATION_VERSION};
 
 pub mod auth;
+pub mod backups;
 pub mod inventory;
 pub mod parties;
 pub mod product_catalog;
@@ -42,7 +43,25 @@ pub struct SystemInfoResponse {
     compatibility: Compatibility,
 }
 
+/// The router as every test builds it: no backup service, so no route can touch a data directory.
 pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
+    router_with_backups(pool, web_dist, None)
+}
+
+/// The router the real service builds.
+///
+/// Opt-in rather than opt-out on purpose. Backup and restore are the only routes that write
+/// outside the database and the only ones that can destroy it, so making them unreachable unless
+/// a caller deliberately supplies a directory is what keeps a stray test away from a real pharmacy.
+pub fn router_with_backups(
+    pool: SqlitePool,
+    web_dist: Option<PathBuf>,
+    backups: Option<Arc<backups::BackupService>>,
+) -> Router {
+    let state = reference_masters::ReferenceState {
+        pool,
+        backups: backups.clone(),
+    };
     let router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/system/info", get(system_info))
@@ -56,7 +75,34 @@ pub fn router(pool: SqlitePool, web_dist: Option<PathBuf>) -> Router {
         .merge(sales::routes())
         .merge(returns::routes())
         .merge(stock_operations::routes())
-        .with_state(reference_masters::ReferenceState { pool });
+        .merge(backups::routes());
+
+    // The download route exists only when there is a directory to serve, and the owner check runs
+    // before `ServeDir` ever sees the request: the file server itself knows nothing about sessions.
+    let router = match &backups {
+        Some(service) => {
+            // A router of its own so the owner check wraps only these paths. Layering the guard
+            // onto the main router would put it in front of every route in the product.
+            let files: Router = Router::new()
+                .fallback_service(ServeDir::new(service.backups_directory.clone()))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    backups::guard_backup_files,
+                ));
+            router.nest_service("/api/v1/backup-files", files)
+        }
+        None => router,
+    };
+
+    // Once a restore has replaced the database, every route answers `service_restoring` until the
+    // service restarts. The static web app is deliberately outside this: the browser still has to
+    // load in order to show what is happening.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        backups::guard_while_restoring,
+    ));
+
+    let router = router.with_state(state);
 
     if let Some(dist) = web_dist {
         router.fallback_service(

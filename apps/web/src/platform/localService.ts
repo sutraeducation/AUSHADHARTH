@@ -65,6 +65,44 @@ export async function localServiceRequest(
   return body;
 }
 
+/**
+ * Sends a file to the Store Service as raw bytes.
+ *
+ * `application/octet-stream` rather than a multipart form on purpose: the service refuses form
+ * encodings precisely because a cross-site HTML form can send them, and octet-stream cannot be
+ * produced by a form at all. There is no timeout — a backup can be a gigabyte, and cutting off an
+ * upload at five seconds would make restore impossible on exactly the installations that need it
+ * most. The caller passes a signal if it wants to offer a cancel.
+ */
+export async function localServiceUpload(
+  path: string,
+  file: Blob,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const response = await fetch(`${LOCAL_SERVICE_ORIGIN}${path}`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/octet-stream" },
+    body: file,
+    credentials: "same-origin",
+    signal
+  });
+  const body = (await response.json().catch(() => null)) as {
+    code?: string;
+    message?: string;
+    issues?: Array<{ field: string; message: string }>;
+  } | null;
+  if (!response.ok) {
+    throw new LocalServiceError(
+      response.status,
+      body?.code ?? "internal_error",
+      safeErrorMessage(body?.code),
+      undefined,
+      body?.issues ?? []
+    );
+  }
+  return body;
+}
+
 export function safeErrorMessage(code?: string): string {
   switch (code) {
     case "invalid_credentials": return "The login ID or password is incorrect.";
@@ -137,6 +175,25 @@ export function safeErrorMessage(code?: string): string {
     case "duplicate_supplier_credit_note": return "That supplier credit note is already recorded against this return.";
     case "party_role_conflict": return "This role conflicts with the party's current status.";
     case "party_address_conflict": return "This address conflicts with the party's or the State's current status.";
+    // Backup and restore. Every one of these is read by somebody whose data may be at stake, so
+    // each says plainly what happened and what is still true of their existing records.
+    case "backup_format_unsupported":
+    case "backup_too_new": return "This backup was made by a newer version of AUSHADHARTH. Update this installation first.";
+    case "backup_corrupt": return "This file is damaged and cannot be used as a backup.";
+    case "backup_product_mismatch": return "That is not an AUSHADHARTH backup.";
+    case "backup_invalid_database": return "This backup does not contain a usable AUSHADHARTH database.";
+    case "backup_partially_migrated": return "This backup was interrupted while being upgraded and cannot be used.";
+    case "backup_checksum_mismatch": return "This backup is damaged: its contents do not match its own record.";
+    case "backup_too_large": return "That file is too large to be an AUSHADHARTH backup.";
+    case "insufficient_disk_space": return "There is not enough free space on this PC to do that safely. Free some space and try again.";
+    case "candidate_not_found": return "That restore is no longer ready. Choose the backup file again.";
+    case "candidate_expired": return "That restore was prepared too long ago. Choose the backup file again.";
+    case "backup_not_found": return "That backup was not found.";
+    case "setup_already_complete": return "This installation is already set up. Sign in to restore a backup.";
+    case "service_restoring": return "AUSHADHARTH is restoring a backup. Restart the Local Store Service to continue.";
+    case "restore_failed": return "The restore could not be completed. Your existing data has been kept.";
+    case "invalid_password": return "That password is not correct.";
+    case "backup_unavailable": return "Backup is not available in this configuration.";
     case "validation_failed": return "Check the highlighted information and try again.";
     default: return "AUSHADHARTH could not complete that request. Try again.";
   }

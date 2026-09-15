@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -20,6 +20,12 @@ use crate::{
 #[derive(Clone)]
 pub struct ReferenceState {
     pub pool: SqlitePool,
+    /// Present only when the service was built against a real data directory.
+    ///
+    /// `None` in every test router by construction, so a test can never reach a handler that would
+    /// write into a pharmacy's backup folder: the routes answer `backup_unavailable` instead. A test
+    /// that wants the real behaviour has to name its own throwaway directory and say so.
+    pub backups: Option<Arc<crate::api::backups::BackupService>>,
 }
 
 #[derive(Debug, Deserialize)]
