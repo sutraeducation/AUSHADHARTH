@@ -30,6 +30,7 @@ use crate::domain::{
     money::{self, LineAmounts, MoneyError, RateComponents, TaxTreatment},
     price_control::{self, Comparability, PriceControlStatus},
     sales::{self, QuantityBasis, SaleMoneyError, SaleQuantity},
+    store_profile::{self, MissingSellerFact},
     taxation,
 };
 
@@ -49,6 +50,10 @@ pub(crate) enum SaleError {
     },
     CustomerNotEligible,
     StoreTaxIncomplete,
+    /// The Store has no name, no address, or no active sale licence, so no lawful memo could be
+    /// issued for this sale. Carries the exact missing particulars so the browser can send the
+    /// operator to one field instead of to a settings page.
+    StoreLegalProfileIncomplete(Vec<MissingSellerFact>),
     ClassificationIncomplete,
     TaxRateNotFound,
     PackMismatch,
@@ -158,6 +163,23 @@ impl IntoResponse for SaleError {
                     "store_tax_profile_incomplete",
                     "Record this store's place of supply before selling.",
                 ),
+            ),
+            Self::StoreLegalProfileIncomplete(missing) => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "store_legal_profile_incomplete",
+                    message: "Complete the pharmacy's details in Store Profile before selling.",
+                    issues: missing
+                        .into_iter()
+                        .map(|fact| ErrorIssue {
+                            field: fact.field().to_owned(),
+                            message: fact.message().to_owned(),
+                        })
+                        .collect(),
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
             ),
             Self::ClassificationIncomplete => (
                 StatusCode::CONFLICT,
@@ -1368,6 +1390,18 @@ async fn post_within_transaction(
     let store_state_id = store_state_id.ok_or(SaleError::StoreTaxIncomplete)?;
     let store_state_code = state_code(connection, &store_state_id).await?;
 
+    // The seller is resolved HERE, inside the same `BEGIN IMMEDIATE` transaction that read the
+    // tax geography and will write the document. Every table the seller spans — identity, address,
+    // licences — is read in one call against this connection, so the snapshot is one coherent
+    // profile rather than a name from before an edit and an address from after it. An operator
+    // saving Store Profile mid-sale either commits before this read or waits for the write lock;
+    // there is no third outcome, and nothing here is taken from the browser.
+    let seller_source = crate::api::store_profile::seller_profile_source(connection, &store_id)
+        .await
+        .map_err(map_database_error)?;
+    let seller =
+        store_profile::resolve(&seller_source).map_err(SaleError::StoreLegalProfileIncomplete)?;
+
     // The customer's facts are recorded so a B2B buyer has the document they need. They are
     // deliberately NOT used to decide the treatment: see below.
     let customer = match customer_party_id.as_deref() {
@@ -1457,7 +1491,8 @@ async fn post_within_transaction(
         sqlx::query(
             "UPDATE sale_lines SET product_display_name=?,pack_display_label=?,base_unit_label=?,\
              batch_number=?,batch_expires_on=?,batch_mrp_paise=?,hsn_code_id=?,hsn_code=?,\
-             tax_category_id=?,tax_treatment_kind=?,tax_rate_version_id=?,cgst_basis_points=?,\
+             tax_category_id=?,tax_treatment_kind=?,tax_rate_version_id=?,quantity_scale=?,\
+             cgst_basis_points=?,\
              sgst_basis_points=?,igst_basis_points=?,cess_basis_points=?,price_control_status=?,\
              controlled_formulation_id=?,price_control_version_id=?,ceiling_price_paise=?,\
              ceiling_basis=?,taxable_value_paise=?,cgst_paise=?,sgst_paise=?,igst_paise=?,\
@@ -1474,6 +1509,7 @@ async fn post_within_transaction(
         .bind(&entry.tax_category_id)
         .bind(&entry.tax_treatment_kind)
         .bind(&entry.tax_rate_version_id)
+        .bind(entry.quantity_scale)
         .bind(entry.rate.cgst_basis_points)
         .bind(entry.rate.sgst_basis_points)
         .bind(entry.rate.igst_basis_points)
@@ -1542,7 +1578,10 @@ async fn post_within_transaction(
          customer_gst_registration_status=?,customer_normalized_gstin=?,customer_state_code=?,\
          tax_treatment=?,taxable_value_paise=?,cgst_paise=?,sgst_paise=?,igst_paise=?,cess_paise=?,\
          grand_total_paise=?,posted_by_user_id=?,posted_at_utc=?,posting_idempotency_key=?,\
-         posting_fingerprint=?,updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
+         posting_fingerprint=?,seller_snapshot_version=1,seller_legal_name=?,seller_trade_name=?,\
+         seller_address_line1=?,seller_address_line2=?,seller_city=?,seller_postal_code=?,\
+         seller_state_name=?,seller_phone=?,seller_email=?,seller_licence_text=?,\
+         updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
     )
     .bind(next)
     .bind(&number.series_code)
@@ -1572,6 +1611,16 @@ async fn post_within_transaction(
     .bind(&now)
     .bind(idempotency_key)
     .bind(&fingerprint)
+    .bind(&seller.legal_name)
+    .bind(&seller.trade_name)
+    .bind(&seller.address_line1)
+    .bind(&seller.address_line2)
+    .bind(&seller.city)
+    .bind(&seller.postal_code)
+    .bind(&seller.state_name)
+    .bind(&seller.phone)
+    .bind(&seller.email)
+    .bind(&seller.licence_text)
     .bind(&now)
     .bind(id)
     .bind(revision)
@@ -1697,6 +1746,9 @@ struct ComputedLine {
     tax_category_id: Option<String>,
     tax_treatment_kind: Option<String>,
     tax_rate_version_id: Option<String>,
+    /// How many decimal places the line's atom count represents. Frozen here so a renderer never
+    /// has to ask the product catalogue what an integer means.
+    quantity_scale: i64,
     rate: RateComponents,
     price_control_status: String,
     controlled_formulation_id: Option<String>,
@@ -1873,6 +1925,7 @@ async fn resolve_and_compute(
         tax_category_id: Some(tax_category_id),
         tax_treatment_kind: Some(treatment_kind),
         tax_rate_version_id: rate_version_id,
+        quantity_scale: product.quantity_scale,
         rate,
         price_control_status: product.price_control_status,
         controlled_formulation_id: product.controlled_formulation_id,
@@ -2334,6 +2387,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        record_legal_profile(&pool, &store_id).await;
         let owner_id = insert_session(&pool, "owner_admin", OWNER).await;
         insert_session(&pool, "cashier", CASHIER).await;
 
@@ -4000,6 +4054,42 @@ mod tests {
         .await
     }
 
+    /// The seller facts a pharmacy must hold before it may issue a memo: a registered name, an
+    /// operating address, and an active drug sale licence. Recorded here because a Sale cannot be
+    /// posted without them — see `store_legal_profile_incomplete`.
+    async fn record_legal_profile(pool: &SqlitePool, store_id: &str) {
+        sqlx::query(
+            "UPDATE store_identity SET legal_name='Care Pharmacy Private Limited',\
+             primary_phone='02012345678',primary_email='care@example.test' WHERE store_id=?",
+        )
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO store_addresses (id,store_id,line1,city,state_id,postal_code,\
+             created_at_utc,updated_at_utc) VALUES (?,?,'12 Market Road','Pune',?,'411001',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .bind(MAHARASHTRA)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
+             normalized_licence_number,created_at_utc,updated_at_utc) \
+             VALUES (?,?,'Form 20','MH-20-1234','MH201234',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn insert_session(pool: &SqlitePool, role: &str, token: &str) -> String {
         let user_id = Uuid::now_v7().to_string();
         let login = format!("{role}-{}", &user_id[24..32]);
@@ -4078,5 +4168,651 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1L-A — the seller snapshot and the canonical invoice
+    //
+    // A posted Sale is a document that was handed to a customer. These prove that it keeps saying
+    // what it said, whatever happens to the Store, the catalogue or the party master afterwards.
+    // -----------------------------------------------------------------------------------------
+
+    /// Posts one complete Sale and returns its id.
+    async fn post_one(f: &Fixture) -> String {
+        let (_, created) = request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/lines"),
+            line_body(1, f, "pack", 1, 8000),
+        )
+        .await;
+        let (status, posted) =
+            post_sale_request(f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        id
+    }
+
+    async fn invoice(f: &Fixture, id: &str) -> (StatusCode, Value) {
+        request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/invoice"),
+            Value::Null,
+        )
+        .await
+    }
+
+    /// Removes one of the three particulars Rule 65(4)(3)(i) requires, so the refusal can be seen.
+    async fn strip(pool: &SqlitePool, what: &str) {
+        let statement = match what {
+            "name" => "UPDATE store_identity SET legal_name=NULL",
+            "address" => "DELETE FROM store_addresses",
+            "licence" => "DELETE FROM store_licences",
+            other => panic!("unknown particular {other}"),
+        };
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_posted_sale_freezes_the_seller_and_reports_it_as_version_one() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["regulatory"]["sellerSnapshotVersion"], 1);
+        assert_eq!(body["regulatory"]["legacyDocument"], false);
+        assert_eq!(
+            body["sellerSnapshot"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        assert_eq!(body["sellerSnapshot"]["tradeName"], "Care Pharmacy");
+        assert_eq!(body["sellerSnapshot"]["addressLine1"], "12 Market Road");
+        assert_eq!(body["sellerSnapshot"]["city"], "Pune");
+        assert_eq!(body["sellerSnapshot"]["postalCode"], "411001");
+        assert_eq!(body["sellerSnapshot"]["stateName"], "Maharashtra");
+        assert_eq!(body["sellerSnapshot"]["licenceText"], "Form 20: MH-20-1234");
+        assert_eq!(body["sellerSnapshot"]["gstin"], "27AAPFU0939F1ZV");
+        // The current profile is for legacy documents only and must not appear beside a snapshot.
+        assert!(body["currentSellerProfile"].is_null());
+    }
+
+    /// The gate: each missing particular refuses the posting, by name.
+    #[tokio::test]
+    async fn a_sale_cannot_be_posted_while_the_seller_profile_is_incomplete() {
+        for (particular, field) in [
+            ("name", "legalName"),
+            ("address", "address.line1"),
+            ("licence", "licences"),
+        ] {
+            let f = fixture().await;
+            strip(&f.pool, particular).await;
+
+            let (_, created) =
+                request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+            let id = created["id"].as_str().unwrap().to_owned();
+            request(
+                f.pool.clone(),
+                "POST",
+                &format!("/api/v1/sales/{id}/lines"),
+                line_body(1, &f, "pack", 1, 8000),
+            )
+            .await;
+            let (status, body) =
+                post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{particular}: {body}");
+            assert_eq!(body["code"], "store_legal_profile_incomplete");
+            assert_eq!(body["issues"][0]["field"], field);
+            // Refused before anything was allocated: the series must not have advanced.
+            let numbers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_number_series")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+            assert_eq!(numbers, 0, "a refused posting consumed a number");
+        }
+    }
+
+    /// An archived licence is not an active one, and archiving the last one closes the counter.
+    #[tokio::test]
+    async fn archiving_the_only_licence_stops_new_sales_without_touching_old_ones() {
+        let f = fixture().await;
+        let before = post_one(&f).await;
+
+        sqlx::query(
+            "UPDATE store_licences SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='surrendered'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (_, created) = request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/lines"),
+            line_body(1, &f, "pack", 1, 8000),
+        )
+        .await;
+        let (status, body) = post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "store_legal_profile_incomplete");
+
+        // The document issued while the licence was active still carries it.
+        let (status, old) = invoice(&f, &before).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(old["sellerSnapshot"]["licenceText"], "Form 20: MH-20-1234");
+    }
+
+    /// The heart of the phase: everything about the seller can change, and the document does not.
+    #[tokio::test]
+    async fn editing_the_store_after_posting_never_changes_the_issued_document() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let (_, before) = invoice(&f, &id).await;
+
+        // Every seller fact is changed, including the GSTIN and the licence.
+        sqlx::query(
+            "UPDATE store_identity SET display_name='Renamed Chemists',\
+             legal_name='Renamed Chemists LLP',primary_phone='9999999999',\
+             primary_email='new@example.test',gstin='29AAGCB7383J1Z4',\
+             normalized_gstin='29AAGCB7383J1Z4',place_of_supply_state_id=?",
+        )
+        .bind(KARNATAKA)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE store_addresses SET line1='99 New Road',city='Mumbai',postal_code='400001'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE store_licences SET licence_type='Form 21',licence_number='MH-21-9999',\
+             normalized_licence_number='MH219999'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, after) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(
+            before["sellerSnapshot"], after["sellerSnapshot"],
+            "the issued document acquired the store's later details"
+        );
+        assert_eq!(
+            after["sellerSnapshot"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        assert_eq!(after["sellerSnapshot"]["addressLine1"], "12 Market Road");
+        assert_eq!(
+            after["sellerSnapshot"]["licenceText"],
+            "Form 20: MH-20-1234"
+        );
+        assert_eq!(after["sellerSnapshot"]["gstin"], "27AAPFU0939F1ZV");
+    }
+
+    /// A Sale posted after the edit carries the new details, so the snapshot is not merely frozen —
+    /// it tracks the profile at the moment of each posting.
+    #[tokio::test]
+    async fn a_later_sale_carries_the_later_profile() {
+        let f = fixture().await;
+        let first = post_one(&f).await;
+
+        sqlx::query("UPDATE store_addresses SET line1='99 New Road'")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let second = post_one(&f).await;
+
+        let (_, old) = invoice(&f, &first).await;
+        let (_, new) = invoice(&f, &second).await;
+        assert_eq!(old["sellerSnapshot"]["addressLine1"], "12 Market Road");
+        assert_eq!(new["sellerSnapshot"]["addressLine1"], "99 New Road");
+    }
+
+    /// Direct SQL cannot rewrite a posted seller snapshot; the frozen posted-row trigger covers it.
+    #[tokio::test]
+    async fn the_seller_snapshot_cannot_be_mutated_by_direct_sql() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        for statement in [
+            "UPDATE sale_documents SET seller_legal_name='Someone Else' WHERE id=?",
+            "UPDATE sale_documents SET seller_address_line1='Elsewhere' WHERE id=?",
+            "UPDATE sale_documents SET seller_licence_text='Forged' WHERE id=?",
+            "UPDATE sale_documents SET seller_snapshot_version=0 WHERE id=?",
+            "DELETE FROM sale_documents WHERE id=?",
+        ] {
+            let outcome = sqlx::query(statement).bind(&id).execute(&f.pool).await;
+            assert!(outcome.is_err(), "posted document accepted: {statement}");
+        }
+    }
+
+    /// Renaming a product, changing its HSN, or archiving the lot leaves the document alone and
+    /// still readable.
+    #[tokio::test]
+    async fn catalogue_changes_after_posting_leave_the_document_readable_and_unchanged() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let (_, before) = invoice(&f, &id).await;
+
+        sqlx::query("UPDATE products SET display_name='Paracetamol 500 mg Tablet' WHERE id=?")
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_batches SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='recalled' WHERE id=?")
+            .bind(&f.batch_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let (status, after) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(
+            before["lines"], after["lines"],
+            "the lines followed the catalogue"
+        );
+        assert_eq!(after["lines"][0]["description"], "Crocin 500");
+    }
+
+    /// The DTO adds up to the posted header, and says so by refusing when it does not.
+    #[tokio::test]
+    async fn the_invoice_totals_are_the_posted_totals() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let (_, body) = invoice(&f, &id).await;
+
+        assert_eq!(body["totals"]["taxableValuePaise"], 8000);
+        assert_eq!(body["totals"]["cgstPaise"], 480);
+        assert_eq!(body["totals"]["sgstPaise"], 480);
+        assert_eq!(body["totals"]["grandTotalPaise"], 8960);
+        assert_eq!(body["taxSummary"][0]["taxableValuePaise"], 8000);
+        assert_eq!(body["taxSummary"][0]["cgstPaise"], 480);
+        assert_eq!(body["tender"][0]["amountPaise"], 8960);
+        assert_eq!(body["lines"][0]["quantityText"], "1 × Strip");
+        assert!(body["lines"][0]["batchNumber"].is_string());
+        assert_eq!(body["lines"][0]["batchNumber"], "B-1");
+    }
+
+    /// A corrupted stored document is reported, never silently corrected into something plausible.
+    #[tokio::test]
+    async fn an_invoice_that_does_not_add_up_is_refused_rather_than_repaired() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        // Reached around the posted-row trigger deliberately, to simulate corruption rather than a
+        // supported edit: this is what a damaged file would look like.
+        sqlx::query("PRAGMA writable_schema=ON")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sale_documents SET grand_total_paise=999999 WHERE id=?")
+            .bind(&id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "invoice_invariant_failed");
+    }
+
+    /// A draft is not a document and must never be described as one.
+    #[tokio::test]
+    async fn a_draft_has_no_invoice() {
+        let f = fixture().await;
+        let (_, created) = request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "invoice_not_posted");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_malformed_sale_is_refused_safely() {
+        let f = fixture().await;
+        let (status, body) = invoice(&f, &Uuid::now_v7().to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "invoice_not_found");
+
+        let (status, body) = invoice(&f, "not-a-uuid").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation_failed");
+    }
+
+    /// Every operational role can read the invoice for a Sale they can already see; nobody outside
+    /// a session can.
+    #[tokio::test]
+    async fn reading_an_invoice_follows_the_existing_sale_read_policy() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let uri = format!("/api/v1/sales/{id}/invoice");
+
+        for token in [OWNER, CASHIER] {
+            let (status, body) =
+                request_as(f.pool.clone(), "GET", &uri, Value::Null, Some(token)).await;
+            assert_eq!(status, StatusCode::OK, "{token}: {body}");
+        }
+        let (status, body) = request_as(f.pool.clone(), "GET", &uri, Value::Null, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    /// A registered seller selling only taxable goods issues a tax invoice.
+    #[tokio::test]
+    async fn a_taxable_basket_from_a_registered_seller_is_a_tax_invoice() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let (_, body) = invoice(&f, &id).await;
+        assert_eq!(body["document"]["documentType"], "tax_invoice");
+        assert!(body["document"]["documentTypeReason"].is_null());
+        assert_eq!(body["regulatory"]["sellerRegistered"], true);
+        assert_eq!(body["regulatory"]["einvoiceApplicable"], false);
+    }
+
+    /// An unregistered pharmacy issues no GST document at all. The Drugs Rules memo still applies,
+    /// which is why the seller profile is still required.
+    #[tokio::test]
+    async fn an_unregistered_seller_issues_a_retail_cash_memo() {
+        let f = fixture().await;
+        sqlx::query(
+            "UPDATE store_identity SET gst_registration_status='unregistered',gstin=NULL,\
+             normalized_gstin=NULL",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let id = post_one(&f).await;
+        let (_, body) = invoice(&f, &id).await;
+        assert_eq!(body["document"]["documentType"], "retail_cash_memo");
+        assert_eq!(body["regulatory"]["sellerRegistered"], false);
+        // Still a complete seller snapshot: Rule 65 does not care about GST.
+        assert_eq!(body["sellerSnapshot"]["licenceText"], "Form 20: MH-20-1234");
+    }
+
+    /// The one classification this project refuses to guess: Rule 46A covers a mixed basket sold to
+    /// an UNREGISTERED person and says nothing about a registered one.
+    #[tokio::test]
+    async fn a_mixed_basket_to_a_registered_recipient_is_left_unresolved() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        // Both halves of the mix, and a registered recipient, written directly because the fixture
+        // catalogue has one tax category.
+        sqlx::query("PRAGMA writable_schema=ON")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER sale_lines_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
+             batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
+             tax_treatment_kind,taxable_value_paise,line_total_paise,created_at_utc,updated_at_utc) \
+             SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,'exempt',0,0,\
+             created_at_utc,updated_at_utc FROM sale_lines WHERE sale_document_id=? LIMIT 1",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&id)
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE sale_documents SET customer_gst_registration_status='registered' WHERE id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["document"]["documentType"],
+            "document_classification_unresolved"
+        );
+        assert!(
+            body["document"]["documentTypeReason"]
+                .as_str()
+                .unwrap()
+                .contains("Rule 46A"),
+            "the refusal does not say why"
+        );
+        // The historical Sale still reads in full: only the claim about its type is withheld.
+        assert_eq!(body["lines"].as_array().unwrap().len(), 2);
+    }
+
+    /// A Sale that predates the snapshot keeps its history and never borrows the current Store's.
+    #[tokio::test]
+    async fn a_legacy_sale_reports_itself_and_keeps_current_details_separate() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        sqlx::query("PRAGMA writable_schema=ON")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER sale_documents_seller_snapshot_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        // Exactly what a Sale posted before migration 0017 looks like.
+        sqlx::query(
+            "UPDATE sale_documents SET seller_snapshot_version=0,seller_legal_name=NULL,\
+             seller_trade_name=NULL,seller_address_line1=NULL,seller_licence_text=NULL WHERE id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["regulatory"]["legacyDocument"], true);
+        assert_eq!(body["regulatory"]["sellerSnapshotVersion"], 0);
+        assert!(
+            body["sellerSnapshot"].is_null(),
+            "current details were presented as history"
+        );
+        assert_eq!(
+            body["currentSellerProfile"]["displayName"], "Care Pharmacy",
+            "the current profile is not offered for inspection"
+        );
+        assert_eq!(
+            body["currentSellerProfile"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+    }
+
+    /// A walk-in stays a walk-in: no name is invented, and no address is required of them.
+    #[tokio::test]
+    async fn a_walk_in_recipient_is_explicit_and_carries_no_invented_details() {
+        let f = fixture().await;
+        let id = post_one(&f).await;
+        let (_, body) = invoice(&f, &id).await;
+        assert_eq!(body["recipient"]["walkIn"], true);
+        assert!(body["recipient"]["name"].is_null());
+        assert!(body["recipient"]["gstin"].is_null());
+    }
+
+    /// A named customer's details are the posted ones, even after the party master is edited or
+    /// archived.
+    #[tokio::test]
+    async fn a_named_recipient_keeps_the_name_that_was_on_the_document() {
+        let f = fixture().await;
+        let (_, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            draft_body(Some(&f.customer_id)),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/lines"),
+            line_body(1, &f, "pack", 1, 8000),
+        )
+        .await;
+        post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        let (_, before) = invoice(&f, &id).await;
+
+        sqlx::query(
+            "UPDATE parties SET display_name='Someone Else',status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='moved' WHERE id=?",
+        )
+        .bind(&f.customer_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, after) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(before["recipient"], after["recipient"]);
+        assert_eq!(after["recipient"]["walkIn"], false);
+    }
+
+    /// Posting and a Store Profile edit race. Whatever the interleaving, the document must carry one
+    /// coherent profile — never a name from before an edit beside an address from after it.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_profile_is_edited_snapshots_one_coherent_state() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let (_, created) =
+                request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+            let id = created["id"].as_str().unwrap().to_owned();
+            request(
+                f.pool.clone(),
+                "POST",
+                &format!("/api/v1/sales/{id}/lines"),
+                line_body(1, &f, "pack", 1, 8000),
+            )
+            .await;
+
+            // Both halves of the profile change together, as one transaction, exactly as the API
+            // would. A posting that read between them would produce a torn snapshot.
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                sqlx::query("UPDATE store_identity SET legal_name='Second Name Limited'")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE store_addresses SET line1='Second Road'")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let poster = post_sale_request(&f, &id, 2, &key, 8960);
+            let (posted, edited) = tokio::join!(poster, editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+
+            let (name, line1): (String, String) = sqlx::query_as(
+                "SELECT seller_legal_name,seller_address_line1 FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            let coherent = (name == "Care Pharmacy Private Limited" && line1 == "12 Market Road")
+                || (name == "Second Name Limited" && line1 == "Second Road");
+            assert!(
+                coherent,
+                "attempt {attempt} produced a torn snapshot: {name} / {line1}"
+            );
+        }
+    }
+
+    /// The same race against a licence change, which lives in a third table.
+    #[tokio::test]
+    async fn a_sale_posted_while_a_licence_changes_snapshots_one_coherent_state() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let (_, created) =
+                request(f.pool.clone(), "POST", "/api/v1/sales", draft_body(None)).await;
+            let id = created["id"].as_str().unwrap().to_owned();
+            request(
+                f.pool.clone(),
+                "POST",
+                &format!("/api/v1/sales/{id}/lines"),
+                line_body(1, &f, "pack", 1, 8000),
+            )
+            .await;
+
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                sqlx::query(
+                    "UPDATE store_licences SET licence_type='Form 21',licence_number='MH-21-7777',\
+                     normalized_licence_number='MH217777'",
+                )
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+                transaction.commit().await.unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let poster = post_sale_request(&f, &id, 2, &key, 8960);
+            let (posted, edited) = tokio::join!(poster, editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+
+            let text: String =
+                sqlx::query_scalar("SELECT seller_licence_text FROM sale_documents WHERE id=?")
+                    .bind(&id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap();
+            assert!(
+                text == "Form 20: MH-20-1234" || text == "Form 21: MH-21-7777",
+                "attempt {attempt} produced a half-applied licence: {text}"
+            );
+        }
+    }
+
+    /// Text an operator typed is carried to the document unchanged. Escaping is a renderer's job,
+    /// and a snapshot that rewrote it would no longer be what was issued.
+    #[tokio::test]
+    async fn hostile_and_unicode_store_text_survives_to_the_document_verbatim() {
+        let f = fixture().await;
+        let hostile = "<script>alert('x')</script> श्री & Söhne";
+        sqlx::query("UPDATE store_identity SET legal_name=?")
+            .bind(hostile)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE store_addresses SET line1=?")
+            .bind(hostile)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let id = post_one(&f).await;
+        let (status, body) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sellerSnapshot"]["legalName"], hostile);
+        assert_eq!(body["sellerSnapshot"]["addressLine1"], hostile);
     }
 }

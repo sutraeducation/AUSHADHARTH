@@ -463,3 +463,13 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .button--ghost:hover:not(:disabled) { background: var(--primary-50); }
 .entry-choice { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
 .entry-choice .button { width: 100%; }
+
+/* Store Profile sections. A panel with its own edit control needs a heading row; a blocking
+   callout needs to read as a stop rather than as a note. */
+.panel-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 17px 19px 0; }
+.panel-heading h2 { margin: 0; font-size: .82rem; }
+.panel-callout--blocking { border-color: var(--danger-100); background: #fff3f2; }
+.panel-callout--blocking strong { color: var(--danger-700); }
+.panel-callout--blocking ul { display: block; margin: 8px 0 0; padding-left: 18px; color: var(--ink-700); font-size: .68rem; font-weight: 500; line-height: 1.7; list-style: disc; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 560px) { .field-row { grid-template-columns: 1fr; } }

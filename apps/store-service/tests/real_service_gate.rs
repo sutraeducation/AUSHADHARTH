@@ -884,6 +884,61 @@ fn gstin_for(state: &str) -> String {
     format!("{body}{}", alphabet[checksum])
 }
 
+/// The seller facts a pharmacy must hold before any Sale may be posted: a registered name, an
+/// operating address, and an active drug sale licence. Recorded through the real endpoints,
+/// because a fixture that reached around the API would prove nothing about the API.
+async fn complete_legal_profile(service: &Service, cookie: &str) {
+    let profile = call(service, "GET", "/api/v1/store/profile", None, Some(cookie)).await;
+    assert_eq!(profile.status, 200, "{:?}", profile.body);
+    assert_eq!(
+        profile.body["sellerComplete"], false,
+        "a fresh installation already claimed to be able to issue a memo"
+    );
+
+    let identity = call(
+        service,
+        "PUT",
+        "/api/v1/store/profile",
+        Some(json!({
+            "expectedRevision": profile.body["revision"],
+            "displayName": "Integration Pharmacy",
+            "legalName": "Integration Pharmacy Private Limited",
+            "primaryPhone": "02012345678",
+            "primaryEmail": "counter@example.test"
+        })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(identity.status, 200, "{:?}", identity.body);
+
+    let address = call(
+        service,
+        "PUT",
+        "/api/v1/store/address",
+        Some(json!({
+            "line1": "12 Market Road", "city": "Pune",
+            "stateId": MAHARASHTRA, "postalCode": "411001"
+        })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(address.status, 200, "{:?}", address.body);
+
+    let licence = call(
+        service,
+        "POST",
+        "/api/v1/store/licences",
+        Some(json!({ "licenceType": "Form 20", "licenceNumber": "MH-20-1234" })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(licence.status, 201, "{:?}", licence.body);
+    assert_eq!(
+        licence.body["sellerComplete"], true,
+        "the profile is still incomplete after all three particulars were recorded"
+    );
+}
+
 async fn seed_purchase_world(
     service: &Service,
     supplier_state: &str,
@@ -904,6 +959,7 @@ async fn seed_purchase_world(
     )
     .await;
     assert_eq!(store.status, 200, "{:?}", store.body);
+    complete_legal_profile(service, &cookie).await;
 
     let supplier_id = create_supplier(service, &cookie, "Sharma Medicals", supplier_state).await;
 

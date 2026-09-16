@@ -1283,6 +1283,9 @@ export const SaleErrorCodeSchema = z.enum([
   "revision_conflict",
   "customer_not_eligible",
   "store_tax_profile_incomplete",
+  // Phase 1L-A: the pharmacy has no recorded name, address or drug sale licence, so no lawful
+  // memo could be issued for the sale.
+  "store_legal_profile_incomplete",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -1964,3 +1967,224 @@ export type PreparedRestore = z.infer<typeof PreparedRestoreSchema>;
 export type RestoreCommitInput = z.infer<typeof RestoreCommitInputSchema>;
 export type RestoreCommitted = z.infer<typeof RestoreCommittedSchema>;
 export type BackupErrorCode = z.infer<typeof BackupErrorCodeSchema>;
+
+/* ------------------------------------------------------------------------------------------------
+ * Store legal profile, and the invoice a posted Sale becomes
+ *
+ * The seller particulars a pharmacy must record before it can issue a bill — Rule 46(a) of the CGST
+ * Rules wants the supplier's name, address and GSTIN, and Rule 65(4)(3)(i) of the Drugs Rules wants
+ * the dealer's name, address and sale licence number on every retail drug memo whether or not GST
+ * applies — plus the canonical document those facts are frozen into.
+ * ---------------------------------------------------------------------------------------------- */
+
+export const StoreAddressSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  line1: z.string(),
+  line2: z.string().nullable(),
+  city: z.string().nullable(),
+  stateId: z.string().nullable(),
+  postalCode: z.string().nullable(),
+  countryCode: z.string()
+});
+
+export const StoreLicenceSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  /** Bounded free text, not an enumeration: what a State authority prints on a certificate varies. */
+  licenceType: z.string(),
+  /** Preserved exactly as transcribed. Nothing parses this. */
+  licenceNumber: z.string(),
+  issuingAuthority: z.string().nullable(),
+  validFrom: z.string().nullable(),
+  validUpto: z.string().nullable()
+});
+
+/** One seller particular the Store is still missing, named so the operator can be sent to it. */
+export const MissingSellerFactSchema = z.object({
+  field: z.string(),
+  message: z.string()
+});
+
+export const StoreProfileSchema = z.object({
+  storeId: z.string(),
+  revision: z.number().int().positive(),
+  /** The trading name, shown on every screen. */
+  displayName: z.string(),
+  /** The registered entity name, frequently different. Neither substitutes for the other. */
+  legalName: z.string().nullable(),
+  primaryPhone: z.string().nullable(),
+  primaryEmail: z.string().nullable(),
+  gstRegistrationStatus: GstRegistrationStatusSchema,
+  gstin: z.string().nullable(),
+  normalizedGstin: z.string().nullable(),
+  placeOfSupplyStateId: z.string().nullable(),
+  /** A place of supply is recorded, so a GST-aware document can be posted. */
+  taxComplete: z.boolean(),
+  address: StoreAddressSchema.nullable(),
+  licences: StoreLicenceSchema.array(),
+  /** A Sale may be posted. An unregistered pharmacy still needs a name, an address and a licence. */
+  sellerComplete: z.boolean(),
+  missingSellerFacts: MissingSellerFactSchema.array()
+});
+
+/**
+ * What kind of document a posted Sale is.
+ *
+ * `document_classification_unresolved` is a real answer. A registered seller supplying a mixed
+ * taxable and exempt basket to a registered recipient falls outside Rule 46A, which is written for
+ * unregistered recipients, and the service refuses to guess through a tax question.
+ */
+export const InvoiceDocumentTypeSchema = z.enum([
+  "tax_invoice",
+  "bill_of_supply",
+  "invoice_cum_bill_of_supply",
+  "retail_cash_memo",
+  "document_classification_unresolved"
+]);
+
+export const InvoiceSellerSnapshotSchema = z.object({
+  legalName: z.string(),
+  tradeName: z.string().nullable(),
+  addressLine1: z.string(),
+  addressLine2: z.string().nullable(),
+  city: z.string().nullable(),
+  postalCode: z.string().nullable(),
+  stateName: z.string().nullable(),
+  stateCode: z.string().nullable(),
+  phone: z.string().nullable(),
+  email: z.string().nullable(),
+  licenceText: z.string(),
+  gstRegistrationStatus: z.string().nullable(),
+  gstin: z.string().nullable()
+});
+
+export const InvoiceLineSchema = z.object({
+  lineNumber: z.number().int().positive(),
+  description: z.string(),
+  packLabel: z.string().nullable(),
+  batchNumber: z.string(),
+  expiresOn: z.string().nullable(),
+  hsnCode: z.string().nullable(),
+  /** Human-readable, built by the service. Raw atoms never reach a page. */
+  quantityText: z.string(),
+  quantityBasis: z.string(),
+  quantityPacks: z.number().int().nullable(),
+  quantityAtoms: z.number().int(),
+  quantityScale: z.number().int().nullable(),
+  unitLabel: z.string().nullable(),
+  mrpPaise: z.number().int().nullable(),
+  sellingRatePaise: z.number().int(),
+  taxTreatmentKind: z.string().nullable(),
+  cgstBasisPoints: z.number().int(),
+  sgstBasisPoints: z.number().int(),
+  igstBasisPoints: z.number().int(),
+  cessBasisPoints: z.number().int(),
+  taxableValuePaise: z.number().int(),
+  cgstPaise: z.number().int(),
+  sgstPaise: z.number().int(),
+  igstPaise: z.number().int(),
+  cessPaise: z.number().int(),
+  lineTotalPaise: z.number().int()
+});
+
+export const InvoiceSchema = z.object({
+  saleId: z.string(),
+  document: z.object({
+    documentNumber: z.string(),
+    businessDate: z.string(),
+    financialYear: z.string(),
+    seriesCode: z.string(),
+    postedAtUtc: z.string(),
+    documentType: InvoiceDocumentTypeSchema,
+    documentTypeReason: z.string().optional()
+  }),
+  /** Null exactly when the Sale predates seller snapshots. Never filled in from current data. */
+  sellerSnapshot: InvoiceSellerSnapshotSchema.nullable(),
+  /** Present only for a legacy document, and never merged into the snapshot above. */
+  currentSellerProfile: z
+    .object({
+      displayName: z.string(),
+      legalName: z.string().nullable(),
+      addressLine1: z.string().nullable(),
+      city: z.string().nullable(),
+      licenceText: z.string().nullable()
+    })
+    .optional(),
+  recipient: z.object({
+    walkIn: z.boolean(),
+    name: z.string().nullable(),
+    gstRegistrationStatus: z.string().nullable(),
+    gstin: z.string().nullable(),
+    stateCode: z.string().nullable()
+  }),
+  lines: InvoiceLineSchema.array(),
+  /** Aggregation of the posted lines. Never a recomputation of the tax. */
+  taxSummary: z
+    .object({
+      taxTreatmentKind: z.string().nullable(),
+      cgstBasisPoints: z.number().int(),
+      sgstBasisPoints: z.number().int(),
+      igstBasisPoints: z.number().int(),
+      cessBasisPoints: z.number().int(),
+      taxableValuePaise: z.number().int(),
+      cgstPaise: z.number().int(),
+      sgstPaise: z.number().int(),
+      igstPaise: z.number().int(),
+      cessPaise: z.number().int()
+    })
+    .array(),
+  totals: z.object({
+    taxableValuePaise: z.number().int(),
+    cgstPaise: z.number().int(),
+    sgstPaise: z.number().int(),
+    igstPaise: z.number().int(),
+    cessPaise: z.number().int(),
+    grandTotalPaise: z.number().int()
+  }),
+  tender: z
+    .object({
+      method: z.string(),
+      amountPaise: z.number().int(),
+      referenceText: z.string().nullable()
+    })
+    .array(),
+  regulatory: z.object({
+    legacyDocument: z.boolean(),
+    sellerSnapshotVersion: z.number().int(),
+    sellerRegistered: z.boolean(),
+    taxTreatment: z.string().nullable(),
+    /** Always false in this product: no e-invoice, no IRN, no QR. */
+    einvoiceApplicable: z.boolean()
+  })
+});
+
+/** Every code the Store Service can return from a Store Profile or invoice route. */
+export const StoreProfileErrorCodeSchema = z.enum([
+  "validation_failed",
+  "not_found",
+  "revision_conflict",
+  "store_tax_conflict",
+  "store_licence_conflict",
+  "store_licence_archived",
+  "store_legal_profile_incomplete",
+  "invoice_not_found",
+  "invoice_not_posted",
+  "invoice_invariant_failed",
+  "service_busy",
+  "internal_error",
+  "authentication_required",
+  "session_expired",
+  "authorization_denied"
+]);
+
+export type StoreAddress = z.infer<typeof StoreAddressSchema>;
+export type StoreLicence = z.infer<typeof StoreLicenceSchema>;
+export type MissingSellerFact = z.infer<typeof MissingSellerFactSchema>;
+export type StoreProfile = z.infer<typeof StoreProfileSchema>;
+export type InvoiceDocumentType = z.infer<typeof InvoiceDocumentTypeSchema>;
+export type InvoiceSellerSnapshot = z.infer<typeof InvoiceSellerSnapshotSchema>;
+export type InvoiceLine = z.infer<typeof InvoiceLineSchema>;
+export type Invoice = z.infer<typeof InvoiceSchema>;
+export type StoreProfileErrorCode = z.infer<typeof StoreProfileErrorCodeSchema>;

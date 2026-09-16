@@ -16,6 +16,27 @@ const states = [
 ];
 
 /**
+ * The whole-profile projection the screen reads, built from the tax state this double keeps.
+ * `sellerComplete` stays false throughout: this spec is about the GST half, and the blocking
+ * callout that produces is asserted in the Vitest suite rather than duplicated here.
+ */
+function asProfile(current: Record<string, unknown>) {
+  return {
+    storeId: current.storeId, revision: current.revision, displayName: current.displayName,
+    legalName: null, primaryPhone: null, primaryEmail: null,
+    gstRegistrationStatus: current.gstRegistrationStatus, gstin: current.gstin,
+    normalizedGstin: current.normalizedGstin, placeOfSupplyStateId: current.placeOfSupplyStateId,
+    taxComplete: current.complete, address: null, licences: [],
+    sellerComplete: false,
+    missingSellerFacts: [
+      { field: "legalName", message: "Record the pharmacy's registered name in Store Profile." },
+      { field: "address.line1", message: "Record the pharmacy's address in Store Profile." },
+      { field: "licences", message: "Record at least one active drug sale licence in Store Profile." }
+    ]
+  };
+}
+
+/**
  * A stateful store-profile double. It refuses a GSTIN whose first two characters disagree with the
  * selected State, exactly as the real trigger does, so no test can pass against absent behaviour.
  */
@@ -37,6 +58,9 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
     if (url.pathname === "/api/v1/auth/status") return route.fulfill({ json: { setupRequired: false, authenticated: true, user, storeDisplayName: "Care Pharmacy" } });
     if (url.pathname === "/api/v1/reference/state-codes") return route.fulfill({ json: states });
     if (/^\/api\/v1\/reference\//.test(url.pathname)) return route.fulfill({ json: [] });
+    if (url.pathname === "/api/v1/store/profile" && method === "GET") {
+      return route.fulfill({ json: asProfile(state.current) });
+    }
     if (url.pathname === "/api/v1/store/tax-identity") {
       if (method === "GET") return route.fulfill({ json: state.current });
       if (role !== "owner_admin") return route.fulfill({ status: 403, json: { code: "authorization_denied", message: "denied", issues: [], expectedRevision: null, currentRevision: null } });

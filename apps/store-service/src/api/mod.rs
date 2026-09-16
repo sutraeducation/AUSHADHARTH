@@ -10,6 +10,7 @@ use crate::{API_VERSION, APPLICATION_VERSION};
 pub mod auth;
 pub mod backups;
 pub mod inventory;
+pub mod invoices;
 pub mod parties;
 pub mod product_catalog;
 pub mod purchases;
@@ -73,6 +74,7 @@ pub fn router_with_backups(
         .merge(store_profile::routes())
         .merge(purchases::routes())
         .merge(sales::routes())
+        .merge(invoices::routes())
         .merge(returns::routes())
         .merge(stock_operations::routes())
         .merge(backups::routes());

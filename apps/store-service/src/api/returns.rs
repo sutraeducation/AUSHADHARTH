@@ -2997,6 +2997,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        record_legal_profile(&pool, &store_id).await;
         let owner_id = insert_session(&pool, "owner_admin", OWNER).await;
         insert_session(&pool, "pharmacist", PHARMACIST).await;
         insert_session(&pool, "cashier", CASHIER).await;
@@ -4654,6 +4655,42 @@ mod tests {
         .fetch_one(&f.pool)
         .await
         .unwrap()
+    }
+
+    /// The seller facts a pharmacy must hold before it may issue a memo: a registered name, an
+    /// operating address, and an active drug sale licence. Recorded here because a Sale cannot be
+    /// posted without them — see `store_legal_profile_incomplete`.
+    async fn record_legal_profile(pool: &SqlitePool, store_id: &str) {
+        sqlx::query(
+            "UPDATE store_identity SET legal_name='Care Pharmacy Private Limited',\
+             primary_phone='02012345678',primary_email='care@example.test' WHERE store_id=?",
+        )
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO store_addresses (id,store_id,line1,city,state_id,postal_code,\
+             created_at_utc,updated_at_utc) VALUES (?,?,'12 Market Road','Pune',?,'411001',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .bind(MAHARASHTRA)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
+             normalized_licence_number,created_at_utc,updated_at_utc) \
+             VALUES (?,?,'Form 20','MH-20-1234','MH201234',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn insert_session(pool: &SqlitePool, role: &str, token: &str) -> String {

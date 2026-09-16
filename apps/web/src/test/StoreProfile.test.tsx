@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { StoreTaxIdentity, UserRole } from "@aushadharth/contracts";
+import type { StoreProfile, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
 
 const IDs = {
@@ -22,11 +22,20 @@ const STATES = [
   { id: IDs.archived, kind: "state-codes", revision: 2, status: "archived", ...stamp, attributes: { jurisdiction: "IN", stateCode: "25", displayName: "Daman and Diu (superseded)" } }
 ];
 
-function profile(overrides: Partial<StoreTaxIdentity> = {}): StoreTaxIdentity {
+function profile(overrides: Partial<StoreProfile> = {}): StoreProfile {
   return {
     storeId: IDs.store, displayName: "Care Pharmacy", revision: 1,
+    legalName: null, primaryPhone: null, primaryEmail: null,
     gstRegistrationStatus: "unknown", gstin: null, normalizedGstin: null,
-    placeOfSupplyStateId: null, complete: false, ...overrides
+    placeOfSupplyStateId: null, taxComplete: false,
+    address: null, licences: [],
+    sellerComplete: false,
+    missingSellerFacts: [
+      { field: "legalName", message: "Record the pharmacy's registered name in Store Profile." },
+      { field: "address.line1", message: "Record the pharmacy's address in Store Profile." },
+      { field: "licences", message: "Record at least one active drug sale licence in Store Profile." }
+    ],
+    ...overrides
   };
 }
 
@@ -35,7 +44,7 @@ function failure(code: string, status: number, extra: Record<string, unknown> = 
   return response({ code, message: "raw backend detail", issues: [], expectedRevision: null, currentRevision: null, ...extra }, status);
 }
 
-type Options = { role?: UserRole; initial?: Partial<StoreTaxIdentity>; failProfile?: number; saveError?: { code: string; status: number; extra?: Record<string, unknown> } };
+type Options = { role?: UserRole; initial?: Partial<StoreProfile>; failProfile?: number; saveError?: { code: string; status: number; extra?: Record<string, unknown> } };
 
 function storeService(options: Options = {}) {
   const role = options.role ?? "owner_admin";
@@ -50,22 +59,28 @@ function storeService(options: Options = {}) {
     if (url.pathname.endsWith("/auth/logout")) return response(null, 204);
     if (url.pathname === "/api/v1/reference/state-codes") return response(STATES);
     if (/^\/api\/v1\/reference\//.test(url.pathname)) return response([]);
+    if (url.pathname === "/api/v1/store/profile" && method === "GET") {
+      if (state.remainingFailures > 0) { state.remainingFailures -= 1; return failure("internal_error", 500); }
+      return response(state.current);
+    }
     if (url.pathname === "/api/v1/store/tax-identity") {
-      if (method === "GET") {
-        if (state.remainingFailures > 0) { state.remainingFailures -= 1; return failure("internal_error", 500); }
-        return response(state.current);
-      }
       if (role !== "owner_admin") return failure("authorization_denied", 403);
       if (options.saveError) return failure(options.saveError.code, options.saveError.status, options.saveError.extra);
       state.saved.push(body);
       state.current = profile({
+        ...state.current,
         revision: state.current.revision + 1,
         gstRegistrationStatus: body.gstRegistrationStatus,
         gstin: body.gstin, normalizedGstin: body.gstin ? String(body.gstin).replace(/\s+/g, "").toUpperCase() : null,
         placeOfSupplyStateId: body.placeOfSupplyStateId,
-        complete: Boolean(body.placeOfSupplyStateId)
+        taxComplete: Boolean(body.placeOfSupplyStateId)
       });
-      return response(state.current);
+      return response({
+        storeId: state.current.storeId, displayName: state.current.displayName,
+        revision: state.current.revision, gstRegistrationStatus: state.current.gstRegistrationStatus,
+        gstin: state.current.gstin, normalizedGstin: state.current.normalizedGstin,
+        placeOfSupplyStateId: state.current.placeOfSupplyStateId, complete: state.current.taxComplete
+      });
     }
     throw new Error(`Unexpected request: ${method} ${url.pathname}`);
   });
@@ -88,12 +103,15 @@ describe("Store tax identity UI", () => {
     expect(await screen.findByText("Place of supply not recorded")).toBeInTheDocument();
     // The consequence is stated before the operator hits it at the counter.
     expect(screen.getByText(/posting one will be refused/i)).toBeInTheDocument();
-    expect(screen.getByText("Not recorded")).toBeInTheDocument();
+    // Two sections can say "Not recorded" now — the operating address State and the GST place
+    // of supply — so this names the one the test is about.
+    const gst = screen.getByRole("region", { name: "GST" });
+    expect(within(gst).getByText("Not recorded")).toBeInTheDocument();
   });
 
   it("shows a completed profile with its resolved State label", async () => {
     renderApp("/app/settings/store", storeService({
-      initial: { gstRegistrationStatus: "registered", gstin: GSTIN, normalizedGstin: GSTIN, placeOfSupplyStateId: IDs.maharashtra, complete: true }
+      initial: { gstRegistrationStatus: "registered", gstin: GSTIN, normalizedGstin: GSTIN, placeOfSupplyStateId: IDs.maharashtra, taxComplete: true }
     }));
     expect(await screen.findByText(GSTIN)).toBeInTheDocument();
     expect(screen.getByText("27 · Maharashtra")).toBeInTheDocument();
@@ -160,7 +178,7 @@ describe("Store tax identity UI", () => {
   });
 
   it("offers only active States but keeps one already assigned and since archived", async () => {
-    renderApp("/app/settings/store", storeService({ initial: { placeOfSupplyStateId: IDs.archived, complete: true } }));
+    renderApp("/app/settings/store", storeService({ initial: { placeOfSupplyStateId: IDs.archived, taxComplete: true } }));
     expect(await screen.findByText("25 · Daman and Diu (superseded) (archived)")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Edit Tax Identity" }));
@@ -206,7 +224,7 @@ describe("Store tax identity UI", () => {
   it("gives a read-only role the profile without any control", async () => {
     renderApp("/app/settings/store", storeService({
       role: "cashier",
-      initial: { gstRegistrationStatus: "registered", gstin: GSTIN, normalizedGstin: GSTIN, placeOfSupplyStateId: IDs.maharashtra, complete: true }
+      initial: { gstRegistrationStatus: "registered", gstin: GSTIN, normalizedGstin: GSTIN, placeOfSupplyStateId: IDs.maharashtra, taxComplete: true }
     }));
     expect(await screen.findByText(GSTIN)).toBeInTheDocument();
     expect(screen.getByText("Read-only access")).toBeInTheDocument();

@@ -194,6 +194,16 @@ export function safeErrorMessage(code?: string): string {
     case "restore_failed": return "The restore could not be completed. Your existing data has been kept.";
     case "invalid_password": return "That password is not correct.";
     case "backup_unavailable": return "Backup is not available in this configuration.";
+    // Phase 1L-A — the Store's legal identity, and the document a posted Sale becomes. A pharmacy
+    // cannot lawfully hand over a bill without its own name, address and sale licence, so the
+    // refusal has to send the operator somewhere rather than just say no.
+    case "store_legal_profile_incomplete": return "Complete the pharmacy's details in Store Profile before selling.";
+    case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
+    case "store_licence_archived": return "This licence is archived. Restore it before editing it.";
+    case "store_profile_conflict": return "Those pharmacy details could not be saved as entered.";
+    case "invoice_not_found": return "That sale no longer exists.";
+    case "invoice_not_posted": return "This sale has not been posted, so it has no invoice yet.";
+    case "invoice_invariant_failed": return "This invoice does not add up and cannot be shown. Report it before using it.";
     case "validation_failed": return "Check the highlighted information and try again.";
     default: return "AUSHADHARTH could not complete that request. Try again.";
   }
