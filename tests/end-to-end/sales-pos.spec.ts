@@ -53,6 +53,10 @@ const sellableBatches = [
   { id: `${IDs.batch}-b`, productPackId: IDs.otherPack, batchNumber: "D-7701", expiresOn: "2028-06-30", mrpPaise: 12_000, availableAtoms: 500, expired: false }
 ];
 
+const states = [
+  { id: "01997300-0000-7000-8000-000000000027", kind: "state-codes", revision: 1, status: "active", createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null, attributes: { jurisdiction: "IN", stateCode: "27", displayName: "Maharashtra" } }
+];
+
 function emptyDraft() {
   return {
     id: IDs.sale, storeId: IDs.store, customerPartyId: null as string | null, customerNameText: null as string | null,
@@ -63,8 +67,40 @@ function emptyDraft() {
     taxTreatment: null, taxableValuePaise: 0, cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, grandTotalPaise: 0,
     createdByUserId: IDs.user, createdAtUtc: "2026-09-12T05:00:00Z", updatedAtUtc: "2026-09-12T05:00:00Z",
     postedByUserId: null, postedAtUtc: null,
+    // Phase 1L-A2: a draft has frozen no recipient particulars; on a walk-in these hold what the
+    // counter typed.
+    recipientSnapshotVersion: 0, recipientParticularsRequested: false as boolean | null,
+    recipientAddressSource: null as string | null,
+    recipientAddressLine1: null as string | null, recipientAddressLine2: null as string | null,
+    recipientCity: null as string | null, recipientPostalCode: null as string | null,
+    recipientStateId: null as string | null, recipientStateName: null as string | null, recipientStateCode: null as string | null,
+    deliverySameAsRecipient: true as boolean | null,
+    deliveryAddressLine1: null as string | null, deliveryAddressLine2: null as string | null,
+    deliveryCity: null as string | null, deliveryPostalCode: null as string | null,
+    deliveryStateId: null as string | null, deliveryStateName: null as string | null, deliveryStateCode: null as string | null,
     lines: [] as Record<string, unknown>[], tenders: [] as Record<string, unknown>[]
   };
+}
+
+/** ₹50,000 in paise: the Rule 46(e) line the Store Service judges TAXABLE value against. */
+const THRESHOLD = 5_000_000;
+
+/**
+ * What the Store Service reports a walk-in draft still needs. Every line in this double is taxable,
+ * so taxable supply and taxable value coincide here; the service's own tests cover the difference.
+ */
+function recipientRequirement(document: ReturnType<typeof emptyDraft>, taxable: number) {
+  const reasons = [
+    ...(taxable >= THRESHOLD ? ["taxable_value_threshold"] : []),
+    ...(document.recipientParticularsRequested ? ["recipient_requested"] : [])
+  ];
+  const missing: Array<{ field: string; message: string }> = [];
+  if (reasons.length > 0) {
+    if (!document.customerNameText) missing.push({ field: "customerNameText", message: "Enter the customer's name for the invoice." });
+    if (!document.recipientAddressLine1) missing.push({ field: "recipientAddress.line1", message: "Enter the customer's address." });
+    if (!document.recipientStateId) missing.push({ field: "recipientAddress.stateId", message: "Choose the State of the customer's address." });
+  }
+  return { required: reasons.length > 0, reasons, missing, thresholdPaise: THRESHOLD, taxableSupplyValuePaise: taxable };
 }
 
 /** The atoms come from the pack, exactly as the Store Service derives them. */
@@ -135,6 +171,7 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
     if (url.pathname === "/api/v1/auth/status") return route.fulfill({ json: { setupRequired: false, authenticated: true, user, storeDisplayName: "Care Pharmacy" } });
     if (url.pathname === "/api/v1/store/tax-identity") return route.fulfill({ json: { storeId: IDs.store, displayName: "Care Pharmacy", revision: 1, gstRegistrationStatus: "registered", gstin: "27AAACX0000A1Z9", normalizedGstin: "27AAACX0000A1Z9", placeOfSupplyStateId: null, complete: true } });
     if (url.pathname === "/api/v1/reference/units") return route.fulfill({ json: units });
+    if (url.pathname === "/api/v1/reference/state-codes") return route.fulfill({ json: states });
     if (/^\/api\/v1\/reference\//.test(url.pathname)) return route.fulfill({ json: [] });
     if (url.pathname === "/api/v1/parties") return route.fulfill({ json: customers });
     if (url.pathname === "/api/v1/products") {
@@ -165,6 +202,7 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
         saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state",
         taxableValuePaise: totals.taxable, cgstPaise: totals.cgst, sgstPaise: totals.sgst,
         igstPaise: 0, cessPaise: 0, grandTotalPaise: totals.total,
+        recipientParticulars: recipientRequirement(document, totals.taxable),
         lines: totals.lines.map((each) => ({
           id: (each as { id: string }).id, lineNumber: (each as { lineNumber: number }).lineNumber,
           taxableValuePaise: (each as { taxableValuePaise: number }).taxableValuePaise,
@@ -208,10 +246,18 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
       if (!document) return deny("sale_not_found", 404);
       if (method === "GET") return route.fulfill({ json: document });
       if (body.expectedRevision !== document.revision) return deny("revision_conflict", 409, { expectedRevision: body.expectedRevision, currentRevision: document.revision });
+      const address = (body.recipientAddress ?? null) as Record<string, string | null> | null;
       Object.assign(document, {
         customerPartyId: (body.customerPartyId as string | null) ?? null,
         customerNameText: (body.customerNameText as string | null) ?? null,
-        customerDisplayName: body.customerPartyId ? customers.find((party) => party.id === body.customerPartyId)!.displayName : null,
+        // Like the real Store Service: a draft's display name is a posting snapshot and stays empty
+        // until the sale is posted. Faking it here once hid a counter showing "Walk-in" for a named customer.
+        customerDisplayName: null,
+        recipientParticularsRequested: Boolean(body.recipientParticularsRequested),
+        recipientAddressLine1: address?.line1 ?? null, recipientAddressLine2: address?.line2 ?? null,
+        recipientCity: address?.city ?? null, recipientPostalCode: address?.postalCode ?? null,
+        recipientStateId: address?.stateId ?? null,
+        deliverySameAsRecipient: (body.deliverySameAsRecipient as boolean | undefined) ?? true,
         revision: document.revision + 1
       });
       return route.fulfill({ json: document });
@@ -511,6 +557,54 @@ test.describe("Phase 1H point of sale", () => {
     // Nothing may overflow the viewport sideways at a phone width.
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow).toBeLessThanOrEqual(0);
+  });
+
+  /**
+   * Phase 1L-A2. At ₹50,000 of taxable value the invoice must show the customer's name, address and
+   * State. The counter is told so beside the total, cannot post until they are recorded, records them
+   * without creating a customer, and the layout survives a phone width with the form open.
+   */
+  test("asks for the customer's details at ₹50,000 of taxable value and posts once they are recorded", async ({ page }) => {
+    const state = await mockStoreService(page);
+    await page.goto(`/app/sales/${IDs.sale}`);
+    await typeLine(page, { name: "Crocin 500 mg Tablet", packId: IDs.pack, batchId: IDs.batch, quantity: "1", rate: "50000" });
+
+    const summary = page.getByLabel("Bill total");
+    await expect(summary.getByText("Customer details needed before posting")).toBeVisible();
+    await expect(summary.getByText("Enter the customer's address.")).toBeVisible();
+    await expect(page.getByRole("button", { name: /and post$/ })).toBeDisabled();
+
+    await summary.getByRole("button", { name: "Add customer details" }).click();
+    await expect(page.getByText(/taxable value is ₹50,000 or more/)).toBeVisible();
+    await page.getByLabel("Name on the bill").fill("Asha Patil");
+    await page.getByLabel("Address line 1").fill("Flat 7, Shanti Niwas, Lake View Society, Near Rajiv Gandhi IT Park");
+    await page.getByLabel(/^City/).fill("Pune");
+    await page.getByLabel("State").selectOption("01997300-0000-7000-8000-000000000027");
+    await expect(page.getByLabel("Goods delivered to the same address")).toBeChecked();
+
+    for (const width of [375, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      expect(overflow, `horizontal overflow at ${width}px`).toBeLessThanOrEqual(0);
+      // The save action is reachable, not clipped: scrolled to, it lies fully inside the viewport.
+      const save = page.getByRole("button", { name: "Save customer" });
+      await save.scrollIntoViewIfNeeded();
+      await expect(save).toBeInViewport({ ratio: 1 });
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    await page.getByRole("button", { name: "Save customer" }).click();
+    await expect(summary.getByText("Customer details needed before posting")).toHaveCount(0);
+    const saved = state.writes.find((write) => write.method === "PUT");
+    expect(saved?.body).toMatchObject({
+      customerPartyId: null, customerNameText: "Asha Patil", recipientParticularsRequested: false,
+      recipientAddress: { line1: "Flat 7, Shanti Niwas, Lake View Society, Near Rajiv Gandhi IT Park", city: "Pune", stateId: "01997300-0000-7000-8000-000000000027" },
+      deliverySameAsRecipient: true, deliveryAddress: null
+    });
+    expect(state.writes.some((write) => write.path.startsWith("/api/v1/parties"))).toBe(false);
+
+    await page.getByRole("button", { name: /and post$/ }).click();
+    await expect(page.getByRole("heading", { name: "INV/2627/000001", level: 1 })).toBeVisible();
   });
 
   test("offers no way to edit a posted invoice", async ({ page }) => {

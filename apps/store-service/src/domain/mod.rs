@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod money;
 pub mod parties;
 pub mod price_control;
+pub mod recipient;
 pub mod references;
 pub mod returns;
 pub mod sales;

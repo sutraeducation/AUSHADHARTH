@@ -3,6 +3,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SaleDetail, SaleLine, SaleQuote, SellableBatch, UserRole } from "@aushadharth/contracts";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { App } from "../app/App";
 import { paiseToAmountText, quantityToInteger, sellingRateToPaise } from "../sales/saleApi";
 
@@ -17,7 +19,9 @@ const IDs = {
   line: "01997a00-0000-7000-8000-000000000050",
   unit: "01997a00-0000-7000-8000-000000000060",
   store: "01997a00-0000-7000-8000-000000000070",
-  user: "01997a00-0000-7000-8000-000000000080"
+  user: "01997a00-0000-7000-8000-000000000080",
+  registered: "01997a00-0000-7000-8000-000000000011",
+  maharashtra: "01997300-0000-7000-8000-000000000027"
 };
 
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
@@ -28,8 +32,16 @@ const UNITS = [
 ];
 
 const CUSTOMERS = [
-  { id: IDs.customer, displayName: "Rahul Deshmukh", legalName: null, normalizedSearchName: "rahul deshmukh", gstRegistrationStatus: "unregistered", gstin: null, normalizedGstin: null, pan: null, normalizedPan: null, placeOfSupplyStateId: null, primaryPhone: null, primaryEmail: null, drugLicenceNumber: null, drugLicenceValidUpto: null, revision: 1, status: "active", ...stamp }
+  { id: IDs.customer, displayName: "Rahul Deshmukh", legalName: null, normalizedSearchName: "rahul deshmukh", gstRegistrationStatus: "unregistered", gstin: null, normalizedGstin: null, pan: null, normalizedPan: null, placeOfSupplyStateId: null, primaryPhone: null, primaryEmail: null, drugLicenceNumber: null, drugLicenceValidUpto: null, revision: 1, status: "active", ...stamp },
+  { id: IDs.registered, displayName: "Mehta Medical Stores", legalName: null, normalizedSearchName: "mehta medical stores", gstRegistrationStatus: "registered", gstin: "27AAACM1234K1Z5", normalizedGstin: "27AAACM1234K1Z5", pan: null, normalizedPan: null, placeOfSupplyStateId: IDs.maharashtra, primaryPhone: null, primaryEmail: null, drugLicenceNumber: null, drugLicenceValidUpto: null, revision: 1, status: "active", ...stamp }
 ];
+
+const STATES = [
+  { id: IDs.maharashtra, kind: "state-codes", revision: 1, status: "active", ...stamp, attributes: { jurisdiction: "IN", stateCode: "27", displayName: "Maharashtra" } }
+];
+
+/** ₹50,000 in paise: the Rule 46(e) line the Store Service judges taxable value against. */
+const THRESHOLD = 5_000_000;
 
 const PACK = { id: IDs.pack, productId: IDs.product, containerUnitId: IDs.unit, baseQuantityAtoms: 10, containedPackId: null, containedPackCount: null, skuCode: null, skuStoreId: null, displayLabel: "Strip of 10", revision: 1, status: "active", ...stamp };
 
@@ -70,7 +82,13 @@ function sale(overrides: Partial<SaleDetail> = {}): SaleDetail {
     customerDisplayName: null, customerGstRegistrationStatus: null, customerNormalizedGstin: null, customerStateCode: null,
     taxTreatment: null, taxableValuePaise: 0, cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, grandTotalPaise: 0,
     createdByUserId: IDs.user, createdAtUtc: "2026-09-12T05:00:00Z", updatedAtUtc: "2026-09-12T05:00:00Z",
-    postedByUserId: null, postedAtUtc: null, lines: [], tenders: [], ...overrides
+    postedByUserId: null, postedAtUtc: null,
+    recipientSnapshotVersion: 0, recipientParticularsRequested: false, recipientAddressSource: null,
+    recipientAddressLine1: null, recipientAddressLine2: null, recipientCity: null, recipientPostalCode: null,
+    recipientStateId: null, recipientStateName: null, recipientStateCode: null,
+    deliverySameAsRecipient: true, deliveryAddressLine1: null, deliveryAddressLine2: null, deliveryCity: null,
+    deliveryPostalCode: null, deliveryStateId: null, deliveryStateName: null, deliveryStateCode: null,
+    lines: [], tenders: [], ...overrides
   };
 }
 
@@ -125,10 +143,33 @@ function saleService(options: Options = {}) {
       ? null
       : failure("revision_conflict", 409, { expectedRevision: body.expectedRevision, currentRevision: document.revision });
 
+  /**
+   * The recipient requirement as the Store Service reports it. Every line in this double is taxable,
+   * so taxable supply and taxable value coincide; the service's own tests prove the case where they
+   * do not.
+   */
+  const requirementFor = (document: SaleDetail, taxable: number): SaleQuote["recipientParticulars"] => {
+    const party = CUSTOMERS.find((each) => each.id === document.customerPartyId);
+    const registered = party?.gstRegistrationStatus === "registered";
+    const reasons: SaleQuote["recipientParticulars"]["reasons"] = [
+      ...(registered ? ["registered_recipient" as const] : taxable >= THRESHOLD ? ["taxable_value_threshold" as const] : []),
+      ...(document.recipientParticularsRequested ? ["recipient_requested" as const] : [])
+    ];
+    const missing: Array<{ field: string; message: string }> = [];
+    if (reasons.length > 0 && !party) {
+      if (!document.customerNameText) missing.push({ field: "customerNameText", message: "Enter the customer's name for the invoice." });
+      if (!document.recipientAddressLine1) missing.push({ field: "recipientAddress.line1", message: "Enter the customer's address." });
+      if (!document.recipientStateId) missing.push({ field: "recipientAddress.stateId", message: "Choose the State of the customer's address." });
+    }
+    if (reasons.length > 0 && registered) missing.push({ field: "customer.billingAddress", message: "Add a billing address to this customer in Parties." });
+    return { required: reasons.length > 0, reasons, missing, thresholdPaise: THRESHOLD, taxableSupplyValuePaise: taxable };
+  };
+
   const quoteFor = (document: SaleDetail): SaleQuote => {
     const taxable = document.lines.reduce((total, each) => total + each.taxableValuePaise, 0);
     const half = Math.round((taxable * 600) / 10_000);
     return {
+      recipientParticulars: requirementFor(document, taxable),
       saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state",
       taxableValuePaise: taxable, cgstPaise: half, sgstPaise: half, igstPaise: 0, cessPaise: 0,
       grandTotalPaise: taxable + half * 2,
@@ -154,6 +195,7 @@ function saleService(options: Options = {}) {
     if (url.pathname.endsWith("/auth/logout")) return response(null, 204);
     if (url.pathname === "/api/v1/store/tax-identity") return response({ storeId: IDs.store, displayName: "Care Pharmacy", revision: 1, gstRegistrationStatus: "registered", gstin: "27AAACX0000A1Z9", normalizedGstin: "27AAACX0000A1Z9", placeOfSupplyStateId: null, complete: true });
     if (url.pathname === "/api/v1/reference/units") return response(UNITS);
+    if (url.pathname === "/api/v1/reference/state-codes") return response(STATES);
     if (url.pathname === "/api/v1/parties") return response(CUSTOMERS);
     if (url.pathname === "/api/v1/products") return response(PRODUCTS);
     if (/^\/api\/v1\/products\/[^/]+$/.test(url.pathname)) {
@@ -203,11 +245,23 @@ function saleService(options: Options = {}) {
       const conflict = guard(document, body);
       if (conflict) return conflict;
       if (options.writeError) return failure(options.writeError.code, options.writeError.status, options.writeError.extra);
+      const address = (body.recipientAddress ?? null) as Record<string, string | null> | null;
+      const delivery = (body.deliveryAddress ?? null) as Record<string, string | null> | null;
       Object.assign(document, {
         customerPartyId: (body.customerPartyId as string | null) ?? null,
         customerNameText: (body.customerNameText as string | null) ?? null,
-        customerDisplayName: body.customerPartyId ? CUSTOMERS.find((party) => party.id === body.customerPartyId)!.displayName : null,
-        businessDate: body.businessDate
+        // Like the real Store Service: a draft's display name is a posting snapshot and stays empty
+        // until the sale is posted. Faking it here once hid a counter showing "Walk-in" for a named customer.
+        customerDisplayName: null,
+        businessDate: body.businessDate,
+        recipientParticularsRequested: Boolean(body.recipientParticularsRequested),
+        recipientAddressLine1: address?.line1 ?? null, recipientAddressLine2: address?.line2 ?? null,
+        recipientCity: address?.city ?? null, recipientPostalCode: address?.postalCode ?? null,
+        recipientStateId: address?.stateId ?? null,
+        deliverySameAsRecipient: body.deliverySameAsRecipient ?? true,
+        deliveryAddressLine1: delivery?.line1 ?? null, deliveryAddressLine2: delivery?.line2 ?? null,
+        deliveryCity: delivery?.city ?? null, deliveryPostalCode: delivery?.postalCode ?? null,
+        deliveryStateId: delivery?.stateId ?? null
       });
       return response(bump(document));
     }
@@ -653,6 +707,145 @@ describe("Point of sale", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("This would leave a negative stock balance.");
     expect(alert).not.toHaveTextContent("raw backend detail");
+  });
+});
+
+describe("Recipient particulars", () => {
+  /** A draft whose one line alone is worth `taxable` paise. */
+  const worth = (taxable: number, overrides: Partial<SaleDetail> = {}) =>
+    sale({ lines: [line({ quantityPacks: 1, quantityAtoms: 10, sellingRatePaise: taxable, taxableValuePaise: taxable })], ...overrides });
+
+  it("keeps an ordinary walk-in bill free of any address form", async () => {
+    const service = saleService({ documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByRole("button", { name: "Take 179.20 and post" })).toBeEnabled();
+    expect(screen.queryByText("Customer details needed before posting")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Address line 1")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change customer" })).toBeInTheDocument();
+
+    // Opening the customer panel still shows no address until something asks for one.
+    fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
+    expect(await screen.findByLabelText(/Customer asked for their details/)).not.toBeChecked();
+    expect(screen.queryByLabelText("Address line 1")).not.toBeInTheDocument();
+  });
+
+  it("asks for the customer's details once the taxable value reaches ₹50,000, and will not post without them", async () => {
+    const service = saleService({ documents: [worth(THRESHOLD)] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    const summary = await screen.findByLabelText("Bill total");
+    await within(summary).findByText("Customer details needed before posting");
+    expect(within(summary).getByText("Enter the customer's address.")).toBeInTheDocument();
+    const post = within(summary).getByRole("button", { name: /and post$/ });
+    expect(post).toBeDisabled();
+    expect(writes(service).some((write) => write.path.endsWith("/post"))).toBe(false);
+
+    fireEvent.click(within(summary).getByRole("button", { name: "Add customer details" }));
+    expect(await screen.findByLabelText("Address line 1")).toBeInTheDocument();
+    expect(screen.getByText(/taxable value is ₹50,000 or more/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Goods delivered to the same address")).toBeChecked();
+  });
+
+  it("does not ask at ₹49,999.99 of taxable value even though GST takes the bill past ₹50,000", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({ documents: [worth(THRESHOLD - 1)] }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    const post = await screen.findByRole("button", { name: /and post$/ });
+    expect(post).toBeEnabled();
+    expect(screen.queryByText("Customer details needed before posting")).not.toBeInTheDocument();
+  });
+
+  it("records a customer's request below the threshold and sends the address typed for it", async () => {
+    const service = saleService({ documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
+    const requested = await screen.findByLabelText(/Customer asked for their details/);
+    fireEvent.click(requested);
+    expect(await screen.findByLabelText("Address line 1")).toBeInTheDocument();
+
+    // Unticking takes the form away again: nothing about a name typed makes it a request.
+    fireEvent.click(requested);
+    await waitFor(() => expect(screen.queryByLabelText("Address line 1")).not.toBeInTheDocument());
+    fireEvent.click(requested);
+
+    fireEvent.change(screen.getByLabelText("Name on the bill"), { target: { value: "Asha Patil" } });
+    fireEvent.change(await screen.findByLabelText("Address line 1"), { target: { value: "4 Lake View Society" } });
+    fireEvent.change(screen.getByLabelText(/^City/), { target: { value: "Pune" } });
+    await waitFor(() => expect(screen.getByRole("option", { name: "Maharashtra (27)" })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("State"), { target: { value: IDs.maharashtra } });
+    fireEvent.click(screen.getByRole("button", { name: "Save customer" }));
+
+    const saved = await waitForWrite(service, (write) => write.method === "PUT");
+    expect(saved.body).toMatchObject({
+      customerPartyId: null,
+      customerNameText: "Asha Patil",
+      recipientParticularsRequested: true,
+      recipientAddress: { line1: "4 Lake View Society", line2: null, city: "Pune", postalCode: null, stateId: IDs.maharashtra },
+      deliverySameAsRecipient: true,
+      deliveryAddress: null
+    });
+    // A statutory recipient is invoice text, never a customer record.
+    expect(writes(service).some((write) => write.path.startsWith("/api/v1/parties"))).toBe(false);
+  });
+
+  it("captures a separate delivery address only when delivery is elsewhere", async () => {
+    const service = saleService({ documents: [worth(THRESHOLD)] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    // Offered twice — beside the total and on the customer panel — and either opens the same form.
+    fireEvent.click((await screen.findAllByRole("button", { name: "Add customer details" }))[0]);
+    fireEvent.click(await screen.findByLabelText("Goods delivered to the same address"));
+    const deliveryLine = await screen.findByLabelText("Address line 1", { selector: "#pos-delivery-line1" });
+    fireEvent.change(deliveryLine, { target: { value: "Site Office, Plot 9" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save customer" }));
+
+    const saved = await waitForWrite(service, (write) => write.method === "PUT");
+    expect(saved.body.deliverySameAsRecipient).toBe(false);
+    expect(saved.body.deliveryAddress).toMatchObject({ line1: "Site Office, Plot 9" });
+  });
+
+  it("takes a registered customer's address from their record and never sends one from the counter", async () => {
+    const service = saleService({ documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
+    await waitFor(() => expect(screen.getByRole("option", { name: "Mehta Medical Stores" })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Registered customer"), { target: { value: IDs.registered } });
+
+    expect(await screen.findByText(/taken from this customer's record in Parties/)).toBeInTheDocument();
+    expect(screen.getByText(/GST-registered, so their name, address and GSTIN/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Address line 1")).not.toBeInTheDocument();
+    // Rule 46(d) asks for no address of delivery.
+    expect(screen.queryByLabelText("Goods delivered to the same address")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save customer" }));
+
+    const saved = await waitForWrite(service, (write) => write.method === "PUT");
+    expect(saved.body).toMatchObject({ customerPartyId: IDs.registered, recipientAddress: null, deliverySameAsRecipient: true, deliveryAddress: null });
+
+    // Once saved, the service's own finding about the record is what the counter is shown.
+    const summary = await screen.findByLabelText("Bill total");
+    await within(summary).findByText("Add a billing address to this customer in Parties.");
+  });
+
+  it("shows the frozen customer address and delivery on a posted invoice", async () => {
+    renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale({
+      customerNameText: "Asha Patil", recipientSnapshotVersion: 1, recipientParticularsRequested: true,
+      recipientAddressSource: "counter", recipientAddressLine1: "4 Lake View Society", recipientCity: "Pune",
+      recipientStateId: IDs.maharashtra, recipientStateName: "Maharashtra", recipientStateCode: "27",
+      deliverySameAsRecipient: false, deliveryAddressLine1: "Site Office, Plot 9", deliveryStateId: IDs.maharashtra,
+      deliveryStateName: "Maharashtra", deliveryStateCode: "27"
+    })] }));
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
+    expect(screen.getByText("4 Lake View Society, Pune, Maharashtra")).toBeInTheDocument();
+    expect(screen.getByText("Site Office, Plot 9, Maharashtra")).toBeInTheDocument();
+  });
+
+  it("describes the requirement factually and never claims compliance", () => {
+    const source = readFileSync(resolve(process.cwd(), "src/sales/Sales.tsx"), "utf8").toLowerCase();
+    for (const claim of ["gst compliant", "compliance guaranteed", "rule 65 compliant", "fully compliant", "prescriptionverified"]) {
+      expect(source).not.toContain(claim);
+    }
   });
 });
 

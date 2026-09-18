@@ -192,6 +192,49 @@ struct RecipientSection {
     name: Option<String>,
     gst_registration_status: Option<String>,
     gstin: Option<String>,
+    /// The customer's place-of-supply State code frozen by Phase 1H. Not the address State below.
+    state_code: Option<String>,
+    /// 0: posted before recipient particulars were evaluated. The address and delivery facts below
+    /// are then UNKNOWN — not absent — and are reported as null without consulting the Party master.
+    /// 1: every field below is the fact frozen at posting.
+    snapshot_version: i64,
+    /// Rule 46(f), as the operator recorded it. Null on a version-0 Sale.
+    particulars_requested: Option<bool>,
+    /// Present exactly when a Rule 46 particular required an address and one was frozen.
+    address: Option<RecipientAddress>,
+    /// Present exactly when Rule 46(e)/(f) asked for an address of delivery.
+    delivery: Option<DeliverySection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecipientAddress {
+    /// `party` (the customer's record at posting) or `counter` (typed for a walk-in).
+    source: String,
+    line1: String,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    state_name: Option<String>,
+    state_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliverySection {
+    same_as_recipient: bool,
+    /// Present only when delivery was to a different address.
+    address: Option<DeliveryAddress>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryAddress {
+    line1: String,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    state_name: Option<String>,
     state_code: Option<String>,
 }
 
@@ -330,6 +373,22 @@ struct HeaderRow {
     seller_phone: Option<String>,
     seller_email: Option<String>,
     seller_licence_text: Option<String>,
+    recipient_snapshot_version: i64,
+    recipient_particulars_requested: Option<bool>,
+    recipient_address_source: Option<String>,
+    recipient_address_line1: Option<String>,
+    recipient_address_line2: Option<String>,
+    recipient_city: Option<String>,
+    recipient_postal_code: Option<String>,
+    recipient_state_name: Option<String>,
+    recipient_state_code: Option<String>,
+    delivery_same_as_recipient: Option<bool>,
+    delivery_address_line1: Option<String>,
+    delivery_address_line2: Option<String>,
+    delivery_city: Option<String>,
+    delivery_postal_code: Option<String>,
+    delivery_state_name: Option<String>,
+    delivery_state_code: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -381,7 +440,12 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
          customer_normalized_gstin,customer_state_code,tax_treatment,taxable_value_paise,\
          cgst_paise,sgst_paise,igst_paise,cess_paise,grand_total_paise,seller_snapshot_version,\
          seller_legal_name,seller_trade_name,seller_address_line1,seller_address_line2,seller_city,\
-         seller_postal_code,seller_state_name,seller_phone,seller_email,seller_licence_text \
+         seller_postal_code,seller_state_name,seller_phone,seller_email,seller_licence_text,\
+         recipient_snapshot_version,recipient_particulars_requested,recipient_address_source,\
+         recipient_address_line1,recipient_address_line2,recipient_city,recipient_postal_code,\
+         recipient_state_name,recipient_state_code,delivery_same_as_recipient,\
+         delivery_address_line1,delivery_address_line2,delivery_city,delivery_postal_code,\
+         delivery_state_name,delivery_state_code \
          FROM sale_documents WHERE id=?",
     )
     .bind(id)
@@ -467,6 +531,10 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
             gst_registration_status: header.customer_gst_registration_status.clone(),
             gstin: header.customer_normalized_gstin.clone(),
             state_code: header.customer_state_code.clone(),
+            snapshot_version: header.recipient_snapshot_version,
+            particulars_requested: recipient_facts(&header, header.recipient_particulars_requested),
+            address: recipient_address(&header),
+            delivery: delivery_section(&header),
         },
         lines,
         tax_summary,
@@ -772,7 +840,88 @@ fn check_invariants(
     if tendered != header.grand_total_paise {
         return Err(InvoiceError::InvariantFailed("tender disagrees with total"));
     }
+    // The database already refuses an incoherent version-1 recipient snapshot. This is the renderer
+    // refusing to present one if that guard were ever bypassed: a registered recipient without the
+    // Rule 46(d) address, or a "delivered elsewhere" without the address it names.
+    if header.recipient_snapshot_version >= 1 {
+        let has_address = header
+            .recipient_address_line1
+            .as_deref()
+            .is_some_and(|line| !line.trim().is_empty());
+        if header.customer_gst_registration_status.as_deref() == Some("registered")
+            && (!has_address || header.customer_normalized_gstin.is_none())
+        {
+            return Err(InvoiceError::InvariantFailed(
+                "registered recipient without its particulars",
+            ));
+        }
+        if header.recipient_address_source.is_some() != has_address {
+            return Err(InvoiceError::InvariantFailed(
+                "recipient address without provenance",
+            ));
+        }
+        if header.delivery_same_as_recipient == Some(false)
+            && header
+                .delivery_address_line1
+                .as_deref()
+                .is_none_or(|line| line.trim().is_empty())
+        {
+            return Err(InvoiceError::InvariantFailed(
+                "delivery elsewhere without an address",
+            ));
+        }
+    }
     Ok(())
+}
+
+/// A recipient fact is reported only from a version-1 snapshot. On an older Sale it is unknown, and
+/// saying "false" would be inventing an answer.
+fn recipient_facts<T>(header: &HeaderRow, value: Option<T>) -> Option<T> {
+    if header.recipient_snapshot_version >= 1 {
+        value
+    } else {
+        None
+    }
+}
+
+fn recipient_address(header: &HeaderRow) -> Option<RecipientAddress> {
+    if header.recipient_snapshot_version < 1 {
+        return None;
+    }
+    let source = header.recipient_address_source.clone()?;
+    let line1 = header.recipient_address_line1.clone()?;
+    Some(RecipientAddress {
+        source,
+        line1,
+        line2: header.recipient_address_line2.clone(),
+        city: header.recipient_city.clone(),
+        postal_code: header.recipient_postal_code.clone(),
+        state_name: header.recipient_state_name.clone(),
+        state_code: header.recipient_state_code.clone(),
+    })
+}
+
+fn delivery_section(header: &HeaderRow) -> Option<DeliverySection> {
+    let same_as_recipient = recipient_facts(header, header.delivery_same_as_recipient)?;
+    let address = if same_as_recipient {
+        None
+    } else {
+        header
+            .delivery_address_line1
+            .clone()
+            .map(|line1| DeliveryAddress {
+                line1,
+                line2: header.delivery_address_line2.clone(),
+                city: header.delivery_city.clone(),
+                postal_code: header.delivery_postal_code.clone(),
+                state_name: header.delivery_state_name.clone(),
+                state_code: header.delivery_state_code.clone(),
+            })
+    };
+    Some(DeliverySection {
+        same_as_recipient,
+        address,
+    })
 }
 
 #[cfg(test)]

@@ -4587,3 +4587,102 @@ async fn real_service_refuses_a_first_run_restore_once_the_pharmacy_exists_over_
     assert_eq!(status, 403, "{parsed:?}");
     assert_eq!(parsed["code"], "setup_already_complete");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1L-A2 — recipient statutory particulars
+// ---------------------------------------------------------------------------------------------
+
+/// Rule 46(f) across a real socket: a customer who asks for their details on the invoice cannot be
+/// billed until those details exist, the refusal names what is missing in plain terms, and once the
+/// counter records them they are frozen onto the posted Sale and served by the canonical invoice.
+#[tokio::test]
+async fn real_service_requires_and_freezes_requested_recipient_particulars_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/sales",
+        Some(json!({ "businessDate": SALE_DATE, "recipientParticularsRequested": true })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let sale_id = draft.body["id"].as_str().expect("sale id").to_owned();
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    assert_eq!(quote.body["recipientParticulars"]["required"], true);
+    assert_eq!(
+        quote.body["recipientParticulars"]["reasons"],
+        json!(["recipient_requested"])
+    );
+
+    let refused = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000e1",
+        8960,
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "recipient_particulars_incomplete");
+    assert_eq!(refused.body["issues"].as_array().map(Vec::len), Some(3));
+    let text = refused.body.to_string().to_lowercase();
+    assert!(!text.contains("sqlite") && !text.contains("trigger"));
+
+    let saved = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/sales/{sale_id}"),
+        Some(json!({
+            "expectedRevision": 2, "businessDate": SALE_DATE,
+            "recipientParticularsRequested": true, "customerNameText": "Asha Patil",
+            "recipientAddress": { "line1": "4 Lake View Society", "city": "Pune", "stateId": MAHARASHTRA }
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "{:?}", saved.body);
+
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        3,
+        "01997a00-0000-7000-8000-0000000000e2",
+        8960,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    let document = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/invoice"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    let recipient = &document.body["recipient"];
+    assert_eq!(recipient["snapshotVersion"], 1);
+    assert_eq!(recipient["particularsRequested"], true);
+    assert_eq!(recipient["name"], "Asha Patil");
+    assert_eq!(recipient["address"]["source"], "counter");
+    assert_eq!(recipient["address"]["line1"], "4 Lake View Society");
+    assert_eq!(recipient["address"]["stateCode"], "27");
+    assert_eq!(recipient["delivery"]["sameAsRecipient"], true);
+}

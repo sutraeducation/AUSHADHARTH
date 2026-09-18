@@ -6,6 +6,10 @@ import type {
   Product,
   ProductPack,
   QuantityBasis,
+  RecipientRequirement,
+  RecipientRequirementReason,
+  ReferenceMasterResponse,
+  SaleAddressInput,
   SaleDetail,
   SaleLine,
   SaleLineTaxKind,
@@ -58,6 +62,16 @@ const TENDER_LABELS: Record<TenderMethod, string> = {
 
 const STALE_DOCUMENT_MESSAGE =
   "This sale changed after you opened it. Reload the latest version before saving.";
+
+/**
+ * Why this invoice must carry the customer's particulars, in the counter's words. One line each for
+ * CGST Rule 46(d), 46(e) and 46(f); the rule numbers stay out of the cashier's way.
+ */
+const REASON_TEXT: Record<RecipientRequirementReason, string> = {
+  registered_recipient: "The customer is GST-registered, so their name, address and GSTIN go on this invoice.",
+  taxable_value_threshold: "The taxable value is ₹50,000 or more, so the customer's name, address and State go on this invoice.",
+  recipient_requested: "The customer asked for their details on the invoice."
+};
 
 // ---------------------------------------------------------------------------------------------
 // List
@@ -211,6 +225,7 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [tenderMethod, setTenderMethod] = useState<TenderMethod>("cash");
   const [tenderReference, setTenderReference] = useState("");
+  const [customerOpen, setCustomerOpen] = useState(false);
   const searchBox = useRef<HTMLInputElement>(null);
   // A ref, not the mutation's own pending flag: `disabled` only takes effect on the next render, and
   // a triple-click reaches the handler three times before React has painted once. Phase 1G proved
@@ -334,6 +349,18 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
     });
   };
 
+  // What posting will ask of the customer, from the same Store Service code posting runs. It changes
+  // as lines are added and removed, because the ₹50,000 line is judged on the bill as it stands.
+  const requirement = quote.data?.recipientParticulars;
+  const particularsMissing = Boolean(requirement && requirement.missing.length > 0);
+
+  const openCustomerDetails = () => {
+    setCustomerOpen(true);
+    // Not every environment implements scrolling an element into view; opening the form must not
+    // depend on it.
+    requestAnimationFrame(() => document.getElementById("pos-customer-title")?.scrollIntoView?.({ block: "start", behavior: "smooth" }));
+  };
+
   const submitPost = () => {
     setNotice(null);
     if (inFlight.current) return;
@@ -343,6 +370,11 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
     }
     if (!quote.data) {
       setNotice("The amount payable is not known yet. Wait for the total, or fix the line it refuses.");
+      return;
+    }
+    if (particularsMissing) {
+      setNotice("Add the customer's details to this invoice before posting.");
+      openCustomerDetails();
       return;
     }
     inFlight.current = true;
@@ -484,6 +516,12 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
             </dl>
           : null}
 
+        {requirement?.required && particularsMissing && <div className="panel-callout panel-callout--blocking pos-recipient-callout" role="status">
+          <strong>Customer details needed before posting</strong>
+          <ul>{requirement.missing.map((fact) => <li key={fact.field}>{fact.message}</li>)}</ul>
+          <button className="button button--secondary" type="button" onClick={openCustomerDetails}>Add customer details</button>
+        </div>}
+
         <div className="field">
           <label htmlFor="pos-tender-method">Paid by</label>
           <select id="pos-tender-method" value={tenderMethod} onChange={(event) => setTenderMethod(event.target.value as TenderMethod)}>
@@ -495,15 +533,87 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           <input id="pos-tender-reference" value={tenderReference} onChange={(event) => setTenderReference(event.target.value)} placeholder="Approval or UPI reference" />
         </div>}
 
-        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data}>
+        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing}>
           {post.isPending ? "Posting…" : quote.data ? `Take ${paiseToAmountText(quote.data.grandTotalPaise)} and post` : "Post"}
         </button>
         <p className="pos-summary__note">Posting issues the invoice number, charges the GST and takes the stock out. It cannot be undone.</p>
       </aside>
 
-      <CustomerPanel sale={sale} onSaved={refresh} storeName={store.data?.displayName ?? null} />
+      <CustomerPanel
+        key={sale.id}
+        sale={sale}
+        requirement={requirement ?? null}
+        open={customerOpen}
+        onOpenChange={setCustomerOpen}
+        onSaved={refresh}
+        storeName={store.data?.displayName ?? null}
+      />
     </section>
   </>;
+}
+
+type AddressForm = { line1: string; line2: string; city: string; postalCode: string; stateId: string };
+
+function addressForm(line1: string | null, line2: string | null, city: string | null, postalCode: string | null, stateId: string | null): AddressForm {
+  return { line1: line1 ?? "", line2: line2 ?? "", city: city ?? "", postalCode: postalCode ?? "", stateId: stateId ?? "" };
+}
+
+/** Blank fields are sent as nothing, and an untouched form as no address at all. */
+function addressInput(form: AddressForm): SaleAddressInput | null {
+  const input = {
+    line1: form.line1.trim() || null,
+    line2: form.line2.trim() || null,
+    city: form.city.trim() || null,
+    postalCode: form.postalCode.trim() || null,
+    stateId: form.stateId || null
+  };
+  return Object.values(input).some((value) => value !== null) ? input : null;
+}
+
+function addressText(parts: Array<string | null | undefined>): string {
+  return parts.map((part) => part?.trim()).filter(Boolean).join(", ");
+}
+
+function stateOptionText(state: ReferenceMasterResponse): string {
+  const attributes = state.attributes as Record<string, unknown>;
+  return `${String(attributes.displayName)} (${String(attributes.stateCode)})`;
+}
+
+/** The same five fields for the customer's address and for a delivery address. */
+function AddressFields({ prefix, legend, value, onChange, states }: {
+  prefix: string;
+  legend: string;
+  value: AddressForm;
+  onChange: (next: AddressForm) => void;
+  states: ReferenceMasterResponse[] | undefined;
+}) {
+  const selectable = (states ?? []).filter((state) => state.status === "active" || state.id === value.stateId);
+  return <fieldset className="pos-address catalog-span">
+    <legend>{legend}</legend>
+    <div className="field pos-address__wide">
+      <label htmlFor={`${prefix}-line1`}>Address line 1</label>
+      <input id={`${prefix}-line1`} maxLength={200} autoComplete="off" value={value.line1} onChange={(event) => onChange({ ...value, line1: event.target.value })} />
+    </div>
+    <div className="field pos-address__wide">
+      <label htmlFor={`${prefix}-line2`}>Address line 2 <span className="row-subtext">(optional)</span></label>
+      <input id={`${prefix}-line2`} maxLength={200} autoComplete="off" value={value.line2} onChange={(event) => onChange({ ...value, line2: event.target.value })} />
+    </div>
+    <div className="field">
+      <label htmlFor={`${prefix}-city`}>City <span className="row-subtext">(optional)</span></label>
+      <input id={`${prefix}-city`} maxLength={100} autoComplete="off" value={value.city} onChange={(event) => onChange({ ...value, city: event.target.value })} />
+    </div>
+    <div className="field">
+      <label htmlFor={`${prefix}-postal`}>PIN code <span className="row-subtext">(optional)</span></label>
+      <input id={`${prefix}-postal`} maxLength={16} inputMode="numeric" autoComplete="off" value={value.postalCode} onChange={(event) => onChange({ ...value, postalCode: event.target.value })} />
+    </div>
+    <div className="field pos-address__wide">
+      <label htmlFor={`${prefix}-state`}>State</label>
+      <select id={`${prefix}-state`} value={value.stateId} disabled={!states} onChange={(event) => onChange({ ...value, stateId: event.target.value })}>
+        <option value="">{states ? "Choose a State" : "Loading…"}</option>
+        {selectable.map((state) => <option key={state.id} value={state.id}>{stateOptionText(state)}</option>)}
+      </select>
+    </div>
+  </fieldset>;
 }
 
 /**
@@ -512,34 +622,97 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
  * Most counter sales are walk-ins, so this sits below the bill rather than in front of it. A name
  * typed here is invoice text and nothing more; only a real party row carries identity.
  */
-function CustomerPanel({ sale, onSaved, storeName }: { sale: SaleDetail; onSaved: () => void; storeName: string | null }) {
-  const [open, setOpen] = useState(false);
+function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeName }: {
+  sale: SaleDetail;
+  requirement: RecipientRequirement | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+  storeName: string | null;
+}) {
   const [customerPartyId, setCustomerPartyId] = useState(sale.customerPartyId ?? "");
   const [customerNameText, setCustomerNameText] = useState(sale.customerNameText ?? "");
+  const [requested, setRequested] = useState(sale.recipientParticularsRequested ?? false);
+  const [address, setAddress] = useState<AddressForm>(() => addressForm(
+    sale.recipientAddressLine1, sale.recipientAddressLine2, sale.recipientCity, sale.recipientPostalCode, sale.recipientStateId
+  ));
+  const [deliverySame, setDeliverySame] = useState(sale.deliverySameAsRecipient ?? true);
+  const [delivery, setDelivery] = useState<AddressForm>(() => addressForm(
+    sale.deliveryAddressLine1, sale.deliveryAddressLine2, sale.deliveryCity, sale.deliveryPostalCode, sale.deliveryStateId
+  ));
   const [notice, setNotice] = useState<string | null>(null);
 
+  // Also loaded when the draft already names a customer: a draft's `customerDisplayName` is a posting
+  // snapshot and stays empty until then, so the name the counter reads has to come from the record.
   const customers = useQuery({
     queryKey: ["parties", "customers", "active"],
     queryFn: () => listParties("", "active", "customer"),
-    enabled: open,
+    enabled: open || Boolean(sale.customerPartyId),
     staleTime: 30_000,
     retry: false
   });
+  const states = useQuery({
+    queryKey: ["reference", "state-codes", "all"],
+    queryFn: () => listReferences("state-codes", "", "all"),
+    enabled: open,
+    staleTime: 300_000,
+    retry: false
+  });
+
+  // Which Rule 46 path this form is on. The saved draft's requirement comes from the Store Service;
+  // a customer chosen in the form but not yet saved is judged from their own record, so the right
+  // fields appear before saving rather than after a round trip. Posting decides either way.
+  const savedCustomer = customerPartyId === (sale.customerPartyId ?? "");
+  const selectedParty = (customers.data ?? []).find((party) => party.id === customerPartyId) ?? null;
+  const registeredPath = customerPartyId !== "" && (selectedParty
+    ? selectedParty.gstRegistrationStatus === "registered"
+    : savedCustomer && Boolean(requirement?.reasons.includes("registered_recipient")));
+  const thresholdReached = requirement !== null && requirement.taxableSupplyValuePaise >= requirement.thresholdPaise;
+  const reasons: RecipientRequirementReason[] = [
+    ...(registeredPath ? ["registered_recipient" as const] : thresholdReached ? ["taxable_value_threshold" as const] : []),
+    ...(requested ? ["recipient_requested" as const] : [])
+  ];
+  const statutory = reasons.length > 0;
+  const walkIn = customerPartyId === "";
+  const partyMissing = savedCustomer && !walkIn
+    ? (requirement?.missing ?? []).filter((fact) => fact.field.startsWith("customer."))
+    : [];
 
   const save = useMutation({
     mutationFn: () => updateSaleDraft(sale.id, sale.revision, {
       customerPartyId: customerPartyId || null,
       customerNameText: customerNameText.trim() || null,
-      businessDate: sale.businessDate
+      businessDate: sale.businessDate,
+      recipientParticularsRequested: requested,
+      // A named customer's address is read from their record at posting and is never sent.
+      recipientAddress: walkIn ? addressInput(address) : null,
+      // Rule 46(d) asks for no address of delivery, so a registered customer carries none.
+      deliverySameAsRecipient: registeredPath ? true : deliverySame,
+      deliveryAddress: registeredPath || deliverySame ? null : addressInput(delivery)
     }),
-    onSuccess: () => { setNotice(null); setOpen(false); onSaved(); },
+    onSuccess: () => { setNotice(null); onOpenChange(false); onSaved(); },
     onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : messageFor(caught, "The customer could not be recorded."))
   });
 
-  const current = sale.customerDisplayName ?? sale.customerNameText ?? "Walk-in";
+  const namedParty = (customers.data ?? []).find((party) => party.id === sale.customerPartyId) ?? null;
+  const current = sale.customerDisplayName
+    ?? namedParty?.displayName
+    ?? sale.customerNameText
+    ?? (sale.customerPartyId ? "Customer on record" : "Walk-in");
+  const recordedAddress = sale.customerPartyId ? "" : addressText([sale.recipientAddressLine1, sale.recipientAddressLine2, sale.recipientCity, sale.recipientPostalCode]);
+  const recordedDelivery = sale.deliverySameAsRecipient === false
+    ? addressText([sale.deliveryAddressLine1, sale.deliveryAddressLine2, sale.deliveryCity, sale.deliveryPostalCode])
+    : "";
+  const savedMissing = Boolean(requirement && requirement.missing.length > 0);
+
   return <section className="pos-customer" aria-labelledby="pos-customer-title">
     <h3 id="pos-customer-title">Customer</h3>
     <p className="pos-customer__current">{current}{storeName ? ` · billed at ${storeName}` : ""}</p>
+    {!open && requirement?.required && <ul className="pos-customer__reasons">
+      {requirement.reasons.map((reason) => <li key={reason}>{REASON_TEXT[reason]}</li>)}
+    </ul>}
+    {!open && recordedAddress && <p className="pos-customer__address">Address: {recordedAddress}</p>}
+    {!open && recordedDelivery && <p className="pos-customer__address">Delivered to: {recordedDelivery}</p>}
     {open
       ? <div className="master-form">
           <div className="field">
@@ -552,16 +725,39 @@ function CustomerPanel({ sale, onSaved, storeName }: { sale: SaleDetail; onSaved
           </div>
           <div className="field">
             <label htmlFor="pos-customer-name">Name on the bill</label>
-            <input id="pos-customer-name" value={customerNameText} onChange={(event) => setCustomerNameText(event.target.value)} />
+            <input id="pos-customer-name" maxLength={200} value={customerNameText} onChange={(event) => setCustomerNameText(event.target.value)} />
             <small>Printed on the invoice for a walk-in who asks for a name. It creates no customer record.</small>
           </div>
+          <label className="check-field catalog-span">
+            <input id="pos-recipient-requested" type="checkbox" checked={requested} onChange={(event) => setRequested(event.target.checked)} />
+            <span>Customer asked for their details on the invoice<small>Their name and address are then recorded on the invoice at any amount.</small></span>
+          </label>
+
+          {statutory && <div className="pos-recipient catalog-span">
+            <ul className="pos-customer__reasons">{reasons.map((reason) => <li key={reason}>{REASON_TEXT[reason]}</li>)}</ul>
+            {walkIn
+              ? <AddressFields prefix="pos-recipient" legend="Customer's address" value={address} onChange={setAddress} states={states.data} />
+              : <div className="pos-recipient__party">
+                  <p>The address is taken from this customer's record in Parties when the sale is posted.</p>
+                  {partyMissing.length > 0 && <ul className="pos-recipient__missing">{partyMissing.map((fact) => <li key={fact.field}>{fact.message}</li>)}</ul>}
+                </div>}
+            {!registeredPath && <>
+              <label className="check-field">
+                <input id="pos-delivery-same" type="checkbox" checked={deliverySame} onChange={(event) => setDeliverySame(event.target.checked)} />
+                <span>Goods delivered to the same address</span>
+              </label>
+              {!deliverySame && <AddressFields prefix="pos-delivery" legend="Delivery address" value={delivery} onChange={setDelivery} states={states.data} />}
+            </>}
+            {states.isError && <div className="inline-notice inline-notice--error" role="alert">State names could not be loaded. Close and reopen this panel to try again.</div>}
+          </div>}
+
           {notice && <div className="inline-notice inline-notice--error catalog-span" role="alert">{notice}</div>}
           <div className="form-actions">
-            <button className="button button--secondary" type="button" onClick={() => { setOpen(false); setNotice(null); }}>Cancel</button>
+            <button className="button button--secondary" type="button" onClick={() => { onOpenChange(false); setNotice(null); }}>Cancel</button>
             <button className="button button--primary" type="button" onClick={() => save.mutate()} disabled={save.isPending}>{save.isPending ? "Saving…" : "Save customer"}</button>
           </div>
         </div>
-      : <button className="button button--secondary" type="button" onClick={() => setOpen(true)}>Change customer</button>}
+      : <button className="button button--secondary" type="button" onClick={() => onOpenChange(true)}>{savedMissing ? "Add customer details" : "Change customer"}</button>}
   </section>;
 }
 
@@ -592,6 +788,9 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
         <div><dt>Tax treatment</dt><dd>{sale.taxTreatment ? TREATMENT_LABELS[sale.taxTreatment] : "—"}</dd></div>
         <div><dt>Store GSTIN</dt><dd>{sale.storeNormalizedGstin ?? "Not registered"}</dd></div>
         <div><dt>Customer GSTIN</dt><dd>{sale.customerNormalizedGstin ?? "—"}</dd></div>
+        {sale.recipientAddressLine1 && <div><dt>Customer address</dt><dd>{addressText([sale.recipientAddressLine1, sale.recipientAddressLine2, sale.recipientCity, sale.recipientPostalCode, sale.recipientStateName])}</dd></div>}
+        {sale.deliverySameAsRecipient === true && <div><dt>Delivery</dt><dd>Same as customer address</dd></div>}
+        {sale.deliverySameAsRecipient === false && <div><dt>Delivery address</dt><dd>{addressText([sale.deliveryAddressLine1, sale.deliveryAddressLine2, sale.deliveryCity, sale.deliveryPostalCode, sale.deliveryStateName])}</dd></div>}
       </dl>
 
       <div className="table-scroll"><table className="data-table">

@@ -198,6 +198,9 @@ export function safeErrorMessage(code?: string): string {
     // cannot lawfully hand over a bill without its own name, address and sale licence, so the
     // refusal has to send the operator somewhere rather than just say no.
     case "store_legal_profile_incomplete": return "Complete the pharmacy's details in Store Profile before selling.";
+    // Phase 1L-A2: CGST Rule 46 requires the customer's particulars on this invoice — a registered
+    // customer, ₹50,000 or more of taxable value, or a customer who asked.
+    case "recipient_particulars_incomplete": return "This invoice must show the customer's details. Complete them before posting.";
     case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
     case "store_licence_archived": return "This licence is archived. Restore it before editing it.";
     case "store_profile_conflict": return "Those pharmacy details could not be saved as entered.";

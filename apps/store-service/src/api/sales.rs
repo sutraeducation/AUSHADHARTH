@@ -29,6 +29,9 @@ use crate::domain::{
     catalog::{CatalogValidationIssue, optional_text, validate_date, validate_uuid_v7},
     money::{self, LineAmounts, MoneyError, RateComponents, TaxTreatment},
     price_control::{self, Comparability, PriceControlStatus},
+    recipient::{
+        self, AddressFacts, MissingRecipientFact, PartyBilling, PartyRecipient, RecipientSource,
+    },
     sales::{self, QuantityBasis, SaleMoneyError, SaleQuantity},
     store_profile::{self, MissingSellerFact},
     taxation,
@@ -54,6 +57,10 @@ pub(crate) enum SaleError {
     /// issued for this sale. Carries the exact missing particulars so the browser can send the
     /// operator to one field instead of to a settings page.
     StoreLegalProfileIncomplete(Vec<MissingSellerFact>),
+    /// Rule 46 requires this invoice to show recipient particulars the Sale does not have — a
+    /// registered customer, a taxable value of ₹50,000 or more, or a customer who asked. Carries
+    /// the exact missing particulars, as the seller refusal does.
+    RecipientParticularsIncomplete(Vec<MissingRecipientFact>),
     ClassificationIncomplete,
     TaxRateNotFound,
     PackMismatch,
@@ -169,6 +176,23 @@ impl IntoResponse for SaleError {
                 ErrorBody {
                     code: "store_legal_profile_incomplete",
                     message: "Complete the pharmacy's details in Store Profile before selling.",
+                    issues: missing
+                        .into_iter()
+                        .map(|fact| ErrorIssue {
+                            field: fact.field().to_owned(),
+                            message: fact.message().to_owned(),
+                        })
+                        .collect(),
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::RecipientParticularsIncomplete(missing) => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "recipient_particulars_incomplete",
+                    message: "This invoice must show the customer's details. Complete them before posting.",
                     issues: missing
                         .into_iter()
                         .map(|fact| ErrorIssue {
@@ -376,6 +400,15 @@ fn map_database_error(error: sqlx::Error) -> SaleError {
         if message.contains("customer_not_eligible") {
             return SaleError::CustomerNotEligible;
         }
+        // The service validates a draft's recipient fields before writing them, so the database
+        // refusing them means a request slipped past that validation. Said as a validation failure
+        // on the field involved, never as the trigger's name.
+        if message.contains("recipient_draft_conflict") {
+            return validation_of(
+                "recipientAddress",
+                "a named customer's address comes from their record, and a delivery address needs delivery elsewhere",
+            );
+        }
         if message.contains("inventory_movement_conflict") {
             return SaleError::BatchPackMismatch;
         }
@@ -408,6 +441,32 @@ struct DraftHeaderRequest {
     customer_party_id: Option<String>,
     customer_name_text: Option<String>,
     business_date: String,
+    /// Rule 46(f): the customer asked for their details on the invoice. Recorded by the operator,
+    /// never inferred.
+    #[serde(default)]
+    recipient_particulars_requested: bool,
+    /// Typed at the counter for a walk-in. A named customer's address is read from their record at
+    /// posting, so this is refused beside a `customerPartyId`.
+    recipient_address: Option<AddressRequest>,
+    #[serde(default = "delivered_to_recipient")]
+    delivery_same_as_recipient: bool,
+    delivery_address: Option<AddressRequest>,
+}
+
+fn delivered_to_recipient() -> bool {
+    true
+}
+
+/// An address as the counter types it. Every field may be blank on a draft: completeness is judged
+/// at posting, when the taxable value that decides whether an address is needed is final.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressRequest {
+    line1: Option<String>,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    state_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,6 +548,26 @@ struct SaleHeaderResponse {
     updated_at_utc: String,
     posted_by_user_id: Option<String>,
     posted_at_utc: Option<String>,
+    /// 0 on a Sale posted before recipient particulars existed, and on every draft; 1 once posting
+    /// has evaluated and frozen them.
+    recipient_snapshot_version: i64,
+    recipient_particulars_requested: Option<bool>,
+    recipient_address_source: Option<String>,
+    recipient_address_line1: Option<String>,
+    recipient_address_line2: Option<String>,
+    recipient_city: Option<String>,
+    recipient_postal_code: Option<String>,
+    recipient_state_id: Option<String>,
+    recipient_state_name: Option<String>,
+    recipient_state_code: Option<String>,
+    delivery_same_as_recipient: Option<bool>,
+    delivery_address_line1: Option<String>,
+    delivery_address_line2: Option<String>,
+    delivery_city: Option<String>,
+    delivery_postal_code: Option<String>,
+    delivery_state_id: Option<String>,
+    delivery_state_name: Option<String>,
+    delivery_state_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -568,7 +647,12 @@ const HEADER_COLUMNS: &str = "id,store_id,customer_party_id,customer_name_text,b
      store_state_code,customer_display_name,customer_gst_registration_status,\
      customer_normalized_gstin,customer_state_code,tax_treatment,taxable_value_paise,cgst_paise,\
      sgst_paise,igst_paise,cess_paise,grand_total_paise,created_by_user_id,created_at_utc,\
-     updated_at_utc,posted_by_user_id,posted_at_utc";
+     updated_at_utc,posted_by_user_id,posted_at_utc,recipient_snapshot_version,\
+     recipient_particulars_requested,recipient_address_source,recipient_address_line1,\
+     recipient_address_line2,recipient_city,recipient_postal_code,recipient_state_id,\
+     recipient_state_name,recipient_state_code,delivery_same_as_recipient,delivery_address_line1,\
+     delivery_address_line2,delivery_city,delivery_postal_code,delivery_state_id,\
+     delivery_state_name,delivery_state_code";
 
 const LINE_COLUMNS: &str = "id,sale_document_id,line_number,product_id,product_pack_id,batch_id,\
      quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,product_display_name,\
@@ -672,7 +756,11 @@ async fn create_draft(
     let now = database_now(&mut transaction).await?;
     sqlx::query(
         "INSERT INTO sale_documents (id,store_id,customer_party_id,customer_name_text,\
-         business_date,created_by_user_id,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?)",
+         business_date,created_by_user_id,created_at_utc,updated_at_utc,\
+         recipient_particulars_requested,recipient_address_line1,recipient_address_line2,\
+         recipient_city,recipient_postal_code,recipient_state_id,delivery_same_as_recipient,\
+         delivery_address_line1,delivery_address_line2,delivery_city,delivery_postal_code,\
+         delivery_state_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(&store_id)
@@ -682,6 +770,18 @@ async fn create_draft(
     .bind(&actor.id)
     .bind(&now)
     .bind(&now)
+    .bind(header.recipient_particulars_requested)
+    .bind(&header.recipient_address.line1)
+    .bind(&header.recipient_address.line2)
+    .bind(&header.recipient_address.city)
+    .bind(&header.recipient_address.postal_code)
+    .bind(&header.recipient_address.state_id)
+    .bind(header.delivery_same_as_recipient)
+    .bind(&header.delivery_address.line1)
+    .bind(&header.delivery_address.line2)
+    .bind(&header.delivery_address.city)
+    .bind(&header.delivery_address.postal_code)
+    .bind(&header.delivery_address.state_id)
     .execute(&mut *transaction)
     .await
     .map_err(map_database_error)?;
@@ -717,11 +817,27 @@ async fn update_draft(
     let now = database_now(&mut transaction).await?;
     sqlx::query(
         "UPDATE sale_documents SET customer_party_id=?,customer_name_text=?,business_date=?,\
+         recipient_particulars_requested=?,recipient_address_line1=?,recipient_address_line2=?,\
+         recipient_city=?,recipient_postal_code=?,recipient_state_id=?,\
+         delivery_same_as_recipient=?,delivery_address_line1=?,delivery_address_line2=?,\
+         delivery_city=?,delivery_postal_code=?,delivery_state_id=?,\
          revision=?,updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
     )
     .bind(&header.customer_party_id)
     .bind(&header.customer_name_text)
     .bind(&header.business_date)
+    .bind(header.recipient_particulars_requested)
+    .bind(&header.recipient_address.line1)
+    .bind(&header.recipient_address.line2)
+    .bind(&header.recipient_address.city)
+    .bind(&header.recipient_address.postal_code)
+    .bind(&header.recipient_address.state_id)
+    .bind(header.delivery_same_as_recipient)
+    .bind(&header.delivery_address.line1)
+    .bind(&header.delivery_address.line2)
+    .bind(&header.delivery_address.city)
+    .bind(&header.delivery_address.postal_code)
+    .bind(&header.delivery_address.state_id)
     .bind(current.0 + 1)
     .bind(&now)
     .bind(&id)
@@ -746,6 +862,98 @@ struct PreparedHeader {
     customer_party_id: Option<String>,
     customer_name_text: Option<String>,
     business_date: String,
+    recipient_particulars_requested: bool,
+    recipient_address: PreparedAddress,
+    delivery_same_as_recipient: bool,
+    delivery_address: PreparedAddress,
+}
+
+/// A counter-typed address after validation. All-`None` is "nothing typed".
+#[derive(Debug, Default)]
+struct PreparedAddress {
+    line1: Option<String>,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    state_id: Option<String>,
+}
+
+impl PreparedAddress {
+    fn is_empty(&self) -> bool {
+        self.line1.is_none()
+            && self.line2.is_none()
+            && self.city.is_none()
+            && self.postal_code.is_none()
+            && self.state_id.is_none()
+    }
+}
+
+/// Bounds and formats exactly as a Party address is held to, so an address that fits one fits the
+/// other. The State must be a known, active State: an invented id is refused here rather than
+/// surfacing later as a foreign-key failure.
+async fn prepare_address(
+    pool: &SqlitePool,
+    request: Option<&AddressRequest>,
+    prefix: &str,
+) -> Result<PreparedAddress, SaleError> {
+    let Some(request) = request else {
+        return Ok(PreparedAddress::default());
+    };
+    let field = |name: &str| format!("{prefix}.{name}");
+    let postal_code = match request
+        .postal_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => {
+            let normalized = value.to_ascii_uppercase();
+            if !(3..=16).contains(&normalized.len())
+                || !normalized
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b" -".contains(&byte))
+            {
+                return Err(validation_of(
+                    &field("postalCode"),
+                    "may contain only letters, digits, spaces, and hyphens",
+                ));
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+    let state_id = match request
+        .state_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => {
+            validate_uuid_v7(value, &field("stateId")).map_err(validation_issue)?;
+            let known: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM state_codes WHERE id=? AND status='active' LIMIT 1",
+            )
+            .bind(value)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_database_error)?;
+            if known.is_none() {
+                return Err(validation_of(&field("stateId"), "is not a known State"));
+            }
+            Some(value.to_owned())
+        }
+        None => None,
+    };
+    Ok(PreparedAddress {
+        line1: optional_text(request.line1.as_deref(), &field("line1"), 200)
+            .map_err(validation_issue)?,
+        line2: optional_text(request.line2.as_deref(), &field("line2"), 200)
+            .map_err(validation_issue)?,
+        city: optional_text(request.city.as_deref(), &field("city"), 100)
+            .map_err(validation_issue)?,
+        postal_code,
+        state_id,
+    })
 }
 
 /// Validates the only header facts a browser may supply.
@@ -785,10 +993,32 @@ async fn prepare_header(
         }
         _ => None,
     };
+    let recipient_address =
+        prepare_address(pool, request.recipient_address.as_ref(), "recipientAddress").await?;
+    // A named customer's address is theirs to keep in Parties and is read from there at posting.
+    // Typing a second one beside it would be a customer master by the back door.
+    if customer_party_id.is_some() && !recipient_address.is_empty() {
+        return Err(validation_of(
+            "recipientAddress",
+            "comes from the customer's record in Parties",
+        ));
+    }
+    let delivery_address =
+        prepare_address(pool, request.delivery_address.as_ref(), "deliveryAddress").await?;
+    if request.delivery_same_as_recipient && !delivery_address.is_empty() {
+        return Err(validation_of(
+            "deliveryAddress",
+            "is recorded only when delivery is to a different address",
+        ));
+    }
     Ok(PreparedHeader {
         customer_party_id,
         customer_name_text,
         business_date,
+        recipient_particulars_requested: request.recipient_particulars_requested,
+        recipient_address,
+        delivery_same_as_recipient: request.delivery_same_as_recipient,
+        delivery_address,
     })
 }
 
@@ -1152,6 +1382,60 @@ struct QuoteResponse {
     cess_paise: i64,
     grand_total_paise: i64,
     lines: Vec<QuoteLineResponse>,
+    recipient_particulars: RecipientRequirementResponse,
+}
+
+/// What Rule 46 will ask of this Sale's recipient if it is posted as it stands.
+///
+/// Worked out by the same `recipient::requirement` posting uses, from the same reads, so the counter
+/// is told exactly what posting would refuse — and told it while the customer is still there.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecipientRequirementResponse {
+    required: bool,
+    reasons: Vec<&'static str>,
+    missing: Vec<ErrorIssue>,
+    threshold_paise: i64,
+    /// The value the Rule 46(e) threshold was judged on: taxable lines only.
+    taxable_supply_value_paise: i64,
+}
+
+impl RecipientRequirementResponse {
+    fn from(requirement: recipient::Requirement, taxable_supply_value_paise: i64) -> Self {
+        Self {
+            required: requirement.required(),
+            reasons: requirement
+                .reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect(),
+            missing: requirement
+                .missing
+                .iter()
+                .map(|fact| ErrorIssue {
+                    field: fact.field().to_owned(),
+                    message: fact.message().to_owned(),
+                })
+                .collect(),
+            threshold_paise: recipient::RECIPIENT_PARTICULARS_THRESHOLD_PAISE,
+            taxable_supply_value_paise,
+        }
+    }
+}
+
+/// The value of the TAXABLE supply on a Sale: `taxable_value_paise` summed over lines whose treatment
+/// is `taxable`, and nothing else.
+///
+/// `compute_line` records the whole value of an exempt, nil-rated or non-GST line in its own
+/// `taxable_value_paise` as well, so the header total of that column is the value of the basket.
+/// Rule 46(e) asks about "the value of the taxable supply", so those lines are excluded here.
+fn taxable_supply_value<'a>(
+    lines: impl Iterator<Item = (Option<&'a str>, i64)>,
+) -> Result<i64, SaleError> {
+    lines
+        .filter(|(kind, _)| *kind == Some("taxable"))
+        .try_fold(0_i64, |total, (_, value)| total.checked_add(value))
+        .ok_or(SaleError::ArithmeticOverflow)
 }
 
 /// What this bill would come to, so the counter can say the amount out loud before taking money.
@@ -1172,10 +1456,9 @@ async fn quote_sale(
 ) -> Result<Json<QuoteResponse>, SaleError> {
     require_reader(&state, &headers).await?;
     validate_uuid_v7(&id, "id").map_err(validation_issue)?;
-    let header = sqlx::query_as::<_, PostingHeader>(
-        "SELECT status,revision,store_id,customer_party_id,business_date,\
-         posting_idempotency_key,posting_fingerprint FROM sale_documents WHERE id=?",
-    )
+    let header = sqlx::query_as::<_, PostingHeader>(&format!(
+        "SELECT {POSTING_HEADER_COLUMNS} FROM sale_documents WHERE id=?"
+    ))
     .bind(&id)
     .fetch_optional(&state.pool)
     .await
@@ -1193,6 +1476,7 @@ async fn quote_sale(
     let treatment = TaxTreatment::IntraState;
     let mut quoted = Vec::with_capacity(lines.len());
     let mut amounts = Vec::with_capacity(lines.len());
+    let mut taxable_supply = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
         let entry =
             resolve_and_compute(&mut connection, line, &header.business_date, treatment).await?;
@@ -1206,9 +1490,31 @@ async fn quote_sale(
             cess_paise: entry.amounts.cess_paise,
             line_total_paise: entry.amounts.line_total_paise,
         });
+        taxable_supply.push((
+            entry.tax_treatment_kind.clone(),
+            entry.amounts.taxable_value_paise,
+        ));
         amounts.push(entry.amounts);
     }
     let totals = money::sum_lines(&amounts)?;
+    let taxable_supply_value_paise = taxable_supply_value(
+        taxable_supply
+            .iter()
+            .map(|(kind, value)| (kind.as_deref(), *value)),
+    )?;
+
+    let customer = match header.customer_party_id.as_deref() {
+        Some(party_id) => Some(load_customer(&mut connection, party_id).await?),
+        None => None,
+    };
+    let source = load_recipient_source(
+        &mut connection,
+        &header,
+        customer.as_ref(),
+        taxable_supply_value_paise,
+    )
+    .await?;
+
     Ok(Json(QuoteResponse {
         sale_document_id: id,
         revision: header.revision,
@@ -1220,6 +1526,10 @@ async fn quote_sale(
         cess_paise: totals.cess_paise,
         grand_total_paise: totals.line_total_paise,
         lines: quoted,
+        recipient_particulars: RecipientRequirementResponse::from(
+            recipient::requirement(&source),
+            taxable_supply_value_paise,
+        ),
     }))
 }
 
@@ -1325,23 +1635,21 @@ async fn post_within_transaction(
     tenders: &[PreparedTender],
     actor_id: &str,
 ) -> Result<(), SaleError> {
-    let header = sqlx::query_as::<_, PostingHeader>(
-        "SELECT status,revision,store_id,customer_party_id,business_date,\
-         posting_idempotency_key,posting_fingerprint FROM sale_documents WHERE id=?",
-    )
+    let header = sqlx::query_as::<_, PostingHeader>(&format!(
+        "SELECT {POSTING_HEADER_COLUMNS} FROM sale_documents WHERE id=?"
+    ))
     .bind(id)
     .fetch_optional(&mut **connection)
     .await
     .map_err(map_database_error)?;
-    let PostingHeader {
-        status,
-        revision,
-        store_id,
-        customer_party_id,
-        business_date,
-        posting_idempotency_key: existing_key,
-        posting_fingerprint: existing_print,
-    } = header.ok_or(SaleError::NotFound)?;
+    let header = header.ok_or(SaleError::NotFound)?;
+    let status = header.status.clone();
+    let revision = header.revision;
+    let store_id = header.store_id.clone();
+    let customer_party_id = header.customer_party_id.clone();
+    let business_date = header.business_date.clone();
+    let existing_key = header.posting_idempotency_key.clone();
+    let existing_print = header.posting_fingerprint.clone();
 
     let lines = load_lines(connection, id).await?;
     let fingerprint = posting_fingerprint(
@@ -1425,6 +1733,36 @@ async fn post_within_transaction(
             .map(|entry| entry.amounts)
             .collect::<Vec<_>>(),
     )?;
+
+    // The recipient's statutory particulars are resolved HERE, once the taxable value that decides
+    // Rule 46(e) is final, and on the same connection that already read the customer inside this
+    // `BEGIN IMMEDIATE` transaction. Nothing is taken from the browser at this point: a named
+    // customer's address comes from their record as it stands under the write lock, and a walk-in's
+    // comes from what the draft recorded. The threshold is judged on the value of the taxable lines
+    // only — never on the amount payable, and never on exempt or non-GST value.
+    let taxable_supply_value_paise = taxable_supply_value(computed.iter().map(|entry| {
+        (
+            entry.tax_treatment_kind.as_deref(),
+            entry.amounts.taxable_value_paise,
+        )
+    }))?;
+    let recipient_source = load_recipient_source(
+        connection,
+        &header,
+        customer.as_ref(),
+        taxable_supply_value_paise,
+    )
+    .await?;
+    let recipient_snapshot =
+        recipient::resolve(&recipient_source).map_err(SaleError::RecipientParticularsIncomplete)?;
+    let (recipient_address_source, recipient_address) = match &recipient_snapshot.address {
+        Some((source, address)) => (Some(source.as_str()), address.clone()),
+        None => (None, AddressFacts::default()),
+    };
+    let delivery_address = recipient_snapshot
+        .delivery_address
+        .clone()
+        .unwrap_or_default();
 
     // Tender is evidence, not accounting, but it must still add up to what was charged: a shortfall
     // would be credit, which this phase does not open.
@@ -1581,6 +1919,12 @@ async fn post_within_transaction(
          posting_fingerprint=?,seller_snapshot_version=1,seller_legal_name=?,seller_trade_name=?,\
          seller_address_line1=?,seller_address_line2=?,seller_city=?,seller_postal_code=?,\
          seller_state_name=?,seller_phone=?,seller_email=?,seller_licence_text=?,\
+         recipient_snapshot_version=1,recipient_particulars_requested=?,\
+         recipient_address_source=?,recipient_address_line1=?,recipient_address_line2=?,\
+         recipient_city=?,recipient_postal_code=?,recipient_state_id=?,recipient_state_name=?,\
+         recipient_state_code=?,delivery_same_as_recipient=?,delivery_address_line1=?,\
+         delivery_address_line2=?,delivery_city=?,delivery_postal_code=?,delivery_state_id=?,\
+         delivery_state_name=?,delivery_state_code=?,\
          updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
     )
     .bind(next)
@@ -1621,6 +1965,23 @@ async fn post_within_transaction(
     .bind(&seller.phone)
     .bind(&seller.email)
     .bind(&seller.licence_text)
+    .bind(recipient_snapshot.particulars_requested)
+    .bind(recipient_address_source)
+    .bind(&recipient_address.line1)
+    .bind(&recipient_address.line2)
+    .bind(&recipient_address.city)
+    .bind(&recipient_address.postal_code)
+    .bind(&recipient_address.state_id)
+    .bind(&recipient_address.state_name)
+    .bind(&recipient_address.state_code)
+    .bind(recipient_snapshot.delivery_same_as_recipient)
+    .bind(&delivery_address.line1)
+    .bind(&delivery_address.line2)
+    .bind(&delivery_address.city)
+    .bind(&delivery_address.postal_code)
+    .bind(&delivery_address.state_id)
+    .bind(&delivery_address.state_name)
+    .bind(&delivery_address.state_code)
     .bind(&now)
     .bind(id)
     .bind(revision)
@@ -2042,6 +2403,164 @@ struct PostingHeader {
     business_date: String,
     posting_idempotency_key: Option<String>,
     posting_fingerprint: Option<String>,
+    customer_name_text: Option<String>,
+    /// NULL on a draft saved before 1L-A2 existed: read as "not requested".
+    recipient_particulars_requested: Option<bool>,
+    recipient_address_line1: Option<String>,
+    recipient_address_line2: Option<String>,
+    recipient_city: Option<String>,
+    recipient_postal_code: Option<String>,
+    recipient_state_id: Option<String>,
+    /// NULL on a draft saved before 1L-A2 existed: read as "delivered to the recipient's address".
+    delivery_same_as_recipient: Option<bool>,
+    delivery_address_line1: Option<String>,
+    delivery_address_line2: Option<String>,
+    delivery_city: Option<String>,
+    delivery_postal_code: Option<String>,
+    delivery_state_id: Option<String>,
+}
+
+const POSTING_HEADER_COLUMNS: &str = "status,revision,store_id,customer_party_id,business_date,\
+     posting_idempotency_key,posting_fingerprint,customer_name_text,\
+     recipient_particulars_requested,recipient_address_line1,recipient_address_line2,\
+     recipient_city,recipient_postal_code,recipient_state_id,delivery_same_as_recipient,\
+     delivery_address_line1,delivery_address_line2,delivery_city,delivery_postal_code,\
+     delivery_state_id";
+
+/// A State as it will be printed, or nothing when no State was given or the id no longer resolves.
+async fn resolve_state(
+    connection: &mut PoolConnection<Sqlite>,
+    state_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>, Option<String>), SaleError> {
+    let Some(state_id) = state_id else {
+        return Ok((None, None, None));
+    };
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT display_name,state_code FROM state_codes WHERE id=?")
+            .bind(state_id)
+            .fetch_optional(&mut **connection)
+            .await
+            .map_err(map_database_error)?;
+    Ok(match row {
+        Some((name, code)) => (Some(state_id.to_owned()), Some(name), Some(code)),
+        None => (None, None, None),
+    })
+}
+
+async fn address_facts(
+    connection: &mut PoolConnection<Sqlite>,
+    line1: Option<&str>,
+    line2: Option<&str>,
+    city: Option<&str>,
+    postal_code: Option<&str>,
+    state_id: Option<&str>,
+) -> Result<AddressFacts, SaleError> {
+    let (state_id, state_name, state_code) = resolve_state(connection, state_id).await?;
+    Ok(AddressFacts {
+        line1: line1.map(str::to_owned),
+        line2: line2.map(str::to_owned),
+        city: city.map(str::to_owned),
+        postal_code: postal_code.map(str::to_owned),
+        state_id,
+        state_name,
+        state_code,
+    })
+}
+
+#[derive(Debug, FromRow)]
+struct BillingAddressRow {
+    line1: String,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    state_id: Option<String>,
+    is_primary: bool,
+}
+
+/// Everything Rule 46 needs to know about this Sale's recipient, read on `connection`.
+///
+/// Called by posting inside its `BEGIN IMMEDIATE` transaction, AFTER `load_customer` has read the
+/// party on the same connection, so the name, the GSTIN and the billing address all come from one
+/// committed state of the Party master. A Party edit that commits first is seen in full; one that
+/// commits later waits for posting's write lock and is not seen at all.
+///
+/// The customer's address is their active billing address: the primary one, or the only one.
+/// Several active billing addresses with none marked primary is reported as ambiguous rather than
+/// resolved by picking one. A shipping address is never used as the recipient's address.
+async fn load_recipient_source(
+    connection: &mut PoolConnection<Sqlite>,
+    header: &PostingHeader,
+    customer: Option<&CustomerSnapshot>,
+    taxable_supply_value_paise: i64,
+) -> Result<RecipientSource, SaleError> {
+    let party = match (header.customer_party_id.as_deref(), customer) {
+        (Some(party_id), Some(customer)) => {
+            let rows = sqlx::query_as::<_, BillingAddressRow>(
+                "SELECT line1,line2,city,postal_code,state_id,is_primary FROM party_addresses \
+                 WHERE party_id=? AND address_role='billing' AND status='active' \
+                 ORDER BY is_primary DESC,id",
+            )
+            .bind(party_id)
+            .fetch_all(&mut **connection)
+            .await
+            .map_err(map_database_error)?;
+            let chosen = match rows.as_slice() {
+                [] => None,
+                [only] => Some(Some(only)),
+                [first, ..] if first.is_primary => Some(Some(first)),
+                _ => Some(None),
+            };
+            let billing = match chosen {
+                None => PartyBilling::None,
+                Some(None) => PartyBilling::Ambiguous,
+                Some(Some(row)) => PartyBilling::One(
+                    address_facts(
+                        connection,
+                        Some(&row.line1),
+                        row.line2.as_deref(),
+                        row.city.as_deref(),
+                        row.postal_code.as_deref(),
+                        row.state_id.as_deref(),
+                    )
+                    .await?,
+                ),
+            };
+            Some(PartyRecipient {
+                display_name: customer.display_name.clone(),
+                gst_registration_status: customer.gst_registration_status.clone(),
+                normalized_gstin: customer.normalized_gstin.clone(),
+                billing,
+            })
+        }
+        _ => None,
+    };
+    let counter_address = address_facts(
+        connection,
+        header.recipient_address_line1.as_deref(),
+        header.recipient_address_line2.as_deref(),
+        header.recipient_city.as_deref(),
+        header.recipient_postal_code.as_deref(),
+        header.recipient_state_id.as_deref(),
+    )
+    .await?;
+    let delivery_address = address_facts(
+        connection,
+        header.delivery_address_line1.as_deref(),
+        header.delivery_address_line2.as_deref(),
+        header.delivery_city.as_deref(),
+        header.delivery_postal_code.as_deref(),
+        header.delivery_state_id.as_deref(),
+    )
+    .await?;
+    Ok(RecipientSource {
+        party,
+        counter_name: header.customer_name_text.clone(),
+        counter_address,
+        particulars_requested: header.recipient_particulars_requested.unwrap_or(false),
+        delivery_same_as_recipient: header.delivery_same_as_recipient.unwrap_or(true),
+        delivery_address,
+        taxable_supply_value_paise,
+    })
 }
 
 #[derive(Debug, FromRow)]
@@ -4545,21 +5064,22 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_basket_to_a_registered_recipient_is_left_unresolved() {
         let f = fixture().await;
-        let id = post_one(&f).await;
-        // Both halves of the mix, and a registered recipient, written directly because the fixture
-        // catalogue has one tax category.
-        sqlx::query("PRAGMA writable_schema=ON")
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        sqlx::query("DROP TRIGGER sale_lines_posted_no_update")
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
-            .execute(&f.pool)
-            .await
-            .unwrap();
+        // A genuinely registered recipient, posted through the API with the Rule 46(d) particulars
+        // it needs. Phase 1L-A2's database guard refuses a registered-recipient snapshot with no
+        // GSTIN or address, so this can no longer be faked by rewriting the status on a walk-in.
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        // The exempt half of the mix is written directly because the fixture catalogue has one tax
+        // category. A zero-value line leaves every posted total unchanged.
         sqlx::query(
             "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
              batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
@@ -4569,13 +5089,6 @@ mod tests {
         )
         .bind(Uuid::now_v7().to_string())
         .bind(&id)
-        .bind(&id)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE sale_documents SET customer_gst_registration_status='registered' WHERE id=?",
-        )
         .bind(&id)
         .execute(&f.pool)
         .await
@@ -4814,5 +5327,1554 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["sellerSnapshot"]["legalName"], hostile);
         assert_eq!(body["sellerSnapshot"]["addressLine1"], hostile);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1L-A2 — recipient statutory particulars
+    //
+    // Rule 46(d): a registered recipient needs name, address and GSTIN at any value. Rule 46(e): an
+    // unregistered one needs name, address, address of delivery and State once the TAXABLE supply
+    // reaches ₹50,000. Rule 46(f): the same below that, when the customer asks. These prove the
+    // service asks for exactly that, freezes it at posting, and never lets it change afterwards.
+    // -----------------------------------------------------------------------------------------
+
+    const COUNTER_ADDRESS: &str = "4 Lake View Society";
+
+    /// A GSTIN for `state` whose check character is genuinely right, found by asking the production
+    /// validator rather than restating its algorithm in a test.
+    fn valid_gstin(state: &str, pan: &str) -> String {
+        let body = format!("{state}{pan}1Z");
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            .chars()
+            .map(|check| format!("{body}{check}"))
+            .find(|candidate| crate::domain::parties::normalize_gstin(candidate).is_ok())
+            .expect("some check character is valid")
+    }
+
+    async fn registered_customer(pool: &SqlitePool, name: &str, gstin: &str) -> String {
+        let state = if gstin.starts_with("29") {
+            KARNATAKA
+        } else {
+            MAHARASHTRA
+        };
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO parties (id,display_name,normalized_search_name,gst_registration_status,\
+             gstin,normalized_gstin,place_of_supply_state_id,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,'registered',?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(gstin)
+        .bind(gstin)
+        .bind(state)
+        .execute(pool)
+        .await
+        .unwrap();
+        add_role(pool, &id, "customer").await;
+        id
+    }
+
+    async fn add_billing_address(
+        pool: &SqlitePool,
+        party_id: &str,
+        line1: &str,
+        state: Option<&str>,
+        primary: bool,
+    ) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO party_addresses (id,party_id,address_role,line1,city,state_id,postal_code,\
+             is_primary,created_at_utc,updated_at_utc) VALUES (?,?,'billing',?,'Pune',?,'411001',?,\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(party_id)
+        .bind(line1)
+        .bind(state)
+        .bind(i64::from(primary))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A lot of the fixture product with no printed MRP and deep stock, so one line can be priced to
+    /// any exact taxable value a threshold test needs without an MRP ceiling getting in the way.
+    async fn unpriced_lot(f: &Fixture) -> String {
+        let batch = insert_batch(&f.pool, &f.pack_id, "BIG-1", Some("2027-12-31"), None).await;
+        add_stock(
+            &f.pool,
+            &f.store_id,
+            &f.product_id,
+            &f.pack_id,
+            &batch,
+            100_000,
+            &f.owner_id,
+        )
+        .await;
+        batch
+    }
+
+    /// An exempt product on its own lot, for baskets whose payable total is not their taxable value.
+    async fn exempt_lot(f: &Fixture) -> (String, String, String) {
+        let category = insert_category(&f.pool, "exempt-goods", "exempt").await;
+        let (product, pack) = insert_product(&f.pool, "Cotton Bandage", TABLET, 0, 10).await;
+        enable_sale(&f.pool, &f.store_id, &product, &pack, 1, 0).await;
+        classify(&f.pool, &product, &category).await;
+        let batch = insert_batch(&f.pool, &pack, "EX-1", Some("2027-12-31"), None).await;
+        add_stock(
+            &f.pool,
+            &f.store_id,
+            &product,
+            &pack,
+            &batch,
+            100_000,
+            &f.owner_id,
+        )
+        .await;
+        (product, pack, batch)
+    }
+
+    fn with_date(header: Value) -> Value {
+        let mut body = header;
+        body["businessDate"] = json!(TODAY);
+        body
+    }
+
+    async fn open_sale(f: &Fixture, header: Value) -> String {
+        let (status, created) =
+            request(f.pool.clone(), "POST", "/api/v1/sales", with_date(header)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        created["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn revision_of(f: &Fixture, id: &str) -> i64 {
+        detail(f, id).await["revision"].as_i64().unwrap()
+    }
+
+    async fn add_line(
+        f: &Fixture,
+        id: &str,
+        product: &str,
+        pack: &str,
+        batch: &str,
+        packs: i64,
+        rate: i64,
+    ) -> String {
+        let revision = revision_of(f, id).await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/lines"),
+            json!({
+                "expectedRevision": revision,
+                "productId": product,
+                "productPackId": pack,
+                "batchId": batch,
+                "quantityBasis": "pack",
+                "quantity": packs,
+                "sellingRatePaise": rate
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["lines"].as_array().unwrap().last().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn save_header(f: &Fixture, id: &str, header: Value) -> (StatusCode, Value) {
+        let mut body = with_date(header);
+        body["expectedRevision"] = json!(revision_of(f, id).await);
+        request(f.pool.clone(), "PUT", &format!("/api/v1/sales/{id}"), body).await
+    }
+
+    async fn quote_of(f: &Fixture, id: &str) -> Value {
+        let (status, body) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Posts for exactly the quoted amount, as the counter does.
+    async fn post_as_quoted(f: &Fixture, id: &str) -> (StatusCode, Value) {
+        post_as_quoted_by(f, id, OWNER).await
+    }
+
+    async fn post_as_quoted_by(f: &Fixture, id: &str, token: &str) -> (StatusCode, Value) {
+        let revision = revision_of(f, id).await;
+        let total = quote_of(f, id).await["grandTotalPaise"].as_i64().unwrap();
+        request_as(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/post"),
+            json!({
+                "expectedRevision": revision,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "tenders": [{ "method": "cash", "amountPaise": total }]
+            }),
+            Some(token),
+        )
+        .await
+    }
+
+    fn counter_address() -> Value {
+        json!({
+            "line1": COUNTER_ADDRESS, "city": "Pune", "postalCode": "411014", "stateId": MAHARASHTRA
+        })
+    }
+
+    fn issue_fields(body: &Value) -> Vec<String> {
+        body["issues"]
+            .as_array()
+            .map(|issues| {
+                issues
+                    .iter()
+                    .map(|issue| issue["field"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn numbers_issued(f: &Fixture) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sale_documents WHERE status='posted'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A refused posting leaves no trace: still a draft, no number, no stock movement.
+    async fn assert_nothing_posted(f: &Fixture, id: &str, batch: &str, stock_before: i64) {
+        let sale = detail(f, id).await;
+        assert_eq!(sale["status"], "draft");
+        assert!(sale["documentNumber"].is_null());
+        assert_eq!(sale["recipientSnapshotVersion"], 0);
+        assert_eq!(
+            balance(f, batch).await,
+            stock_before,
+            "a refused posting moved stock"
+        );
+    }
+
+    // --- Rule 46(d): registered recipient --------------------------------------------------------
+
+    /// A registered recipient at ₹1 of taxable value still needs, and gets, its particulars: there
+    /// is no threshold on this path.
+    #[tokio::test]
+    async fn a_registered_recipient_with_an_address_posts_at_one_rupee_and_freezes_it() {
+        let f = fixture().await;
+        let gstin = valid_gstin("27", "AAACM1234K");
+        let party = registered_customer(&f.pool, "Mehta Medical Stores", &gstin).await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 100).await;
+
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["recipientParticulars"]["required"], true);
+        assert_eq!(
+            quote["recipientParticulars"]["reasons"],
+            json!(["registered_recipient"])
+        );
+        assert_eq!(quote["recipientParticulars"]["missing"], json!([]));
+
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["taxableValuePaise"], 100);
+        assert_eq!(posted["recipientSnapshotVersion"], 1);
+        assert_eq!(posted["recipientAddressSource"], "party");
+        assert_eq!(posted["recipientAddressLine1"], "7 Mill Road");
+        assert_eq!(posted["recipientStateName"], "Maharashtra");
+        assert_eq!(posted["recipientStateCode"], "27");
+        // Rule 46(d) names no address of delivery, so none is asserted.
+        assert!(posted["deliverySameAsRecipient"].is_null());
+
+        let (status, document) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        let recipient = &document["recipient"];
+        assert_eq!(recipient["snapshotVersion"], 1);
+        assert_eq!(recipient["gstin"], gstin);
+        assert_eq!(recipient["name"], "Mehta Medical Stores");
+        assert_eq!(recipient["address"]["source"], "party");
+        assert_eq!(recipient["address"]["line1"], "7 Mill Road");
+        assert_eq!(recipient["address"]["postalCode"], "411001");
+        assert!(recipient["delivery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_registered_recipient_without_an_address_is_refused_and_nothing_is_posted() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let before = balance(&f, &f.batch_id).await;
+        let issued = numbers_issued(&f).await;
+
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(
+            quote["recipientParticulars"]["missing"][0]["field"],
+            "customer.billingAddress"
+        );
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+        assert_eq!(issue_fields(&body), vec!["customer.billingAddress"]);
+        assert!(!body.to_string().to_lowercase().contains("sqlite"));
+        assert_nothing_posted(&f, &id, &f.batch_id, before).await;
+        assert_eq!(
+            numbers_issued(&f).await,
+            issued,
+            "a refused posting consumed a number"
+        );
+    }
+
+    /// A shipping address is not the recipient's address, and is never borrowed as one.
+    #[tokio::test]
+    async fn a_shipping_address_is_not_used_as_the_recipient_address() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO party_addresses (id,party_id,address_role,line1,state_id,is_primary,\
+             created_at_utc,updated_at_utc) VALUES (?,?,'shipping','Warehouse 4',?,1,\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&party)
+        .bind(MAHARASHTRA)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields(&body), vec!["customer.billingAddress"]);
+    }
+
+    /// An archived billing address is not an address the customer has.
+    #[tokio::test]
+    async fn an_archived_billing_address_does_not_satisfy_the_rule() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        let address =
+            add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        sqlx::query(
+            "UPDATE party_addresses SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='moved' WHERE id=?",
+        )
+        .bind(&address)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+    }
+
+    /// Several billing addresses and no primary: choosing one would be a guess about which the
+    /// customer uses, so the service refuses and says how to settle it.
+    #[tokio::test]
+    async fn several_billing_addresses_without_a_primary_are_refused_rather_than_guessed() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), false).await;
+        add_billing_address(&f.pool, &party, "9 Station Road", Some(MAHARASHTRA), false).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["issues"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("primary"),
+            "{body}"
+        );
+
+        // Marking one primary settles it, and that one is frozen.
+        sqlx::query("UPDATE party_addresses SET is_primary=1 WHERE line1='9 Station Road'")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientAddressLine1"], "9 Station Road");
+    }
+
+    /// A GSTIN that is well-shaped but fails its check digit is not a valid GSTIN, whatever the
+    /// Party master holds.
+    #[tokio::test]
+    async fn a_registered_recipient_whose_gstin_fails_its_check_digit_is_refused() {
+        let f = fixture().await;
+        let good = valid_gstin("27", "AAACM1234K");
+        let party = registered_customer(&f.pool, "Mehta Medical Stores", &good).await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let wrong_check = format!(
+            "{}{}",
+            &good[..14],
+            if good.ends_with('A') { 'B' } else { 'A' }
+        );
+        sqlx::query("UPDATE parties SET gstin=?,normalized_gstin=? WHERE id=?")
+            .bind(&wrong_check)
+            .bind(&wrong_check)
+            .bind(&party)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields(&body), vec!["customer.gstin"]);
+    }
+
+    #[tokio::test]
+    async fn an_archived_registered_recipient_is_refused_at_posting() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        sqlx::query(
+            "UPDATE parties SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='closed' WHERE id=?",
+        )
+        .bind(&party)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let revision = revision_of(&f, &id).await;
+        let (status, body) =
+            post_sale_request(&f, &id, revision, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "customer_not_eligible");
+    }
+
+    /// A registered customer from another State still buys at the counter as before: Rule 46(d)
+    /// asks for no address of delivery, so nothing on the document contradicts intra-State tax.
+    #[tokio::test]
+    async fn a_registered_recipient_from_another_state_still_posts_as_a_counter_sale() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mysuru Pharma Distributors",
+            &valid_gstin("29", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(
+            &f.pool,
+            &party,
+            "12 Sayyaji Rao Road",
+            Some(KARNATAKA),
+            true,
+        )
+        .await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["taxTreatment"], "intra_state");
+        assert_eq!(posted["recipientStateCode"], "29");
+        assert_eq!(posted["customerStateCode"], "29");
+    }
+
+    // --- Rule 46(e): the ₹50,000 taxable-value threshold ---------------------------------------
+
+    /// ₹49,999.99 of taxable value is below the line even though the payable total, with GST, is
+    /// well above ₹50,000. No address is demanded, and none is frozen.
+    #[tokio::test]
+    async fn just_below_the_threshold_an_ordinary_walk_in_posts_without_an_address() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 4_999_999).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["taxableValuePaise"], 4_999_999);
+        assert!(quote["grandTotalPaise"].as_i64().unwrap() > 5_000_000);
+        assert_eq!(quote["recipientParticulars"]["required"], false);
+        assert_eq!(
+            quote["recipientParticulars"]["taxableSupplyValuePaise"],
+            4_999_999
+        );
+
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientSnapshotVersion"], 1);
+        assert_eq!(posted["recipientParticularsRequested"], false);
+        assert!(posted["recipientAddressLine1"].is_null());
+        assert!(posted["deliverySameAsRecipient"].is_null());
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["recipient"]["walkIn"], true);
+        assert!(document["recipient"]["address"].is_null());
+    }
+
+    #[tokio::test]
+    async fn exactly_fifty_thousand_rupees_of_taxable_value_requires_the_particulars() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let before = balance(&f, &batch).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+        assert_eq!(
+            issue_fields(&body),
+            vec![
+                "customerNameText",
+                "recipientAddress.line1",
+                "recipientAddress.stateId"
+            ]
+        );
+        assert_nothing_posted(&f, &id, &batch, before).await;
+    }
+
+    #[tokio::test]
+    async fn one_paisa_over_the_threshold_requires_the_particulars() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_001).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(
+            quote["recipientParticulars"]["reasons"],
+            json!(["taxable_value_threshold"])
+        );
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+    }
+
+    /// The same Sale, completed at the counter, posts and freezes exactly what was typed — without
+    /// creating a customer record. The seller and tax snapshots are unaffected.
+    #[tokio::test]
+    async fn over_the_threshold_complete_counter_particulars_post_without_creating_a_party() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let parties_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parties")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_001).await;
+        let (status, saved) = save_header(
+            &f,
+            &id,
+            json!({ "customerNameText": "Asha Patil", "recipientAddress": counter_address() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(
+            quote_of(&f, &id).await["recipientParticulars"]["missing"],
+            json!([])
+        );
+
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientAddressSource"], "counter");
+        assert_eq!(posted["deliverySameAsRecipient"], true);
+        let parties_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parties")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            parties_before, parties_after,
+            "a statutory recipient created a Party"
+        );
+
+        let (_, document) = invoice(&f, &id).await;
+        let recipient = &document["recipient"];
+        assert_eq!(recipient["walkIn"], true);
+        assert_eq!(recipient["name"], "Asha Patil");
+        assert_eq!(recipient["address"]["source"], "counter");
+        assert_eq!(recipient["address"]["line1"], COUNTER_ADDRESS);
+        assert_eq!(recipient["address"]["stateName"], "Maharashtra");
+        assert_eq!(recipient["address"]["stateCode"], "27");
+        assert_eq!(recipient["delivery"]["sameAsRecipient"], true);
+        assert!(recipient["delivery"]["address"].is_null());
+        // Neither neighbouring snapshot was disturbed.
+        assert_eq!(
+            document["sellerSnapshot"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        assert_eq!(document["regulatory"]["sellerSnapshotVersion"], 1);
+        assert_eq!(document["totals"]["taxableValuePaise"], 5_000_001);
+        assert_eq!(document["lines"][0]["cgstBasisPoints"], 600);
+    }
+
+    /// Fixture A. Taxable ₹49,999 beside ₹10,000 of exempt goods: the basket, and the header's
+    /// `taxable_value_paise`, both exceed ₹50,000, but the value of the TAXABLE supply does not.
+    #[tokio::test]
+    async fn exempt_value_does_not_carry_a_basket_over_the_threshold() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let (exempt_product, exempt_pack, exempt_batch) = exempt_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 4_999_900).await;
+        add_line(
+            &f,
+            &id,
+            &exempt_product,
+            &exempt_pack,
+            &exempt_batch,
+            1,
+            1_000_000,
+        )
+        .await;
+
+        let quote = quote_of(&f, &id).await;
+        // The repository fact this test exists for: the header column counts the exempt line.
+        assert_eq!(quote["taxableValuePaise"], 5_999_900);
+        assert_eq!(
+            quote["recipientParticulars"]["taxableSupplyValuePaise"],
+            4_999_900
+        );
+        assert_eq!(quote["recipientParticulars"]["required"], false);
+
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert!(posted["recipientAddressLine1"].is_null());
+    }
+
+    /// Fixture B, with exempt value alongside: taxable exactly ₹50,000 triggers whatever else is in
+    /// the basket.
+    #[tokio::test]
+    async fn taxable_value_at_the_threshold_triggers_beside_exempt_goods() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let (exempt_product, exempt_pack, exempt_batch) = exempt_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        add_line(
+            &f,
+            &id,
+            &exempt_product,
+            &exempt_pack,
+            &exempt_batch,
+            1,
+            500,
+        )
+        .await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+    }
+
+    /// The threshold follows the bill as it is built: crossing it adds the requirement, falling back
+    /// removes the one Rule 46(e) caused, and a request keeps particulars required regardless.
+    #[tokio::test]
+    async fn the_requirement_follows_the_taxable_value_as_lines_change() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 4_000_000).await;
+        assert_eq!(
+            quote_of(&f, &id).await["recipientParticulars"]["required"],
+            false
+        );
+
+        let second = add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 1_000_000).await;
+        let crossed = quote_of(&f, &id).await;
+        assert_eq!(crossed["recipientParticulars"]["required"], true);
+        assert_eq!(
+            crossed["recipientParticulars"]["reasons"],
+            json!(["taxable_value_threshold"])
+        );
+
+        let revision = revision_of(&f, &id).await;
+        let (status, removed) = request(
+            f.pool.clone(),
+            "DELETE",
+            &format!("/api/v1/sale-lines/{second}"),
+            json!({ "expectedRevision": revision }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{removed}");
+        assert_eq!(
+            quote_of(&f, &id).await["recipientParticulars"]["required"],
+            false
+        );
+
+        let (status, _) =
+            save_header(&f, &id, json!({ "recipientParticularsRequested": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        let requested = quote_of(&f, &id).await;
+        assert_eq!(requested["recipientParticulars"]["required"], true);
+        assert_eq!(
+            requested["recipientParticulars"]["reasons"],
+            json!(["recipient_requested"])
+        );
+    }
+
+    // --- Rule 46(f): particulars recorded on request ------------------------------------------
+
+    #[tokio::test]
+    async fn a_request_below_the_threshold_needs_every_particular_before_posting() {
+        let f = fixture().await;
+        let id = open_sale(&f, json!({ "recipientParticularsRequested": true })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            issue_fields(&body),
+            vec![
+                "customerNameText",
+                "recipientAddress.line1",
+                "recipientAddress.stateId"
+            ]
+        );
+
+        // Name and line typed, State still missing.
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "recipientParticularsRequested": true, "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": COUNTER_ADDRESS }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields(&body), vec!["recipientAddress.stateId"]);
+
+        // Complete.
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "recipientParticularsRequested": true, "customerNameText": "Asha Patil",
+                "recipientAddress": counter_address()
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientParticularsRequested"], true);
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["recipient"]["particularsRequested"], true);
+        assert_eq!(document["recipient"]["address"]["line1"], COUNTER_ADDRESS);
+    }
+
+    /// Without the request, an address typed at a small counter sale is not put on the invoice:
+    /// Rule 46(f) is the customer asking, not the operator happening to fill in a form.
+    #[tokio::test]
+    async fn an_address_typed_without_a_request_below_the_threshold_is_not_frozen() {
+        let f = fixture().await;
+        let id = open_sale(
+            &f,
+            json!({ "customerNameText": "Asha Patil", "recipientAddress": counter_address() }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        assert_eq!(
+            quote_of(&f, &id).await["recipientParticulars"]["required"],
+            false
+        );
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientParticularsRequested"], false);
+        assert!(posted["recipientAddressLine1"].is_null());
+        assert!(posted["recipientAddressSource"].is_null());
+    }
+
+    /// A draft saved before this phase existed has NULL flags. They read as "not requested" and
+    /// "delivered to the recipient", which is what an ordinary counter sale was.
+    #[tokio::test]
+    async fn a_draft_from_before_the_upgrade_posts_as_an_ordinary_sale() {
+        let f = fixture().await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        sqlx::query(
+            "UPDATE sale_documents SET recipient_particulars_requested=NULL,\
+             delivery_same_as_recipient=NULL WHERE id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientSnapshotVersion"], 1);
+    }
+
+    // --- Address of delivery -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delivery_elsewhere_needs_its_own_address_and_freezes_it() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "customerNameText": "Asha Patil", "recipientAddress": counter_address(),
+                "deliverySameAsRecipient": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            issue_fields(&body),
+            vec!["deliveryAddress.line1", "deliveryAddress.stateId"]
+        );
+
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "customerNameText": "Asha Patil", "recipientAddress": counter_address(),
+                "deliverySameAsRecipient": false,
+                "deliveryAddress": { "line1": "Site Office, Plot 9", "city": "Pimpri", "stateId": MAHARASHTRA }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        let delivery = &document["recipient"]["delivery"];
+        assert_eq!(delivery["sameAsRecipient"], false);
+        assert_eq!(delivery["address"]["line1"], "Site Office, Plot 9");
+        assert_eq!(delivery["address"]["city"], "Pimpri");
+        assert_eq!(delivery["address"]["stateCode"], "27");
+    }
+
+    const PUNJAB: &str = "01997300-0000-7000-8000-000000000003";
+
+    /// Moves the fixture pharmacy to Punjab: its GSTIN, place of supply and address all change
+    /// together, as the Store Profile would record them.
+    async fn relocate_store_to_punjab(f: &Fixture) {
+        let gstin = valid_gstin("03", "AAPFU0939F");
+        sqlx::query(
+            "UPDATE store_identity SET gstin=?,normalized_gstin=?,place_of_supply_state_id=? \
+             WHERE store_id=?",
+        )
+        .bind(&gstin)
+        .bind(&gstin)
+        .bind(PUNJAB)
+        .bind(&f.store_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE store_addresses SET city='Ludhiana',state_id=? WHERE store_id=?")
+            .bind(PUNJAB)
+            .bind(&f.store_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Posts one ₹50,000 walk-in counter sale in the Punjab store with the given recipient and
+    /// delivery particulars, and returns the posted detail and its invoice.
+    async fn punjab_counter_sale(f: &Fixture, batch: &str, header: Value) -> (Value, Value) {
+        let id = open_sale(f, json!({})).await;
+        add_line(f, &id, &f.product_id, &f.pack_id, batch, 1, 5_000_000).await;
+        let (status, saved) = save_header(f, &id, header).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let (status, posted) = post_as_quoted(f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (status, document) = invoice(f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        (posted, document)
+    }
+
+    /// Test A. A Punjab pharmacy hands goods over the counter to an unregistered customer whose
+    /// address is in Karnataka, with Rule 46(e) particulars required. The address is a documentary
+    /// particular of the invoice; by itself it proves no movement of goods out of Punjab, so it is
+    /// recorded as given and the sale posts.
+    #[tokio::test]
+    async fn a_counter_handover_to_a_customer_with_an_address_in_another_state_posts() {
+        let f = fixture().await;
+        relocate_store_to_punjab(&f).await;
+        let batch = unpriced_lot(&f).await;
+        let (posted, document) = punjab_counter_sale(
+            &f,
+            &batch,
+            json!({
+                "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "4 Brigade Road", "city": "Bengaluru", "stateId": KARNATAKA }
+            }),
+        )
+        .await;
+        assert_eq!(posted["storeStateCode"], "03");
+        assert_eq!(posted["recipientStateCode"], "29");
+        assert_eq!(posted["deliverySameAsRecipient"], true);
+        let recipient = &document["recipient"];
+        assert_eq!(recipient["address"]["line1"], "4 Brigade Road");
+        assert_eq!(recipient["address"]["stateName"], "Karnataka");
+        assert_eq!(recipient["address"]["stateCode"], "29");
+        assert_eq!(recipient["delivery"]["sameAsRecipient"], true);
+    }
+
+    /// The Rule 46(f) path behaves the same way below the threshold: a requested particular in
+    /// another State is recorded, not refused.
+    #[tokio::test]
+    async fn a_requested_particular_in_another_state_is_recorded_below_the_threshold() {
+        let f = fixture().await;
+        relocate_store_to_punjab(&f).await;
+        let id = open_sale(
+            &f,
+            json!({
+                "recipientParticularsRequested": true, "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "4 Brigade Road", "stateId": KARNATAKA }
+            }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientParticularsRequested"], true);
+        assert_eq!(posted["recipientStateCode"], "29");
+    }
+
+    /// Test B. Neither a different-State recipient address nor a different-State delivery address
+    /// changes the place of supply, the CGST/SGST/IGST split, or the document classification. The
+    /// same basket posted with every address in Punjab produces exactly the same tax facts.
+    #[tokio::test]
+    async fn a_different_state_address_changes_no_tax_fact_of_a_counter_sale() {
+        let f = fixture().await;
+        relocate_store_to_punjab(&f).await;
+        let batch = unpriced_lot(&f).await;
+        let (home, home_document) = punjab_counter_sale(
+            &f,
+            &batch,
+            json!({
+                "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "22 Mall Road", "stateId": PUNJAB }
+            }),
+        )
+        .await;
+        let (away, away_document) = punjab_counter_sale(
+            &f,
+            &batch,
+            json!({
+                "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "4 Brigade Road", "stateId": KARNATAKA },
+                "deliverySameAsRecipient": false,
+                "deliveryAddress": { "line1": "Warehouse 2, Mysore Road", "stateId": KARNATAKA }
+            }),
+        )
+        .await;
+
+        for field in [
+            "taxTreatment",
+            "storePlaceOfSupplyStateId",
+            "storeStateCode",
+            "taxableValuePaise",
+            "cgstPaise",
+            "sgstPaise",
+            "igstPaise",
+            "cessPaise",
+            "grandTotalPaise",
+        ] {
+            assert_eq!(
+                home[field], away[field],
+                "{field} changed with the address State"
+            );
+        }
+        assert_eq!(away["taxTreatment"], "intra_state");
+        assert_eq!(away["igstPaise"], 0);
+        assert!(away["cgstPaise"].as_i64().unwrap() > 0);
+        assert_eq!(away["storeStateCode"], "03");
+        assert_eq!(
+            home_document["document"]["documentType"],
+            away_document["document"]["documentType"]
+        );
+        assert_eq!(away_document["document"]["documentType"], "tax_invoice");
+        assert_eq!(home_document["taxSummary"], away_document["taxSummary"]);
+        assert_eq!(away_document["regulatory"]["taxTreatment"], "intra_state");
+        // The delivery address itself is frozen exactly as supplied.
+        let delivery = &away_document["recipient"]["delivery"];
+        assert_eq!(delivery["sameAsRecipient"], false);
+        assert_eq!(delivery["address"]["line1"], "Warehouse 2, Mysore Road");
+        assert_eq!(delivery["address"]["stateCode"], "29");
+    }
+
+    /// Tests C and D. Removing the State comparison removed nothing else: a required delivery
+    /// address in another State that is missing, or incomplete, is still refused.
+    #[tokio::test]
+    async fn a_different_state_delivery_address_that_is_missing_or_incomplete_is_still_refused() {
+        let f = fixture().await;
+        relocate_store_to_punjab(&f).await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let before = balance(&f, &batch).await;
+
+        // C: delivery elsewhere, no delivery address at all.
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "4 Brigade Road", "stateId": KARNATAKA },
+                "deliverySameAsRecipient": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+        assert_eq!(
+            issue_fields(&body),
+            vec!["deliveryAddress.line1", "deliveryAddress.stateId"]
+        );
+
+        // D: a delivery line in another State, but no State recorded for it.
+        let (status, _) = save_header(
+            &f,
+            &id,
+            json!({
+                "customerNameText": "Asha Patil",
+                "recipientAddress": { "line1": "4 Brigade Road", "stateId": KARNATAKA },
+                "deliverySameAsRecipient": false,
+                "deliveryAddress": { "line1": "Warehouse 2, Mysore Road", "city": "Mysuru" }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields(&body), vec!["deliveryAddress.stateId"]);
+        assert_nothing_posted(&f, &id, &batch, before).await;
+    }
+
+    // --- Draft validation -------------------------------------------------------------------
+
+    /// A named customer's address lives in their record. The counter cannot type a second one beside
+    /// it — through the API or straight into the database.
+    #[tokio::test]
+    async fn a_counter_address_beside_a_named_customer_is_refused() {
+        let f = fixture().await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            with_date(
+                json!({ "customerPartyId": f.customer_id, "recipientAddress": counter_address() }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(issue_fields(&body), vec!["recipientAddress"]);
+
+        let id = open_sale(&f, json!({ "customerPartyId": f.customer_id })).await;
+        let direct =
+            sqlx::query("UPDATE sale_documents SET recipient_address_line1='Back Door' WHERE id=?")
+                .bind(&id)
+                .execute(&f.pool)
+                .await;
+        assert!(
+            direct.is_err(),
+            "the database accepted a second address for a named customer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_address_without_delivery_elsewhere_is_refused() {
+        let f = fixture().await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            with_date(json!({ "deliveryAddress": { "line1": "Somewhere" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(issue_fields(&body), vec!["deliveryAddress"]);
+    }
+
+    /// Bounds and formats are the Party address's own, and a malformed field is named precisely.
+    #[tokio::test]
+    async fn malformed_counter_address_fields_are_refused_by_name() {
+        let f = fixture().await;
+        let unknown_state = Uuid::now_v7().to_string();
+        for (address, field) in [
+            (
+                json!({ "line1": "x".repeat(201) }),
+                "recipientAddress.line1",
+            ),
+            (
+                json!({ "line1": "ok", "line2": "y".repeat(201) }),
+                "recipientAddress.line2",
+            ),
+            (
+                json!({ "line1": "ok", "city": "c".repeat(101) }),
+                "recipientAddress.city",
+            ),
+            (
+                json!({ "line1": "ok", "postalCode": "4110<1>" }),
+                "recipientAddress.postalCode",
+            ),
+            (
+                json!({ "line1": "ok", "postalCode": "1".repeat(17) }),
+                "recipientAddress.postalCode",
+            ),
+            (
+                json!({ "line1": "ok", "stateId": "not-a-uuid" }),
+                "recipientAddress.stateId",
+            ),
+            (
+                json!({ "line1": "ok", "stateId": unknown_state }),
+                "recipientAddress.stateId",
+            ),
+        ] {
+            let (status, body) = request(
+                f.pool.clone(),
+                "POST",
+                "/api/v1/sales",
+                with_date(json!({ "recipientAddress": address })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
+            assert_eq!(issue_fields(&body), vec![field]);
+        }
+    }
+
+    /// A line of spaces is no address: it is stored as nothing and reported as missing.
+    #[tokio::test]
+    async fn a_blank_address_line_is_not_an_address() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(
+            &f,
+            json!({ "customerNameText": "Asha", "recipientAddress": { "line1": "   ", "stateId": MAHARASHTRA } }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields(&body), vec!["recipientAddress.line1"]);
+    }
+
+    /// What the operator typed reaches the document as typed. Escaping is the renderer's job.
+    #[tokio::test]
+    async fn unicode_and_markup_in_a_counter_address_survive_verbatim() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let hostile = "<img src=x onerror=alert(1)> फ्लैट ७, \"शांति\" निवास & Co";
+        let name = "आशा पाटील <b>O'Brien</b>";
+        let id = open_sale(
+            &f,
+            json!({
+                "customerNameText": name,
+                "recipientAddress": { "line1": hostile, "city": "पुणे", "stateId": MAHARASHTRA }
+            }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["recipient"]["name"], name);
+        assert_eq!(document["recipient"]["address"]["line1"], hostile);
+        assert_eq!(document["recipient"]["address"]["city"], "पुणे");
+    }
+
+    /// Recording statutory particulars is counter work, like the rest of the Sale. No new privilege.
+    #[tokio::test]
+    async fn a_cashier_records_and_posts_statutory_particulars() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let revision = revision_of(&f, &id).await;
+        let (status, body) = request_as(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/sales/{id}"),
+            json!({
+                "expectedRevision": revision, "businessDate": TODAY,
+                "customerNameText": "Asha Patil", "recipientAddress": counter_address()
+            }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, posted) = post_as_quoted_by(&f, &id, CASHIER).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_party_cannot_be_named_on_a_sale() {
+        let f = fixture().await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            with_date(json!({ "customerPartyId": Uuid::now_v7().to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "customer_not_eligible");
+    }
+
+    // --- Authority, immutability and history --------------------------------------------------
+
+    /// The browser that opened the draft saw one address; the record changed before posting. The
+    /// posted Sale carries the record as it stood at posting — the browser is not the authority.
+    #[tokio::test]
+    async fn posting_reads_the_customer_record_not_what_the_screen_last_showed() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let seen = quote_of(&f, &id).await;
+        assert_eq!(seen["recipientParticulars"]["missing"], json!([]));
+
+        sqlx::query("UPDATE party_addresses SET line1='21 New Mill Road' WHERE party_id=?")
+            .bind(&party)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientAddressLine1"], "21 New Mill Road");
+    }
+
+    /// After posting, nothing that happens to the customer's record reaches the issued document:
+    /// not a rename, not an address change, not archiving the address, not archiving the party.
+    #[tokio::test]
+    async fn customer_record_changes_after_posting_never_reach_the_document() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, _) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, before) = invoice(&f, &id).await;
+
+        for statement in [
+            "UPDATE parties SET display_name='Renamed Traders' WHERE id=?1",
+            "UPDATE party_addresses SET line1='99 Elsewhere',city='Nashik',postal_code='422001' WHERE party_id=?1",
+            "UPDATE party_addresses SET status='archived',archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='moved' WHERE party_id=?1",
+            "UPDATE parties SET status='archived',archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='closed' WHERE id=?1",
+        ] {
+            sqlx::query(statement)
+                .bind(&party)
+                .execute(&f.pool)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+            let (status, after) = invoice(&f, &id).await;
+            assert_eq!(status, StatusCode::OK, "{after}");
+            assert_eq!(
+                before["recipient"], after["recipient"],
+                "after: {statement}"
+            );
+        }
+    }
+
+    /// Direct SQL cannot rewrite a frozen recipient particular on a posted Sale, column by column.
+    #[tokio::test]
+    async fn the_recipient_snapshot_cannot_be_mutated_by_direct_sql() {
+        let f = fixture().await;
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(
+            &f,
+            json!({ "customerNameText": "Asha Patil", "recipientAddress": counter_address() }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 5_000_000).await;
+        let (status, _) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, before) = invoice(&f, &id).await;
+
+        for assignment in [
+            "recipient_snapshot_version=0",
+            "recipient_particulars_requested=1",
+            "recipient_address_source='party'",
+            "recipient_address_line1='Forged Road'",
+            "recipient_address_line2='Forged'",
+            "recipient_city='Forged'",
+            "recipient_postal_code='000000'",
+            "recipient_state_id=NULL",
+            "recipient_state_name='Karnataka'",
+            "recipient_state_code='29'",
+            "delivery_same_as_recipient=0",
+            "delivery_address_line1='Forged'",
+            "delivery_state_code='29'",
+            "customer_name_text='Someone Else'",
+        ] {
+            let attempt = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+            assert!(
+                attempt.is_err(),
+                "{assignment} was accepted on a posted Sale"
+            );
+        }
+        let (_, after) = invoice(&f, &id).await;
+        assert_eq!(before["recipient"], after["recipient"]);
+    }
+
+    /// The database refuses a version-1 snapshot that lacks what Rule 46 requires, even when the
+    /// posted-row guard is out of the way and the service is bypassed entirely.
+    #[tokio::test]
+    async fn the_database_refuses_an_incomplete_recipient_snapshot_whoever_writes_it() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, _) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        for assignment in [
+            // Rule 46(d) without its address.
+            "recipient_address_line1=NULL,recipient_address_line2=NULL,recipient_city=NULL,\
+             recipient_postal_code=NULL,recipient_state_id=NULL,recipient_state_name=NULL,\
+             recipient_state_code=NULL,recipient_address_source=NULL",
+            // An address with no provenance.
+            "recipient_address_source=NULL",
+            // Provenance that contradicts the named party.
+            "recipient_address_source='counter'",
+            // A State name with no code.
+            "recipient_state_code=NULL",
+            // Delivery elsewhere with nowhere named.
+            "delivery_same_as_recipient=0",
+            // The request flag erased.
+            "recipient_particulars_requested=NULL",
+        ] {
+            let attempt = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+            let message = attempt
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                message.contains("recipient_snapshot_incomplete"),
+                "{assignment} was accepted: {message}"
+            );
+        }
+    }
+
+    /// A Sale posted before recipient particulars existed reports that honestly: version 0, no
+    /// address, no delivery, no request flag — and the customer's CURRENT address, although the
+    /// record holds one, is not presented as history.
+    #[tokio::test]
+    async fn a_legacy_sale_reports_unknown_recipient_particulars_without_borrowing_current_ones() {
+        let f = fixture().await;
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, _) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        for trigger in [
+            "sale_documents_posted_no_update",
+            "sale_documents_recipient_snapshot_update",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(&f.pool)
+                .await
+                .unwrap();
+        }
+        // Exactly what a Sale posted before migration 0018 looks like.
+        sqlx::query(
+            "UPDATE sale_documents SET recipient_snapshot_version=0,\
+             recipient_particulars_requested=NULL,recipient_address_source=NULL,\
+             recipient_address_line1=NULL,recipient_address_line2=NULL,recipient_city=NULL,\
+             recipient_postal_code=NULL,recipient_state_id=NULL,recipient_state_name=NULL,\
+             recipient_state_code=NULL,delivery_same_as_recipient=NULL WHERE id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, document) = invoice(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        let recipient = &document["recipient"];
+        assert_eq!(recipient["snapshotVersion"], 0);
+        assert!(
+            recipient["address"].is_null(),
+            "a current address was presented as history"
+        );
+        assert!(recipient["delivery"].is_null());
+        assert!(recipient["particularsRequested"].is_null());
+        // What Phase 1H did freeze is still reported.
+        assert_eq!(recipient["name"], "Mehta Medical Stores");
+        assert_eq!(recipient["gstRegistrationStatus"], "registered");
+        assert!(!document.to_string().contains("7 Mill Road"));
+    }
+
+    /// Posting races an edit to the customer's name and address, committed together. Whatever the
+    /// interleaving, the Sale carries one coherent record: never the old name beside the new address.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_customer_record_is_edited_snapshots_one_coherent_state() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let party =
+                registered_customer(&f.pool, "Old Traders", &valid_gstin("27", "AAACM1234K")).await;
+            add_billing_address(&f.pool, &party, "1 Old Road", Some(MAHARASHTRA), true).await;
+            let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+
+            let pool = f.pool.clone();
+            let party_id = party.clone();
+            let editor = tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                sqlx::query("UPDATE parties SET display_name='New Traders' WHERE id=?")
+                    .bind(&party_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE party_addresses SET line1='2 New Road' WHERE party_id=?")
+                    .bind(&party_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let poster = post_sale_request(&f, &id, revision, &key, 8960);
+            let (posted, edited) = tokio::join!(poster, editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+
+            let (name, line1): (String, String) = sqlx::query_as(
+                "SELECT customer_display_name,recipient_address_line1 FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            let coherent = (name == "Old Traders" && line1 == "1 Old Road")
+                || (name == "New Traders" && line1 == "2 New Road");
+            assert!(
+                coherent,
+                "attempt {attempt} produced a torn recipient: {name} / {line1}"
+            );
+        }
+    }
+
+    /// The same race against a GSTIN correction made together with an address change.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_gstin_and_address_change_snapshots_one_coherent_state() {
+        let old_gstin = valid_gstin("27", "AAACM1234K");
+        let new_gstin = valid_gstin("27", "AAACN5678L");
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let party = registered_customer(&f.pool, "Mehta Medical Stores", &old_gstin).await;
+            add_billing_address(&f.pool, &party, "1 Old Road", Some(MAHARASHTRA), true).await;
+            let id = open_sale(&f, json!({ "customerPartyId": party })).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+
+            let pool = f.pool.clone();
+            let party_id = party.clone();
+            let replacement = new_gstin.clone();
+            let editor = tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                sqlx::query("UPDATE parties SET gstin=?,normalized_gstin=? WHERE id=?")
+                    .bind(&replacement)
+                    .bind(&replacement)
+                    .bind(&party_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE party_addresses SET line1='2 New Road' WHERE party_id=?")
+                    .bind(&party_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let poster = post_sale_request(&f, &id, revision, &key, 8960);
+            let (posted, edited) = tokio::join!(poster, editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+
+            let (gstin, line1): (String, String) = sqlx::query_as(
+                "SELECT customer_normalized_gstin,recipient_address_line1 FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            let coherent = (gstin == old_gstin && line1 == "1 Old Road")
+                || (gstin == new_gstin && line1 == "2 New Road");
+            assert!(
+                coherent,
+                "attempt {attempt} produced a torn recipient: {gstin} / {line1}"
+            );
+        }
     }
 }

@@ -424,6 +424,27 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .pos-customer h3 { margin: 0 0 4px; font-size: .78rem; }
 .pos-customer__current { margin: 0 0 10px; color: var(--ink-500); font-size: .74rem; }
 .pos-customer .master-form { padding: 0; }
+/* Recipient particulars (CGST Rule 46): shown only when a rule asks for them, so an ordinary walk-in
+   bill never grows an address form. */
+.pos-customer__reasons { margin: 0 0 10px; padding-left: 18px; color: var(--ink-700); font-size: .7rem; line-height: 1.55; }
+.pos-customer__address { margin: 0 0 10px; color: var(--ink-700); font-size: .72rem; overflow-wrap: anywhere; }
+.pos-recipient { display: grid; gap: 12px; min-width: 0; padding-top: 12px; border-top: 1px solid var(--line); }
+.pos-recipient .pos-customer__reasons { margin: 0; }
+.pos-recipient__party p { margin: 0; color: var(--ink-500); font-size: .72rem; }
+.pos-recipient__missing { margin: 6px 0 0; padding-left: 18px; color: var(--danger-700); font-size: .7rem; font-weight: 700; line-height: 1.55; }
+.pos-address { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.pos-address legend { margin-bottom: 6px; padding: 0; font-size: .72rem; font-weight: 800; }
+.pos-address .field { margin: 0; min-width: 0; }
+.pos-address .field input, .pos-address .field select { width: 100%; }
+.pos-address__wide { grid-column: 1 / -1; }
+.pos-address label .row-subtext { display: inline; margin-left: 3px; font-weight: 500; }
+.pos-summary .pos-recipient-callout { margin: 0; }
+.pos-recipient-callout ul { overflow-wrap: anywhere; }
+.pos-recipient-callout .button { justify-self: start; margin-top: 8px; }
+.check-field span { min-width: 0; }
+@media (max-width: 560px) {
+  .pos-address { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* An expired lot or an empty one is stated in the operator's own colour vocabulary rather than
    quietly hidden: a lot that vanishes teaches nothing, and the operator goes looking for it. */

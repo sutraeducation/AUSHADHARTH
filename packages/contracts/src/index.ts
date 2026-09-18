@@ -1114,7 +1114,33 @@ export const SaleSchema = z.object({
   createdAtUtc: z.string(),
   updatedAtUtc: z.string(),
   postedByUserId: z.string().nullable(),
-  postedAtUtc: z.string().nullable()
+  postedAtUtc: z.string().nullable(),
+  /**
+   * Phase 1L-A2 recipient particulars (CGST Rule 46(d)–(f)).
+   *
+   * 0 on every draft and on a Sale posted before these existed — whose address facts are then
+   * UNKNOWN, not absent. 1 once posting evaluated and froze them. On a walk-in draft the address
+   * fields hold what the counter typed; on a posted Sale they are the snapshot.
+   */
+  recipientSnapshotVersion: z.number().int(),
+  /** Rule 46(f): the customer asked for their details on the invoice. */
+  recipientParticularsRequested: z.boolean().nullable(),
+  recipientAddressSource: z.enum(["party", "counter"]).nullable(),
+  recipientAddressLine1: z.string().nullable(),
+  recipientAddressLine2: z.string().nullable(),
+  recipientCity: z.string().nullable(),
+  recipientPostalCode: z.string().nullable(),
+  recipientStateId: z.string().nullable(),
+  recipientStateName: z.string().nullable(),
+  recipientStateCode: z.string().nullable(),
+  deliverySameAsRecipient: z.boolean().nullable(),
+  deliveryAddressLine1: z.string().nullable(),
+  deliveryAddressLine2: z.string().nullable(),
+  deliveryCity: z.string().nullable(),
+  deliveryPostalCode: z.string().nullable(),
+  deliveryStateId: z.string().nullable(),
+  deliveryStateName: z.string().nullable(),
+  deliveryStateCode: z.string().nullable()
 });
 
 /**
@@ -1189,11 +1215,32 @@ export const SaleDetailSchema = SaleSchema.extend({
   tenders: z.array(SaleTenderSchema).default([])
 });
 
-/** The only header facts a browser may supply. */
+/**
+ * An address typed at the counter. Every field may be blank on a draft: whether an address is
+ * needed at all depends on the taxable value, which is only final at posting.
+ */
+export const SaleAddressInputSchema = z.object({
+  line1: z.string().nullable().optional(),
+  line2: z.string().nullable().optional(),
+  city: z.string().nullable().optional(),
+  postalCode: z.string().nullable().optional(),
+  stateId: z.string().nullable().optional()
+});
+
+/**
+ * The only header facts a browser may supply.
+ *
+ * The header is replaced as a whole on every save, so a caller that omits the recipient fields
+ * clears them. A named customer's address is never sent: it is read from their record at posting.
+ */
 export const SaleDraftInputSchema = z.object({
   customerPartyId: z.string().nullable().optional(),
   customerNameText: z.string().nullable().optional(),
-  businessDate: z.string()
+  businessDate: z.string(),
+  recipientParticularsRequested: z.boolean().optional(),
+  recipientAddress: SaleAddressInputSchema.nullable().optional(),
+  deliverySameAsRecipient: z.boolean().optional(),
+  deliveryAddress: SaleAddressInputSchema.nullable().optional()
 });
 
 export const UpdateSaleDraftRequestSchema = SaleDraftInputSchema.extend({
@@ -1272,7 +1319,29 @@ export const SaleQuoteSchema = z.object({
   igstPaise: z.number().int(),
   cessPaise: z.number().int(),
   grandTotalPaise: z.number().int(),
-  lines: z.array(SaleQuoteLineSchema).default([])
+  lines: z.array(SaleQuoteLineSchema).default([]),
+  recipientParticulars: z.lazy(() => RecipientRequirementSchema)
+});
+
+/** Why an invoice must show recipient particulars: Rule 46(d), 46(e) and 46(f) respectively. */
+export const RecipientRequirementReasonSchema = z.enum([
+  "registered_recipient",
+  "taxable_value_threshold",
+  "recipient_requested"
+]);
+
+/**
+ * What posting will ask of this Sale's recipient, worked out by the same code posting uses.
+ *
+ * `taxableSupplyValuePaise` is the value the ₹50,000 line is judged on: taxable lines only. It is
+ * deliberately not `taxableValuePaise`, which also counts exempt and non-GST lines.
+ */
+export const RecipientRequirementSchema = z.object({
+  required: z.boolean(),
+  reasons: RecipientRequirementReasonSchema.array(),
+  missing: z.object({ field: z.string(), message: z.string() }).array(),
+  thresholdPaise: z.number().int(),
+  taxableSupplyValuePaise: z.number().int()
 });
 
 /** Every code the sale API can return, mirroring `api::sales::SaleError`. */
@@ -1286,6 +1355,8 @@ export const SaleErrorCodeSchema = z.enum([
   // Phase 1L-A: the pharmacy has no recorded name, address or drug sale licence, so no lawful
   // memo could be issued for the sale.
   "store_legal_profile_incomplete",
+  // Phase 1L-A2: Rule 46 requires recipient particulars this Sale does not have yet.
+  "recipient_particulars_incomplete",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -1325,6 +1396,9 @@ export type TenderInput = z.infer<typeof TenderInputSchema>;
 export type SellableBatch = z.infer<typeof SellableBatchSchema>;
 export type SaleQuote = z.infer<typeof SaleQuoteSchema>;
 export type SaleQuoteLine = z.infer<typeof SaleQuoteLineSchema>;
+export type SaleAddressInput = z.infer<typeof SaleAddressInputSchema>;
+export type RecipientRequirement = z.infer<typeof RecipientRequirementSchema>;
+export type RecipientRequirementReason = z.infer<typeof RecipientRequirementReasonSchema>;
 export type SaleErrorCode = z.infer<typeof SaleErrorCodeSchema>;
 
 /**
@@ -2117,7 +2191,37 @@ export const InvoiceSchema = z.object({
     name: z.string().nullable(),
     gstRegistrationStatus: z.string().nullable(),
     gstin: z.string().nullable(),
-    stateCode: z.string().nullable()
+    /** The customer's place-of-supply State code from Phase 1H. Not the address State. */
+    stateCode: z.string().nullable(),
+    /** 0: the address facts below are unknown, and are never filled from the current record. */
+    snapshotVersion: z.number().int(),
+    particularsRequested: z.boolean().nullable(),
+    address: z
+      .object({
+        source: z.enum(["party", "counter"]),
+        line1: z.string(),
+        line2: z.string().nullable(),
+        city: z.string().nullable(),
+        postalCode: z.string().nullable(),
+        stateName: z.string().nullable(),
+        stateCode: z.string().nullable()
+      })
+      .nullable(),
+    delivery: z
+      .object({
+        sameAsRecipient: z.boolean(),
+        address: z
+          .object({
+            line1: z.string(),
+            line2: z.string().nullable(),
+            city: z.string().nullable(),
+            postalCode: z.string().nullable(),
+            stateName: z.string().nullable(),
+            stateCode: z.string().nullable()
+          })
+          .nullable()
+      })
+      .nullable()
   }),
   lines: InvoiceLineSchema.array(),
   /** Aggregation of the posted lines. Never a recomputation of the tax. */
