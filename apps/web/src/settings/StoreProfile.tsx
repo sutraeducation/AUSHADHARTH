@@ -1,8 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
+  EinvoiceApplicability,
   GstRegistrationStatus,
+  HsnTurnoverBand,
   ReferenceMasterResponse,
+  Rule46sDeclarationApplicability,
   StoreLicence,
   StoreProfile
 } from "@aushadharth/contracts";
@@ -17,6 +20,7 @@ import {
   getStoreProfile,
   restoreStoreLicence,
   updateStoreAddress,
+  updateInvoiceCompliance,
   updateStoreIdentity,
   updateStoreLicence
 } from "./storeProfileApi";
@@ -25,6 +29,26 @@ const REGISTRATION_LABELS: Record<GstRegistrationStatus, string> = {
   registered: "Registered",
   unregistered: "Not registered",
   unknown: "Not recorded yet"
+};
+
+// Factual labels only. Each describes what the owner told us, never what the law concludes from it.
+// The two questions are separate: one does not answer the other.
+const RULE46S_LABELS: Record<Rule46sDeclarationApplicability, string> = {
+  unknown: "Not recorded yet",
+  not_applicable: "Does not apply",
+  applicable: "Applies: recorded on every invoice"
+};
+
+const EINVOICE_LABELS: Record<EinvoiceApplicability, string> = {
+  unknown: "Not recorded yet",
+  not_required: "Not required",
+  required: "Required: sales to registered customers are refused"
+};
+
+const HSN_BAND_LABELS: Record<HsnTurnoverBand, string> = {
+  unknown: "Not recorded yet",
+  up_to_5_crore: "Up to ₹5 crore",
+  above_5_crore: "More than ₹5 crore"
 };
 
 const PROFILE_KEY = ["store", "profile"] as const;
@@ -43,7 +67,7 @@ export function StoreProfilePage() {
   usePageTitle("Store Profile");
   const auth = useAuth();
   const queryClient = useQueryClient();
-  const [editing, setEditing] = useState<"identity" | "address" | "tax" | null>(null);
+  const [editing, setEditing] = useState<"identity" | "address" | "tax" | "facts" | null>(null);
   const canMutate = auth.status?.user?.role === "owner_admin";
 
   const profile = useQuery({ queryKey: PROFILE_KEY, queryFn: getStoreProfile, retry: false });
@@ -124,6 +148,22 @@ export function StoreProfilePage() {
           {profile.data.taxComplete
             ? <p className="panel-note">Purchase documents can determine their tax treatment from this State.</p>
             : <div className="panel-callout" role="status"><strong>Place of supply not recorded</strong><small>Until a State is recorded here, a GST-aware purchase cannot decide between CGST and SGST or IGST, and posting one will be refused. Nothing else in the application is affected.</small></div>}
+          {profile.data.gstRegistrationStatus === "unknown" && <div className="panel-callout" role="status"><strong>GST registration not recorded</strong><small>Whether a sale charges GST depends on whether this pharmacy is registered. Until the owner records it, sales are refused rather than guessed.</small></div>}
+          {profile.data.gstRegistrationStatus === "unregistered" && <p className="panel-note">Recorded as not registered: sales charge no GST and are issued as retail cash memos.</p>}
+        </section>
+
+        <section className="master-panel" aria-labelledby="store-facts-title">
+          <div className="panel-heading">
+            <h2 id="store-facts-title">Turnover Facts</h2>
+            {canMutate && <button className="button button--secondary" type="button" onClick={() => setEditing("facts")}>Edit Turnover Facts</button>}
+          </div>
+          <dl className="detail-grid">
+            <div><dt>Rule 46(s) declaration</dt><dd>{RULE46S_LABELS[profile.data.rule46sDeclarationApplicability]}</dd></div>
+            <div><dt>E-invoicing for registered customers (Rule 48(4))</dt><dd>{EINVOICE_LABELS[profile.data.einvoiceApplicability]}</dd></div>
+            <div><dt>Aggregate turnover band (HSN digits)</dt><dd>{HSN_BAND_LABELS[profile.data.hsnTurnoverBand]}</dd></div>
+            <div><dt>Applies to invoices in financial year</dt><dd>{profile.data.hsnTurnoverFinancialYear ?? "—"}</dd></div>
+          </dl>
+          <p className="panel-note">These are facts about your business that only you can supply. AUSHADHARTH does not work them out from its own sales, and records exactly what you enter on each posted invoice.</p>
         </section>
 
         <LicencePanel profile={profile.data} canMutate={canMutate} onSaved={saved} />
@@ -133,6 +173,7 @@ export function StoreProfilePage() {
 
     {editing === "identity" && profile.data && <IdentityDialog current={profile.data} onClose={() => setEditing(null)} onSaved={saved} />}
     {editing === "address" && profile.data && <AddressDialog current={profile.data} states={states.data} onClose={() => setEditing(null)} onSaved={saved} />}
+    {editing === "facts" && profile.data && <InvoiceFactsDialog current={profile.data} onClose={() => setEditing(null)} onSaved={saved} />}
     {editing === "tax" && profile.data && <TaxIdentityDialog current={profile.data} states={states.data} onClose={() => setEditing(null)} onSaved={saved} />}
   </>;
 }
@@ -168,11 +209,12 @@ function LicencePanel({ profile, canMutate, onSaved }: {
     {profile.licences.length === 0
       ? <div className="empty-state"><h3>No licence recorded</h3><p>Your drug sale licence number must appear on every bill you issue. Record at least one before selling.</p></div>
       : <div className="table-scroll"><table className="data-table">
-        <thead><tr><th scope="col">Type</th><th scope="col">Number</th><th scope="col">Valid</th><th scope="col">Status</th>{canMutate && <th scope="col"><span className="sr-only">Actions</span></th>}</tr></thead>
+        <thead><tr><th scope="col">Type</th><th scope="col">Number</th><th scope="col">Valid</th><th scope="col">Retail memo</th><th scope="col">Status</th>{canMutate && <th scope="col"><span className="sr-only">Actions</span></th>}</tr></thead>
         <tbody>{profile.licences.map((licence) => <tr key={licence.id}>
           <td data-label="Type">{licence.licenceType}</td>
           <td data-label="Number"><code>{licence.licenceNumber}</code>{licence.issuingAuthority && <small className="row-subtext">{licence.issuingAuthority}</small>}</td>
           <td data-label="Valid">{validity(licence)}</td>
+          <td data-label="Retail memo">{licence.includeOnRetailMemo ? "Printed on retail memos" : "Not designated"}</td>
           <td data-label="Status"><span className={`status-badge status-badge--${licence.status}`}>{licence.status === "active" ? "Active" : "Archived"}</span></td>
           {canMutate && <td className="row-actions">
             {licence.status === "active"
@@ -187,6 +229,7 @@ function LicencePanel({ profile, canMutate, onSaved }: {
     <p className="panel-note">{active.length === 0
       ? "An archived licence does not appear on a bill. At least one active licence is needed to sell."
       : `Every active licence is printed on the bill, in a fixed order. ${active.length === 1 ? "One licence is" : `${active.length} licences are`} active.`}</p>
+    {active.length > 0 && !active.some((licence) => licence.includeOnRetailMemo) && <div className="panel-callout" role="status"><strong>No licence designated for retail memos</strong><small>A sale of a medicine or device is refused until you mark which active licence is your retail sale licence. AUSHADHARTH does not guess this from the licence type.</small></div>}
 
     {editing && <LicenceDialog
       current={editing === "new" ? null : editing}
@@ -212,6 +255,7 @@ function LicenceDialog({ current, onClose, onSaved }: {
   const [issuingAuthority, setIssuingAuthority] = useState(current?.issuingAuthority ?? "");
   const [validFrom, setValidFrom] = useState(current?.validFrom ?? "");
   const [validUpto, setValidUpto] = useState(current?.validUpto ?? "");
+  const [includeOnRetailMemo, setIncludeOnRetailMemo] = useState(current?.includeOnRetailMemo ?? false);
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
@@ -221,7 +265,8 @@ function LicenceDialog({ current, onClose, onSaved }: {
         licenceNumber: licenceNumber.trim(),
         issuingAuthority: issuingAuthority.trim() || null,
         validFrom: validFrom || null,
-        validUpto: validUpto || null
+        validUpto: validUpto || null,
+        includeOnRetailMemo
       };
       return current
         ? updateStoreLicence(current.id, { ...input, expectedRevision: current.revision })
@@ -259,6 +304,7 @@ function LicenceDialog({ current, onClose, onSaved }: {
         <div className="field"><label htmlFor="licence-from">Valid from</label><input id="licence-from" type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></div>
         <div className="field"><label htmlFor="licence-upto">Valid until</label><input id="licence-upto" type="date" value={validUpto} onChange={(event) => setValidUpto(event.target.value)} /></div>
       </div>
+      <label className="check-field catalog-span"><input id="licence-retail-memo" type="checkbox" checked={includeOnRetailMemo} onChange={(event) => setIncludeOnRetailMemo(event.target.checked)} /> <span>Print this licence number on retail memos<small>Tick this for the licence under which you sell drugs by retail. Its number is recorded on every medicine or device sale.</small></span></label>
       {error && <div className="inline-notice inline-notice--error" role="alert">{error}</div>}
       <div className="form-actions"><button className="button button--secondary" type="button" onClick={onClose}>Cancel</button><button className="button button--primary" type="submit" disabled={mutation.isPending}>{mutation.isPending ? "Saving…" : "Save Licence"}</button></div>
     </form>
@@ -467,6 +513,82 @@ function TaxIdentityDialog({ current, states, onClose, onSaved }: {
       </div>
       {error && <div className="inline-notice inline-notice--error" role="alert">{stale ? "The store profile changed after you opened it. Reload the latest version before saving." : error}{stale && <button type="button" onClick={() => void reloadLatest()} disabled={reloading}>{reloading ? "Reloading…" : "Reload latest"}</button>}</div>}
       <div className="form-actions"><button className="button button--secondary" type="button" onClick={onClose}>Cancel</button><button className="button button--primary" type="submit" disabled={mutation.isPending}>{mutation.isPending ? "Saving…" : "Save Tax Identity"}</button></div>
+    </form>
+  </CatalogDialog>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Turnover facts
+// ---------------------------------------------------------------------------------------------
+
+function InvoiceFactsDialog({ current, onClose, onSaved }: {
+  current: StoreProfile;
+  onClose: () => void;
+  onSaved: (next: StoreProfile) => void;
+}) {
+  const [declaration, setDeclaration] = useState<Rule46sDeclarationApplicability>(current.rule46sDeclarationApplicability);
+  const [einvoice, setEinvoice] = useState<EinvoiceApplicability>(current.einvoiceApplicability);
+  const [band, setBand] = useState<HsnTurnoverBand>(current.hsnTurnoverBand);
+  const [financialYear, setFinancialYear] = useState(current.hsnTurnoverFinancialYear ?? "");
+  const [error, setError] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: () => updateInvoiceCompliance({
+      expectedRevision: current.revision,
+      rule46sDeclarationApplicability: declaration,
+      einvoiceApplicability: einvoice,
+      hsnTurnoverBand: band,
+      // A year belongs to a band; with no band there is nothing for it to qualify.
+      hsnTurnoverFinancialYear: band === "unknown" ? null : financialYear.trim()
+    }),
+    onSuccess: onSaved,
+    onError: (caught) => setError(caught instanceof LocalServiceError
+      ? caught.code === "revision_conflict" ? "The store profile changed after you opened it. Close this and try again." : caught.message
+      : "The turnover facts could not be saved.")
+  });
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault(); setError(null);
+    if (band !== "unknown" && !/^[0-9]{4}-[0-9]{2}$/.test(financialYear.trim())) { setError("Enter the financial year as, for example, 2026-27."); return; }
+    mutation.mutate();
+  };
+
+  return <CatalogDialog title="Edit Turnover Facts" description="Facts about your business that decide what a posted invoice carries. Record them as they stand for your registration." onClose={onClose}>
+    <form className="master-form" onSubmit={submit}>
+      <div className="field">
+        <label htmlFor="facts-rule46s">Rule 46(s) declaration (CGST Rules)</label>
+        <select id="facts-rule46s" value={declaration} onChange={(event) => setDeclaration(event.target.value as Rule46sDeclarationApplicability)}>
+          <option value="unknown">Not recorded yet</option>
+          <option value="not_applicable">Does not apply</option>
+          <option value="applicable">Applies</option>
+        </select>
+        <small>It applies if your aggregate turnover in any financial year since 2017-18 was more than the turnover notified for e-invoicing. It is then recorded on every invoice that is not an e-invoice, which is every invoice AUSHADHARTH issues. It does not stop any sale.</small>
+      </div>
+      <div className="field">
+        <label htmlFor="facts-einvoice">E-invoicing for GST-registered customers (Rule 48(4))</label>
+        <select id="facts-einvoice" value={einvoice} onChange={(event) => setEinvoice(event.target.value as EinvoiceApplicability)}>
+          <option value="unknown">Not recorded yet</option>
+          <option value="not_required">Not required</option>
+          <option value="required">Required</option>
+        </select>
+        <small>A separate question: whether your business must issue e-invoices to GST-registered customers. Only sales to those customers depend on it. AUSHADHARTH cannot issue e-invoices, so while this is “Required” those sales are refused.</small>
+      </div>
+      <div className="field">
+        <label htmlFor="facts-band">Aggregate turnover in the preceding financial year</label>
+        <select id="facts-band" value={band} onChange={(event) => setBand(event.target.value as HsnTurnoverBand)}>
+          <option value="unknown">Not recorded yet</option>
+          <option value="up_to_5_crore">Up to ₹5 crore</option>
+          <option value="above_5_crore">More than ₹5 crore</option>
+        </select>
+        <small>Notification No. 78/2020-Central Tax sets the HSN digits an invoice shows from this band: 4 digits up to ₹5 crore, 6 digits above it.</small>
+      </div>
+      {band !== "unknown" && <div className="field">
+        <label htmlFor="facts-year">Financial year of invoices this applies to<span aria-hidden="true"> *</span></label>
+        <input id="facts-year" value={financialYear} onChange={(event) => setFinancialYear(event.target.value)} placeholder="2026-27" />
+        <small>The band is only used for sales dated in this financial year. Record it again each year.</small>
+      </div>}
+      {error && <div className="inline-notice inline-notice--error" role="alert">{error}</div>}
+      <div className="form-actions"><button className="button button--secondary" type="button" onClick={onClose}>Cancel</button><button className="button button--primary" type="submit" disabled={mutation.isPending}>{mutation.isPending ? "Saving…" : "Save Turnover Facts"}</button></div>
     </form>
   </CatalogDialog>;
 }

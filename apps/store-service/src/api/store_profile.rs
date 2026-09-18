@@ -235,6 +235,10 @@ pub fn routes() -> Router<ReferenceState> {
         // One composite read, so the browser never assembles a legal identity from four requests.
         .route("/api/v1/store/profile", get(get_profile).put(put_profile))
         .route("/api/v1/store/address", put(put_address))
+        .route(
+            "/api/v1/store/invoice-compliance",
+            put(put_invoice_compliance),
+        )
         .route("/api/v1/store/licences", post(create_licence))
         .route("/api/v1/store/licences/{id}", put(update_licence))
         .route("/api/v1/store/licences/{id}/archive", post(archive_licence))
@@ -515,6 +519,9 @@ struct StoreLicenceRequest {
     valid_from: Option<String>,
     valid_upto: Option<String>,
     reason: Option<String>,
+    /// Phase 1L-A3: print this licence's number on retail drug memos. Omitted on an update, the
+    /// designation is left as it was; omitted on a create, the licence starts undesignated.
+    include_on_retail_memo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +555,8 @@ pub struct StoreLicenceResponse {
     pub issuing_authority: Option<String>,
     pub valid_from: Option<String>,
     pub valid_upto: Option<String>,
+    /// The operator's designation that this licence is printed on retail drug memos.
+    pub include_on_retail_memo: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -579,6 +588,16 @@ struct StoreProfileResponse {
     /// needs a name, an address and a licence.
     seller_complete: bool,
     missing_seller_facts: Vec<MissingFactResponse>,
+    /// Phase 1L-A3. Whether the Rule 46(s) declaration applies to this business's non-IRN invoices:
+    /// 'unknown', 'not_applicable' or 'applicable'. Recorded by the owner; never computed.
+    rule46s_declaration_applicability: String,
+    /// Whether Rule 48(4) requires this business to e-invoice supplies to registered persons:
+    /// 'unknown', 'not_required' or 'required'. A separate fact, never derived from the one above.
+    einvoice_applicability: String,
+    /// The aggregate-turnover band that fixes HSN digits, and the financial year of invoices it
+    /// governs. 'unknown' carries no year.
+    hsn_turnover_band: String,
+    hsn_turnover_financial_year: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -625,7 +644,7 @@ async fn fetch_profile(pool: &SqlitePool) -> Result<StoreProfileResponse, StoreP
 
     let licences = sqlx::query_as::<_, StoreLicenceResponse>(
         "SELECT id,revision,status,licence_type,licence_number,issuing_authority,valid_from,\
-         valid_upto FROM store_licences WHERE store_id=? ORDER BY status,licence_type,\
+         valid_upto,include_on_retail_memo FROM store_licences WHERE store_id=? ORDER BY status,licence_type,\
          normalized_licence_number",
     )
     .bind(&row.store_id)
@@ -640,7 +659,25 @@ async fn fetch_profile(pool: &SqlitePool) -> Result<StoreProfileResponse, StoreP
     let source = seller_source(&row, address.as_ref(), state_name, &licences);
     let missing = store_profile::missing_facts(&source);
 
+    let (
+        rule46s_declaration_applicability,
+        einvoice_applicability,
+        hsn_turnover_band,
+        hsn_turnover_financial_year,
+    ): (String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT rule46s_declaration_applicability,einvoice_applicability,hsn_turnover_band,\
+         hsn_turnover_financial_year FROM store_identity WHERE store_id=?",
+    )
+    .bind(&row.store_id)
+    .fetch_one(pool)
+    .await
+    .map_err(map_database_error)?;
+
     Ok(StoreProfileResponse {
+        rule46s_declaration_applicability,
+        einvoice_applicability,
+        hsn_turnover_band,
+        hsn_turnover_financial_year,
         tax_complete: row.place_of_supply_state_id.is_some(),
         seller_complete: missing.is_empty(),
         missing_seller_facts: missing
@@ -686,6 +723,7 @@ fn seller_source(
             .iter()
             .filter(|licence| licence.status == "active")
             .map(|licence| store_profile::SellerLicence {
+                include_on_retail_memo: licence.include_on_retail_memo,
                 licence_type: licence.licence_type.clone(),
                 licence_number: licence.licence_number.clone(),
                 normalized_licence_number: normalize_licence_comparison(&licence.licence_number),
@@ -784,6 +822,175 @@ async fn put_profile(
             payload: json!({
                 "previous": { "displayName": previous_display, "legalName": previous_legal },
                 "next": { "displayName": display_name, "legalName": legal_name },
+            }),
+        },
+        &actor.id,
+    )
+    .await?;
+
+    transaction.commit().await.map_err(map_database_error)?;
+    fetch_profile(&state.pool).await.map(Json)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Invoice-compliance facts (Phase 1L-A3)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInvoiceComplianceRequest {
+    expected_revision: i64,
+    rule46s_declaration_applicability: String,
+    einvoice_applicability: String,
+    hsn_turnover_band: String,
+    hsn_turnover_financial_year: Option<String>,
+    reason: Option<String>,
+}
+
+const RULE46S_APPLICABILITY: [&str; 3] = ["unknown", "not_applicable", "applicable"];
+const EINVOICE_APPLICABILITY: [&str; 3] = ["unknown", "not_required", "required"];
+const HSN_TURNOVER_BANDS: [&str; 3] = ["unknown", "up_to_5_crore", "above_5_crore"];
+
+/// A financial year as the rest of the product writes it: '2026-27', whose second half is the
+/// year after the first.
+fn valid_financial_year(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 7 || bytes[4] != b'-' {
+        return false;
+    }
+    match (value[0..4].parse::<u32>(), value[5..7].parse::<u32>()) {
+        (Ok(start), Ok(end)) => {
+            value[0..4].bytes().all(|b| b.is_ascii_digit())
+                && value[5..7].bytes().all(|b| b.is_ascii_digit())
+                && (start + 1) % 100 == end
+        }
+        _ => false,
+    }
+}
+
+/// Records the three turnover facts only the pharmacy can know. Owner/Admin only.
+///
+/// None is computed from AUSHADHARTH's own Sales: Rule 46(s) looks at aggregate turnover in any
+/// financial year since 2017-18, Rule 48(4) at the notified class (which also excludes and exempts
+/// named persons), and the HSN band at the whole preceding year — all across the whole business
+/// rather than one counter's database. Each is validated on its own; none constrains another,
+/// because the law does not make any of them follow from the others.
+async fn put_invoice_compliance(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateInvoiceComplianceRequest>,
+) -> Result<Json<StoreProfileResponse>, StoreProfileError> {
+    let actor = require_admin(&state, &headers).await?;
+
+    let declaration = request
+        .rule46s_declaration_applicability
+        .trim()
+        .to_ascii_lowercase();
+    if !RULE46S_APPLICABILITY.contains(&declaration.as_str()) {
+        return Err(validation(
+            "rule46sDeclarationApplicability",
+            "must be unknown, not_applicable, or applicable",
+        ));
+    }
+    let einvoice = request.einvoice_applicability.trim().to_ascii_lowercase();
+    if !EINVOICE_APPLICABILITY.contains(&einvoice.as_str()) {
+        return Err(validation(
+            "einvoiceApplicability",
+            "must be unknown, not_required, or required",
+        ));
+    }
+    let band = request.hsn_turnover_band.trim().to_ascii_lowercase();
+    if !HSN_TURNOVER_BANDS.contains(&band.as_str()) {
+        return Err(validation(
+            "hsnTurnoverBand",
+            "must be unknown, up_to_5_crore, or above_5_crore",
+        ));
+    }
+    let financial_year = blank(request.hsn_turnover_financial_year.as_deref()).map(str::to_owned);
+    match (band.as_str(), financial_year.as_deref()) {
+        ("unknown", Some(_)) => {
+            return Err(validation(
+                "hsnTurnoverFinancialYear",
+                "is recorded only with a known turnover band",
+            ));
+        }
+        ("unknown", None) => {}
+        (_, None) => {
+            return Err(validation(
+                "hsnTurnoverFinancialYear",
+                "is required: name the financial year of the invoices this band governs",
+            ));
+        }
+        (_, Some(year)) if !valid_financial_year(year) => {
+            return Err(validation(
+                "hsnTurnoverFinancialYear",
+                "must be a financial year such as 2026-27",
+            ));
+        }
+        _ => {}
+    }
+    let reason = optional_text(request.reason.as_deref(), "reason", 500)
+        .map_err(|issue| StoreProfileError::Validation(vec![issue]))?;
+
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| StoreProfileError::Internal)?;
+    let current: Option<(String, i64, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT store_id,revision,rule46s_declaration_applicability,einvoice_applicability,\
+         hsn_turnover_band,hsn_turnover_financial_year FROM store_identity LIMIT 1",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (store_id, revision, previous_declaration, previous_einvoice, previous_band, previous_year) =
+        current.ok_or(StoreProfileError::NotFound)?;
+    if revision != request.expected_revision {
+        return Err(StoreProfileError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+
+    let next = revision + 1;
+    sqlx::query(
+        "UPDATE store_identity SET revision=?,rule46s_declaration_applicability=?,\
+         einvoice_applicability=?,hsn_turnover_band=?,hsn_turnover_financial_year=? \
+         WHERE store_id=? AND revision=?",
+    )
+    .bind(next)
+    .bind(&declaration)
+    .bind(&einvoice)
+    .bind(&band)
+    .bind(&financial_year)
+    .bind(&store_id)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    record_event(
+        &mut transaction,
+        ProfileEvent {
+            entity_type: "store_tax_identity",
+            entity_id: &store_id,
+            entity_revision: next,
+            action: "updated",
+            reason: reason.as_deref(),
+            payload: json!({
+                "previous": {
+                    "rule46sDeclarationApplicability": previous_declaration,
+                    "einvoiceApplicability": previous_einvoice,
+                    "hsnTurnoverBand": previous_band,
+                    "hsnTurnoverFinancialYear": previous_year,
+                },
+                "next": {
+                    "rule46sDeclarationApplicability": declaration,
+                    "einvoiceApplicability": einvoice,
+                    "hsnTurnoverBand": band,
+                    "hsnTurnoverFinancialYear": financial_year,
+                },
             }),
         },
         &actor.id,
@@ -1073,8 +1280,9 @@ async fn create_licence(
     sqlx::query(
         "INSERT INTO store_licences \
          (id,store_id,revision,status,licence_type,licence_number,normalized_licence_number,\
-          issuing_authority,valid_from,valid_upto,created_at_utc,updated_at_utc) \
-         VALUES (?,?,1,'active',?,?,?,?,?,?,?,?)",
+          issuing_authority,valid_from,valid_upto,created_at_utc,updated_at_utc,\
+          include_on_retail_memo) \
+         VALUES (?,?,1,'active',?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(&store_id)
@@ -1086,6 +1294,7 @@ async fn create_licence(
     .bind(&prepared.valid_upto)
     .bind(&now)
     .bind(&now)
+    .bind(request.include_on_retail_memo.unwrap_or(false))
     .execute(&mut *transaction)
     .await
     .map_err(map_licence_error)?;
@@ -1098,7 +1307,11 @@ async fn create_licence(
             entity_revision: 1,
             action: "created",
             reason: prepared.reason.as_deref(),
-            payload: json!({ "licenceType": prepared.licence_type, "licenceNumber": prepared.licence_number }),
+            payload: json!({
+                "licenceType": prepared.licence_type,
+                "licenceNumber": prepared.licence_number,
+                "includeOnRetailMemo": request.include_on_retail_memo,
+            }),
         },
         &actor.id,
     )
@@ -1150,7 +1363,8 @@ async fn update_licence(
 
     sqlx::query(
         "UPDATE store_licences SET revision=?,licence_type=?,licence_number=?,\
-         normalized_licence_number=?,issuing_authority=?,valid_from=?,valid_upto=?,updated_at_utc=? \
+         normalized_licence_number=?,issuing_authority=?,valid_from=?,valid_upto=?,updated_at_utc=?,\
+         include_on_retail_memo=COALESCE(?,include_on_retail_memo) \
          WHERE id=? AND revision=?",
     )
     .bind(next)
@@ -1161,6 +1375,7 @@ async fn update_licence(
     .bind(&prepared.valid_from)
     .bind(&prepared.valid_upto)
     .bind(&now)
+    .bind(request.include_on_retail_memo)
     .bind(&id)
     .bind(revision)
     .execute(&mut *transaction)
@@ -1175,7 +1390,11 @@ async fn update_licence(
             entity_revision: next,
             action: "updated",
             reason: prepared.reason.as_deref(),
-            payload: json!({ "licenceType": prepared.licence_type, "licenceNumber": prepared.licence_number }),
+            payload: json!({
+                "licenceType": prepared.licence_type,
+                "licenceNumber": prepared.licence_number,
+                "includeOnRetailMemo": request.include_on_retail_memo,
+            }),
         },
         &actor.id,
     )
@@ -1387,7 +1606,7 @@ pub async fn seller_profile_source(
     .await?;
     let licences = sqlx::query_as::<_, StoreLicenceResponse>(
         "SELECT id,revision,status,licence_type,licence_number,issuing_authority,valid_from,\
-         valid_upto FROM store_licences WHERE store_id=? AND status='active'",
+         valid_upto,include_on_retail_memo FROM store_licences WHERE store_id=? AND status='active'",
     )
     .bind(store_id)
     .fetch_all(&mut *connection)

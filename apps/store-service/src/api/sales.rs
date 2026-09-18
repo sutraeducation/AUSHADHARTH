@@ -27,6 +27,10 @@ use super::auth::{self, AuthError, AuthenticatedActor};
 use super::reference_masters::ReferenceState;
 use crate::domain::{
     catalog::{CatalogValidationIssue, optional_text, validate_date, validate_uuid_v7},
+    invoice_compliance::{
+        self, ComplianceIssue, ComplianceRefusal, ComplianceSource, EinvoiceApplicability, HsnBand,
+        Rule46sDeclaration, SellerGst,
+    },
     money::{self, LineAmounts, MoneyError, RateComponents, TaxTreatment},
     price_control::{self, Comparability, PriceControlStatus},
     recipient::{
@@ -61,6 +65,17 @@ pub(crate) enum SaleError {
     /// registered customer, a taxable value of ₹50,000 or more, or a customer who asked. Carries
     /// the exact missing particulars, as the seller refusal does.
     RecipientParticularsIncomplete(Vec<MissingRecipientFact>),
+    /// The Store has not recorded whether it is GST-registered, so whether this Sale charges GST
+    /// cannot be decided. Refused rather than guessed in either direction.
+    StoreGstStatusUnresolved,
+    /// A fact a posted document must carry — the Rule 46(s) applicability, the Rule 48(4)
+    /// applicability for a registered recipient, the HSN policy and codes, or a designated
+    /// retail-memo licence — is missing. Carries each issue.
+    SaleComplianceIncomplete(Vec<ComplianceIssue>),
+    /// The Store recorded that Rule 48(4) requires an e-invoice for supplies to registered persons,
+    /// and this Sale is to one. AUSHADHARTH cannot obtain an IRN, and Rule 48(5) says a document
+    /// issued any other way "shall not be treated as an invoice", so it is not issued at all.
+    EinvoiceRequired,
     ClassificationIncomplete,
     TaxRateNotFound,
     PackMismatch,
@@ -198,6 +213,37 @@ impl IntoResponse for SaleError {
                         .map(|fact| ErrorIssue {
                             field: fact.field().to_owned(),
                             message: fact.message().to_owned(),
+                        })
+                        .collect(),
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::StoreGstStatusUnresolved => (
+                StatusCode::CONFLICT,
+                simple(
+                    "store_gst_status_unresolved",
+                    "Record in Store Profile whether this pharmacy is GST-registered before selling.",
+                ),
+            ),
+            Self::EinvoiceRequired => (
+                StatusCode::CONFLICT,
+                simple(
+                    "einvoice_required_unsupported",
+                    "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices.",
+                ),
+            ),
+            Self::SaleComplianceIncomplete(issues) => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "sale_compliance_incomplete",
+                    message: "This sale needs details recorded before it can be posted.",
+                    issues: issues
+                        .iter()
+                        .map(|issue| ErrorIssue {
+                            field: issue.field(),
+                            message: issue.message(),
                         })
                         .collect(),
                     expected_revision: None,
@@ -1375,6 +1421,9 @@ struct QuoteResponse {
     sale_document_id: String,
     revision: i64,
     tax_treatment: &'static str,
+    /// The seller status this quote was computed under: `registered` or `unregistered`. An unknown
+    /// status never produces a quote.
+    seller_gst_registration_status: &'static str,
     taxable_value_paise: i64,
     cgst_paise: i64,
     sgst_paise: i64,
@@ -1474,12 +1523,21 @@ async fn quote_sale(
     // The place of supply is the store, for the same reason posting says so: the goods are handed
     // over at the counter.
     let treatment = TaxTreatment::IntraState;
+    // The same seller-status authority posting uses, so a quote never shows GST the posting would
+    // not charge — or charge GST the quote did not show.
+    let seller = seller_gst(&mut connection, &header.store_id).await?;
     let mut quoted = Vec::with_capacity(lines.len());
     let mut amounts = Vec::with_capacity(lines.len());
     let mut taxable_supply = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
-        let entry =
-            resolve_and_compute(&mut connection, line, &header.business_date, treatment).await?;
+        let entry = resolve_and_compute(
+            &mut connection,
+            line,
+            &header.business_date,
+            treatment,
+            seller,
+        )
+        .await?;
         quoted.push(QuoteLineResponse {
             id: line.id.clone(),
             line_number: index as i64 + 1,
@@ -1512,6 +1570,7 @@ async fn quote_sale(
         &header,
         customer.as_ref(),
         taxable_supply_value_paise,
+        seller,
     )
     .await?;
 
@@ -1519,6 +1578,10 @@ async fn quote_sale(
         sale_document_id: id,
         revision: header.revision,
         tax_treatment: treatment.as_str(),
+        seller_gst_registration_status: match seller {
+            SellerGst::Registered => "registered",
+            SellerGst::Unregistered => "unregistered",
+        },
         taxable_value_paise: totals.taxable_value_paise,
         cgst_paise: totals.cgst_paise,
         sgst_paise: totals.sgst_paise,
@@ -1683,8 +1746,9 @@ async fn post_within_transaction(
 
     // The Store's tax geography is re-read now, never taken from the draft or the browser.
     let store = sqlx::query_as::<_, StoreTaxSource>(
-        "SELECT normalized_gstin,place_of_supply_state_id,gst_registration_status \
-         FROM store_identity WHERE store_id=?",
+        "SELECT normalized_gstin,place_of_supply_state_id,gst_registration_status,\
+         rule46s_declaration_applicability,einvoice_applicability,hsn_turnover_band,\
+         hsn_turnover_financial_year FROM store_identity WHERE store_id=?",
     )
     .bind(&store_id)
     .fetch_optional(&mut **connection)
@@ -1694,9 +1758,17 @@ async fn post_within_transaction(
         normalized_gstin: store_gstin,
         place_of_supply_state_id: store_state_id,
         gst_registration_status: store_status,
+        rule46s_declaration_applicability,
+        einvoice_applicability,
+        hsn_turnover_band,
+        hsn_turnover_financial_year,
     } = store.ok_or(SaleError::NotFound)?;
     let store_state_id = store_state_id.ok_or(SaleError::StoreTaxIncomplete)?;
     let store_state_code = state_code(connection, &store_state_id).await?;
+    // Read under the same write lock as everything else posting freezes: an owner changing the
+    // registration mid-sale either commits before this read or waits for the lock.
+    let seller_tax =
+        SellerGst::from_status(&store_status).ok_or(SaleError::StoreGstStatusUnresolved)?;
 
     // The seller is resolved HERE, inside the same `BEGIN IMMEDIATE` transaction that read the
     // tax geography and will write the document. Every table the seller spans — identity, address,
@@ -1725,7 +1797,9 @@ async fn post_within_transaction(
 
     let mut computed = Vec::with_capacity(lines.len());
     for line in &lines {
-        computed.push(resolve_and_compute(connection, line, &business_date, treatment).await?);
+        computed.push(
+            resolve_and_compute(connection, line, &business_date, treatment, seller_tax).await?,
+        );
     }
     let totals = money::sum_lines(
         &computed
@@ -1746,11 +1820,14 @@ async fn post_within_transaction(
             entry.amounts.taxable_value_paise,
         )
     }))?;
+    // Rule 46 recipient particulars belong to a tax invoice, so the seller's registration — already
+    // resolved above, under this lock — decides whether they are asked at all.
     let recipient_source = load_recipient_source(
         connection,
         &header,
         customer.as_ref(),
         taxable_supply_value_paise,
+        seller_tax,
     )
     .await?;
     let recipient_snapshot =
@@ -1763,6 +1840,50 @@ async fn post_within_transaction(
         .delivery_address
         .clone()
         .unwrap_or_default();
+
+    // The facts a later print will need and must never re-read, settled HERE under the same write
+    // lock as the seller, the recipient and the tax: the seller's GST status (already applied to
+    // every line above), the Rule 46(s) applicability, the Rule 48(4) applicability where the
+    // recipient is registered, the HSN policy against the frozen line codes, and the designated
+    // retail-memo licence.
+    //
+    // The licence is required for a `medicine` line only. The catalogue's `device` kind is a label
+    // with no regulatory classification behind it, so nothing here can show that Drugs Rule 65
+    // governs every product so labelled; assuming it would be a legal claim the data cannot support.
+    let requires_retail_licence: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sale_lines line JOIN products product \
+         ON product.id = line.product_id WHERE line.sale_document_id=? \
+         AND product.product_kind = 'medicine')",
+    )
+    .bind(id)
+    .fetch_one(&mut **connection)
+    .await
+    .map_err(map_database_error)?;
+    let compliance = invoice_compliance::resolve(&ComplianceSource {
+        seller: seller_tax,
+        rule46s: Rule46sDeclaration::parse(&rule46s_declaration_applicability)
+            .ok_or(SaleError::Internal)?,
+        einvoice: EinvoiceApplicability::parse(&einvoice_applicability)
+            .ok_or(SaleError::Internal)?,
+        hsn_band: HsnBand::parse(&hsn_turnover_band).ok_or(SaleError::Internal)?,
+        hsn_band_financial_year: hsn_turnover_financial_year.clone(),
+        sale_financial_year: sales::indian_financial_year(&business_date)
+            .ok_or_else(|| validation_of("businessDate", "must be a valid YYYY-MM-DD date"))?,
+        recipient_registered: customer
+            .as_ref()
+            .is_some_and(|party| party.gst_registration_status == "registered"),
+        line_hsn: lines
+            .iter()
+            .zip(computed.iter())
+            .map(|(line, entry)| (line.line_number, entry.hsn_code.clone()))
+            .collect(),
+        requires_retail_licence,
+        designated_licence_text: seller.retail_memo_licence_text.clone(),
+    })
+    .map_err(|refusal| match refusal {
+        ComplianceRefusal::Incomplete(issues) => SaleError::SaleComplianceIncomplete(issues),
+        ComplianceRefusal::EinvoiceRequired => SaleError::EinvoiceRequired,
+    })?;
 
     // Tender is evidence, not accounting, but it must still add up to what was charged: a shortfall
     // would be credit, which this phase does not open.
@@ -1925,6 +2046,10 @@ async fn post_within_transaction(
          recipient_state_code=?,delivery_same_as_recipient=?,delivery_address_line1=?,\
          delivery_address_line2=?,delivery_city=?,delivery_postal_code=?,delivery_state_id=?,\
          delivery_state_name=?,delivery_state_code=?,\
+         compliance_snapshot_version=1,seller_retail_licence_text=?,\
+         rule46s_declaration_snapshot=?,einvoice_applicability_snapshot=?,\
+         hsn_turnover_band_snapshot=?,\
+         hsn_turnover_financial_year_snapshot=?,hsn_required_digits=?,\
          updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
     )
     .bind(next)
@@ -1982,6 +2107,12 @@ async fn post_within_transaction(
     .bind(&delivery_address.state_id)
     .bind(&delivery_address.state_name)
     .bind(&delivery_address.state_code)
+    .bind(&compliance.retail_licence_text)
+    .bind(compliance.rule46s.map(Rule46sDeclaration::as_str))
+    .bind(compliance.einvoice.map(EinvoiceApplicability::as_str))
+    .bind(compliance.hsn_band.map(HsnBand::as_str))
+    .bind(&compliance.hsn_band_financial_year)
+    .bind(compliance.hsn_required_digits.map(i64::from))
     .bind(&now)
     .bind(id)
     .bind(revision)
@@ -2135,6 +2266,7 @@ async fn resolve_and_compute(
     line: &DraftLine,
     business_date: &str,
     treatment: TaxTreatment,
+    seller: SellerGst,
 ) -> Result<ComputedLine, SaleError> {
     let product = sqlx::query_as::<_, ProductSource>(
         "SELECT display_name,base_unit_id,quantity_scale,hsn_code_id,tax_category_id,\
@@ -2203,11 +2335,6 @@ async fn resolve_and_compute(
         return Err(SaleError::BatchExpired);
     }
 
-    // A Product with no Tax Category cannot be taxed. That is an error, never zero tax.
-    let tax_category_id = product
-        .tax_category_id
-        .clone()
-        .ok_or(SaleError::ClassificationIncomplete)?;
     let hsn_code: Option<String> = match product.hsn_code_id.as_deref() {
         Some(id) => sqlx::query_scalar("SELECT hsn_code FROM hsn_codes WHERE id=?")
             .bind(id)
@@ -2216,6 +2343,76 @@ async fn resolve_and_compute(
             .map_err(map_database_error)?,
         None => None,
     };
+
+    // A seller that is not GST-registered charges no GST, whatever rate the product carries: CGST
+    // Act s.32(1) forbids it to collect "any amount by way of tax". The product's own tax category
+    // is still recorded as product metadata when it has one, but no rate is resolved and nothing is
+    // charged — and a missing category or rate is no reason to refuse a sale that charges no tax.
+    // A registered seller's path below is unchanged.
+    let (tax_category_id, treatment_kind, rate_version_id, rate) = if seller
+        == SellerGst::Unregistered
+    {
+        let treatment_kind: Option<String> = match product.tax_category_id.as_deref() {
+            Some(id) => sqlx::query_scalar("SELECT tax_treatment FROM tax_categories WHERE id=?")
+                .bind(id)
+                .fetch_optional(&mut **connection)
+                .await
+                .map_err(map_database_error)?,
+            None => None,
+        };
+        (
+            product.tax_category_id.clone(),
+            treatment_kind,
+            None,
+            RateComponents::default(),
+        )
+    } else {
+        let (tax_category_id, treatment_kind, rate_version_id, rate) =
+            registered_rate(connection, &product, business_date).await?;
+        (
+            Some(tax_category_id),
+            Some(treatment_kind),
+            rate_version_id,
+            rate,
+        )
+    };
+
+    let quantity = SaleQuantity {
+        basis: QuantityBasis::parse(&line.quantity_basis).ok_or(SaleError::Internal)?,
+        quantity_packs: line.quantity_packs,
+        quantity_atoms: line.quantity_atoms,
+    };
+    let amounts = sales::compute_line(&quantity, line.selling_rate_paise, treatment, rate)?;
+    finish_computed_line(
+        connection,
+        line,
+        business_date,
+        ResolvedLineFacts {
+            product,
+            pack,
+            pack_label,
+            base_unit_label,
+            batch,
+            hsn_code,
+        },
+        (tax_category_id, treatment_kind, rate_version_id, rate),
+        (quantity, amounts),
+    )
+    .await
+}
+
+/// A registered seller's tax: exactly the Phase 1H/1F resolution, moved here unchanged so the
+/// unregistered branch above can bypass it.
+async fn registered_rate(
+    connection: &mut PoolConnection<Sqlite>,
+    product: &ProductSource,
+    business_date: &str,
+) -> Result<(String, String, Option<String>, RateComponents), SaleError> {
+    // A Product with no Tax Category cannot be taxed. That is an error, never zero tax.
+    let tax_category_id = product
+        .tax_category_id
+        .clone()
+        .ok_or(SaleError::ClassificationIncomplete)?;
     let treatment_kind: String =
         sqlx::query_scalar("SELECT tax_treatment FROM tax_categories WHERE id=?")
             .bind(&tax_category_id)
@@ -2249,14 +2446,42 @@ async fn resolve_and_compute(
     } else {
         (None, RateComponents::default())
     };
+    Ok((tax_category_id, treatment_kind, rate_version_id, rate))
+}
 
-    let quantity = SaleQuantity {
-        basis: QuantityBasis::parse(&line.quantity_basis).ok_or(SaleError::Internal)?,
-        quantity_packs: line.quantity_packs,
-        quantity_atoms: line.quantity_atoms,
-    };
-    let amounts = sales::compute_line(&quantity, line.selling_rate_paise, treatment, rate)?;
+/// The catalogue facts a line was resolved from, before any tax decision.
+struct ResolvedLineFacts {
+    product: ProductSource,
+    pack: SellablePack,
+    pack_label: Option<String>,
+    base_unit_label: Option<String>,
+    batch: PostingBatch,
+    hsn_code: Option<String>,
+}
 
+/// The rest of a line's resolution, identical for either seller: both price ceilings, then the
+/// frozen line.
+async fn finish_computed_line(
+    connection: &mut PoolConnection<Sqlite>,
+    line: &DraftLine,
+    business_date: &str,
+    facts: ResolvedLineFacts,
+    (tax_category_id, treatment_kind, rate_version_id, rate): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        RateComponents,
+    ),
+    (quantity, amounts): (SaleQuantity, LineAmounts),
+) -> Result<ComputedLine, SaleError> {
+    let ResolvedLineFacts {
+        product,
+        pack,
+        pack_label,
+        base_unit_label,
+        batch,
+        hsn_code,
+    } = facts;
     // Ceiling one: the printed MRP, which is INCLUSIVE of GST under Legal Metrology, so it is
     // compared against the GST-inclusive line total.
     if !sales::within_mrp_ceiling(
@@ -2283,8 +2508,8 @@ async fn resolve_and_compute(
         batch_mrp_paise: batch.mrp_paise,
         hsn_code_id: product.hsn_code_id,
         hsn_code,
-        tax_category_id: Some(tax_category_id),
-        tax_treatment_kind: Some(treatment_kind),
+        tax_category_id,
+        tax_treatment_kind: treatment_kind,
         tax_rate_version_id: rate_version_id,
         quantity_scale: product.quantity_scale,
         rate,
@@ -2492,6 +2717,7 @@ async fn load_recipient_source(
     header: &PostingHeader,
     customer: Option<&CustomerSnapshot>,
     taxable_supply_value_paise: i64,
+    seller: SellerGst,
 ) -> Result<RecipientSource, SaleError> {
     let party = match (header.customer_party_id.as_deref(), customer) {
         (Some(party_id), Some(customer)) => {
@@ -2553,6 +2779,7 @@ async fn load_recipient_source(
     )
     .await?;
     Ok(RecipientSource {
+        seller_registered: seller == SellerGst::Registered,
         party,
         counter_name: header.customer_name_text.clone(),
         counter_address,
@@ -2568,6 +2795,25 @@ struct StoreTaxSource {
     normalized_gstin: Option<String>,
     place_of_supply_state_id: Option<String>,
     gst_registration_status: String,
+    rule46s_declaration_applicability: String,
+    einvoice_applicability: String,
+    hsn_turnover_band: String,
+    hsn_turnover_financial_year: Option<String>,
+}
+
+/// The seller-status authority the quote and the posting share. `unknown` decides nothing.
+async fn seller_gst(
+    connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
+) -> Result<SellerGst, SaleError> {
+    let status: String =
+        sqlx::query_scalar("SELECT gst_registration_status FROM store_identity WHERE store_id=?")
+            .bind(store_id)
+            .fetch_optional(&mut **connection)
+            .await
+            .map_err(map_database_error)?
+            .ok_or(SaleError::NotFound)?;
+    SellerGst::from_status(&status).ok_or(SaleError::StoreGstStatusUnresolved)
 }
 
 #[derive(Debug, FromRow)]
@@ -2639,6 +2885,7 @@ async fn load_customer(
 struct DraftLine {
     id: String,
     sale_document_id: String,
+    line_number: i64,
     product_id: String,
     product_pack_id: String,
     batch_id: String,
@@ -2653,8 +2900,8 @@ async fn load_lines(
     document_id: &str,
 ) -> Result<Vec<DraftLine>, SaleError> {
     sqlx::query_as::<_, DraftLine>(
-        "SELECT id,sale_document_id,product_id,product_pack_id,batch_id,quantity_basis,\
-         quantity_packs,quantity_atoms,selling_rate_paise \
+        "SELECT id,sale_document_id,line_number,product_id,product_pack_id,batch_id,\
+         quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise \
          FROM sale_lines WHERE sale_document_id=? ORDER BY line_number",
     )
     .bind(document_id)
@@ -2916,6 +3163,7 @@ mod tests {
         let (product_id, pack_id) = insert_product(&pool, "Crocin 500", TABLET, 0, 10).await;
         enable_sale(&pool, &store_id, &product_id, &pack_id, 1, 0).await;
         classify(&pool, &product_id, &category_id).await;
+        assign_hsn(&pool, &product_id, "30049099").await;
         let batch_id = insert_batch(&pool, &pack_id, "B-1", Some("2027-12-31"), Some(9550)).await;
         add_stock(
             &pool,
@@ -3033,6 +3281,29 @@ mod tests {
         .bind(pack_id)
         .bind(sale_enabled)
         .bind(fractional)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Gives a product an HSN code from the master, creating the master row on first use.
+    async fn assign_hsn(pool: &SqlitePool, product_id: &str, code: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO hsn_codes (id,jurisdiction,hsn_code,description,created_at_utc,\
+             updated_at_utc) VALUES (?,'IN',?,'Medicaments',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(code)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE products SET hsn_code_id=(SELECT id FROM hsn_codes WHERE jurisdiction='IN' \
+             AND hsn_code=?) WHERE id=?",
+        )
+        .bind(code)
+        .bind(product_id)
         .execute(pool)
         .await
         .unwrap();
@@ -4598,11 +4869,25 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
-             normalized_licence_number,created_at_utc,updated_at_utc) \
+             normalized_licence_number,created_at_utc,updated_at_utc,include_on_retail_memo) \
              VALUES (?,?,'Form 20','MH-20-1234','MH201234',\
-             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),1)",
         )
         .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        // Phase 1L-A3: the facts a registered pharmacy records before selling. Turnover never
+        // crossed the e-invoicing threshold (so no Rule 46(s) declaration, and Rule 48(4) does not
+        // require e-invoices), and it was up to Rs 5 crore in the year before the fixture's
+        // financial year — so HSN is required on B2B invoices only.
+        sqlx::query(
+            "UPDATE store_identity SET rule46s_declaration_applicability='not_applicable',\
+             einvoice_applicability='not_required',\
+             hsn_turnover_band='up_to_5_crore',hsn_turnover_financial_year='2026-27' \
+             WHERE store_id=?",
+        )
         .bind(store_id)
         .execute(pool)
         .await
@@ -5051,10 +5336,20 @@ mod tests {
         .execute(&f.pool)
         .await
         .unwrap();
-        let id = post_one(&f).await;
+        // Phase 1L-A3: this test used to post an Rs 80 line for Rs 89.60, i.e. an unregistered
+        // seller collecting CGST and SGST. CGST Act s.32(1) forbids that, so the Rs 80 line now
+        // costs Rs 80 and the posted document carries no GST at all.
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        assert_eq!(quote_of(&f, &id).await["grandTotalPaise"], 8000);
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["grandTotalPaise"], 8000);
         let (_, body) = invoice(&f, &id).await;
         assert_eq!(body["document"]["documentType"], "retail_cash_memo");
         assert_eq!(body["regulatory"]["sellerRegistered"], false);
+        assert_eq!(body["totals"]["cgstPaise"], 0);
+        assert_eq!(body["totals"]["sgstPaise"], 0);
         // Still a complete seller snapshot: Rule 65 does not care about GST.
         assert_eq!(body["sellerSnapshot"]["licenceText"], "Form 20: MH-20-1234");
     }
@@ -6875,6 +7170,1451 @@ mod tests {
                 coherent,
                 "attempt {attempt} produced a torn recipient: {gstin} / {line1}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1L-A3 — seller GST authority and the invoice-compliance facts
+    //
+    // An unregistered pharmacy may not collect GST (CGST Act s.32(1)); an unknown registration
+    // decides nothing. Rule 46(s), the HSN band (Notification No. 78/2020-CT) and the retail-memo
+    // licence are facts the pharmacy records, frozen onto each posted Sale.
+    // -----------------------------------------------------------------------------------------
+
+    async fn set_seller_status(f: &Fixture, status: &str) {
+        let (gstin, normalized): (Option<&str>, Option<&str>) = if status == "registered" {
+            (Some("27AAPFU0939F1ZV"), Some("27AAPFU0939F1ZV"))
+        } else {
+            (None, None)
+        };
+        sqlx::query(
+            "UPDATE store_identity SET gst_registration_status=?,gstin=?,normalized_gstin=? \
+             WHERE store_id=?",
+        )
+        .bind(status)
+        .bind(gstin)
+        .bind(normalized)
+        .bind(&f.store_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Sets the Rule 46(s) fact and the HSN band. Rule 48(4) is left alone: see `set_einvoice`.
+    async fn set_invoice_facts(f: &Fixture, declaration: &str, band: &str, year: Option<&str>) {
+        sqlx::query(
+            "UPDATE store_identity SET rule46s_declaration_applicability=?,hsn_turnover_band=?,\
+             hsn_turnover_financial_year=? WHERE store_id=?",
+        )
+        .bind(declaration)
+        .bind(band)
+        .bind(year)
+        .bind(&f.store_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn set_einvoice(f: &Fixture, applicability: &str) {
+        sqlx::query("UPDATE store_identity SET einvoice_applicability=? WHERE store_id=?")
+            .bind(applicability)
+            .bind(&f.store_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Turns the fixture product into a medicine, which the universal retail memo covers.
+    async fn make_medicine(f: &Fixture, product_id: &str) {
+        let form = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO dosage_forms (id,canonical_code,display_name,created_at_utc,updated_at_utc) \
+             VALUES (?,?,'Tablet',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&form)
+        .bind(format!("tab-{}", &form[28..36]))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE products SET product_kind='medicine',dosage_form_id=? WHERE id=?")
+            .bind(&form)
+            .bind(product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn add_store_licence(f: &Fixture, licence_type: &str, number: &str, designated: bool) {
+        sqlx::query(
+            "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
+             normalized_licence_number,created_at_utc,updated_at_utc,include_on_retail_memo) \
+             VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&f.store_id)
+        .bind(licence_type)
+        .bind(number)
+        .bind(
+            number
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_uppercase(),
+        )
+        .bind(i64::from(designated))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn undesignate_all(f: &Fixture) {
+        sqlx::query("UPDATE store_licences SET include_on_retail_memo=0")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn clear_hsn(f: &Fixture, product_id: &str) {
+        sqlx::query("UPDATE products SET hsn_code_id=NULL WHERE id=?")
+            .bind(product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Posts one line of the fixture product at `rate` per pack and returns (id, posted detail).
+    async fn post_line(
+        f: &Fixture,
+        customer: Option<&str>,
+        rate: i64,
+    ) -> (String, StatusCode, Value) {
+        let id = open_sale(f, json!({ "customerPartyId": customer })).await;
+        add_line(f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, rate).await;
+        let (status, body) = post_as_quoted(f, &id).await;
+        (id, status, body)
+    }
+
+    async fn registered_buyer(f: &Fixture) -> String {
+        let party = registered_customer(
+            &f.pool,
+            "Mehta Medical Stores",
+            &valid_gstin("27", "AAACM1234K"),
+        )
+        .await;
+        add_billing_address(&f.pool, &party, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        party
+    }
+
+    fn issue_fields_of(body: &Value) -> Vec<String> {
+        issue_fields(body)
+    }
+
+    // --- Seller GST status governs the tax -------------------------------------------------
+
+    /// Registered seller: the Phase 1H/1F arithmetic is unchanged — Rs 100 at 6% + 6%.
+    #[tokio::test]
+    async fn a_registered_seller_still_charges_gst_exactly_as_before() {
+        let f = fixture().await;
+        let (id, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["taxableValuePaise"], 8000);
+        assert_eq!(posted["cgstPaise"], 480);
+        assert_eq!(posted["sgstPaise"], 480);
+        assert_eq!(posted["grandTotalPaise"], 8960);
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["lines"][0]["cgstBasisPoints"], 600);
+        assert_eq!(document["document"]["documentType"], "tax_invoice");
+        assert_eq!(document["regulatory"]["complianceSnapshotVersion"], 1);
+        assert_eq!(document["regulatory"]["reverseCharge"], false);
+    }
+
+    /// Registered seller, exempt goods: no GST, exactly as before.
+    #[tokio::test]
+    async fn a_registered_seller_charges_no_gst_on_exempt_goods() {
+        let f = fixture().await;
+        let (product, pack, batch) = exempt_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["cgstPaise"], 0);
+        assert_eq!(posted["grandTotalPaise"], 5000);
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "bill_of_supply");
+    }
+
+    /// Registered seller, mixed basket to a walk-in: the taxable line is taxed and the exempt one is
+    /// not, and the document is still an invoice-cum-bill of supply.
+    #[tokio::test]
+    async fn a_registered_sellers_mixed_basket_is_unchanged() {
+        let f = fixture().await;
+        let (product, pack, batch) = exempt_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["cgstPaise"], 480);
+        assert_eq!(posted["grandTotalPaise"], 8960 + 5000);
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(
+            document["document"]["documentType"],
+            "invoice_cum_bill_of_supply"
+        );
+    }
+
+    /// Unregistered seller, product with a 12% GST rate: Rs 100 costs Rs 100. No CGST, SGST, IGST or
+    /// cess anywhere — header, lines, rates — while the product's own classification is kept as
+    /// metadata, not as tax charged.
+    #[tokio::test]
+    async fn an_unregistered_seller_charges_no_gst_on_a_taxable_rate_product() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        // The no-MRP lot: Rs 100 is above the fixture batch's printed MRP of Rs 95.50.
+        let batch = unpriced_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &batch, 1, 10000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        for field in ["cgstPaise", "sgstPaise", "igstPaise", "cessPaise"] {
+            assert_eq!(posted[field], 0, "{field}");
+        }
+        assert_eq!(posted["taxableValuePaise"], 10000);
+        assert_eq!(posted["grandTotalPaise"], 10000);
+        let line = &posted["lines"][0];
+        for field in [
+            "cgstBasisPoints",
+            "sgstBasisPoints",
+            "igstBasisPoints",
+            "cessBasisPoints",
+            "cgstPaise",
+            "sgstPaise",
+            "igstPaise",
+            "cessPaise",
+        ] {
+            assert_eq!(line[field], 0, "line {field}");
+        }
+        assert!(
+            line["taxRateVersionId"].is_null(),
+            "a rate was resolved for an unregistered seller"
+        );
+        assert_eq!(
+            line["taxTreatmentKind"], "taxable",
+            "product metadata was lost"
+        );
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "retail_cash_memo");
+        assert_eq!(document["regulatory"]["sellerRegistered"], false);
+        assert!(document["regulatory"]["rule46sDeclaration"].is_null());
+        assert!(document["regulatory"]["einvoiceApplicability"].is_null());
+        assert!(document["regulatory"]["hsnRequiredDigits"].is_null());
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_seller_charges_no_gst_on_exempt_or_mixed_baskets() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        let (product, pack, batch) = exempt_lot(&f).await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["cgstPaise"], 0);
+        assert_eq!(posted["sgstPaise"], 0);
+        assert_eq!(posted["grandTotalPaise"], 13000);
+    }
+
+    /// With no GST to charge, a missing tax category is no reason to refuse the sale.
+    #[tokio::test]
+    async fn an_unregistered_seller_can_sell_a_product_with_no_tax_category() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        sqlx::query("UPDATE products SET tax_category_id=NULL WHERE id=?")
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (_, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert!(posted["lines"][0]["taxTreatmentKind"].is_null());
+    }
+
+    /// Unknown registration: neither the quote nor the posting decides whether GST is collected.
+    #[tokio::test]
+    async fn an_unknown_seller_status_is_refused_rather_than_guessed() {
+        let f = fixture().await;
+        set_seller_status(&f, "unknown").await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let before = balance(&f, &f.batch_id).await;
+        let (status, quote) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{quote}");
+        assert_eq!(quote["code"], "store_gst_status_unresolved");
+        let revision = revision_of(&f, &id).await;
+        for amount in [8000, 8960] {
+            let (status, body) =
+                post_sale_request(&f, &id, revision, &Uuid::now_v7().to_string(), amount).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "store_gst_status_unresolved");
+        }
+        assert_nothing_posted(&f, &id, &f.batch_id, before).await;
+    }
+
+    /// The registration and the GSTIN cannot disagree: the frozen 1G-0 trigger refuses it.
+    #[tokio::test]
+    async fn a_registration_status_that_contradicts_the_gstin_cannot_be_stored() {
+        let f = fixture().await;
+        for statement in [
+            "UPDATE store_identity SET gst_registration_status='unregistered'",
+            "UPDATE store_identity SET gst_registration_status='registered',gstin=NULL,normalized_gstin=NULL",
+            "UPDATE store_identity SET gst_registration_status='sometimes'",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&f.pool).await.is_err(),
+                "{statement} was accepted"
+            );
+        }
+    }
+
+    /// Quote and posting come from one authority: identical subtotal, tax and total, to the paisa,
+    /// for a registered and an unregistered seller alike.
+    #[tokio::test]
+    async fn the_quote_and_the_posting_agree_for_either_seller() {
+        for status in ["registered", "unregistered"] {
+            let f = fixture().await;
+            set_seller_status(&f, status).await;
+            let id = open_sale(&f, json!({})).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 3, 7777).await;
+            let quote = quote_of(&f, &id).await;
+            let (code, posted) = post_as_quoted(&f, &id).await;
+            assert_eq!(code, StatusCode::OK, "{status}: {posted}");
+            for field in [
+                "taxableValuePaise",
+                "cgstPaise",
+                "sgstPaise",
+                "igstPaise",
+                "cessPaise",
+                "grandTotalPaise",
+            ] {
+                assert_eq!(quote[field], posted[field], "{status}: {field} drifted");
+            }
+        }
+    }
+
+    /// A Sale already posted keeps the tax it was issued with, whatever the Store later records —
+    /// including a legacy Sale that was taxed while the Store was unregistered.
+    #[tokio::test]
+    async fn historical_sales_keep_their_frozen_tax() {
+        let f = fixture().await;
+        let (taxed, status, _) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, before) = invoice(&f, &taxed).await;
+        set_seller_status(&f, "unregistered").await;
+        let (_, after) = invoice(&f, &taxed).await;
+        assert_eq!(before["totals"], after["totals"]);
+        assert_eq!(after["totals"]["cgstPaise"], 480);
+
+        // A pre-1L-A3 Sale: version 0, unregistered snapshot, phantom tax. Reported as frozen.
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sale_documents SET compliance_snapshot_version=0,\
+             store_gst_registration_status='unregistered',seller_retail_licence_text=NULL,\
+             rule46s_declaration_snapshot=NULL,einvoice_applicability_snapshot=NULL,\
+             hsn_turnover_band_snapshot=NULL,hsn_turnover_financial_year_snapshot=NULL,\
+             hsn_required_digits=NULL WHERE id=?",
+        )
+        .bind(&taxed)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, legacy) = invoice(&f, &taxed).await;
+        assert_eq!(legacy["regulatory"]["complianceSnapshotVersion"], 0);
+        assert_eq!(legacy["totals"]["cgstPaise"], 480, "history was recomputed");
+        assert!(legacy["sellerSnapshot"]["retailMemoLicenceText"].is_null());
+    }
+
+    // --- Rule 46(s) ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_rule_46s_fact_is_frozen_onto_each_sale() {
+        let f = fixture().await;
+        let (plain, _, _) = post_line(&f, None, 8000).await;
+        set_invoice_facts(&f, "applicable", "up_to_5_crore", Some("2026-27")).await;
+        let (declared, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, first) = invoice(&f, &plain).await;
+        let (_, second) = invoice(&f, &declared).await;
+        assert_eq!(first["regulatory"]["rule46sDeclaration"], "not_applicable");
+        assert_eq!(second["regulatory"]["rule46sDeclaration"], "applicable");
+
+        // Changing the Store afterwards changes neither document.
+        set_invoice_facts(&f, "not_applicable", "up_to_5_crore", Some("2026-27")).await;
+        let (_, second_after) = invoice(&f, &declared).await;
+        assert_eq!(second["regulatory"], second_after["regulatory"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_rule_46s_fact_blocks_a_registered_seller_only() {
+        let f = fixture().await;
+        set_invoice_facts(&f, "unknown", "up_to_5_crore", Some("2026-27")).await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "sale_compliance_incomplete");
+        assert_eq!(
+            issue_fields_of(&body),
+            vec!["store.rule46sDeclarationApplicability"]
+        );
+
+        // An unregistered seller issues no GST document, so the fact is irrelevant to it.
+        set_seller_status(&f, "unregistered").await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // --- Retail-memo licence ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_medicine_sale_freezes_only_the_designated_licences() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        add_store_licence(&f, "Form 20B", "MH-20B-9999", false).await;
+        add_store_licence(&f, "Form 21", "MH-21-4321", true).await;
+        let (id, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        let seller = &document["sellerSnapshot"];
+        assert_eq!(
+            seller["retailMemoLicenceText"],
+            "Form 20: MH-20-1234, Form 21: MH-21-4321"
+        );
+        // The broad 1L-A text still lists every active licence; the undesignated one is only there.
+        assert!(
+            seller["licenceText"]
+                .as_str()
+                .unwrap()
+                .contains("MH-20B-9999")
+        );
+        assert!(
+            !seller["retailMemoLicenceText"]
+                .as_str()
+                .unwrap()
+                .contains("MH-20B-9999")
+        );
+    }
+
+    /// A licence typed to look like a retail licence is not treated as one: only the designation
+    /// counts.
+    #[tokio::test]
+    async fn a_medicine_sale_without_a_designated_licence_is_refused() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        undesignate_all(&f).await;
+        add_store_licence(&f, "Retail Drug Licence Form 20", "MH-RETAIL-1", false).await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            issue_fields_of(&body),
+            vec!["store.licences.includeOnRetailMemo"]
+        );
+    }
+
+    /// The catalogue's `device` kind is a label with no regulatory classification behind it, so a
+    /// device line does not by itself assert that Drugs Rule 65 governs it: no designation is
+    /// demanded and none is frozen. A medicine on the same Sale still demands one.
+    #[tokio::test]
+    async fn a_device_line_alone_does_not_assert_the_drugs_retail_memo_licence() {
+        let f = fixture().await;
+        sqlx::query("UPDATE products SET product_kind='device' WHERE id=?")
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        undesignate_all(&f).await;
+        let (id, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert!(document["sellerSnapshot"]["retailMemoLicenceText"].is_null());
+
+        // Direct SQL agrees: a device-only Sale with no licence text is coherent.
+        let (device_only, _, _) = post_line(&f, None, 8000).await;
+        let text: Option<String> =
+            sqlx::query_scalar("SELECT seller_retail_licence_text FROM sale_documents WHERE id=?")
+                .bind(&device_only)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(text, None);
+
+        // Turn the same product into a medicine and the requirement is back.
+        make_medicine(&f, &f.product_id).await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            issue_fields_of(&body),
+            vec!["store.licences.includeOnRetailMemo"]
+        );
+    }
+
+    /// General merchandise needs no designated licence beyond what 1L-A already requires.
+    #[tokio::test]
+    async fn a_general_merchandise_sale_needs_no_designation() {
+        let f = fixture().await;
+        undesignate_all(&f).await;
+        let (id, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        assert!(document["sellerSnapshot"]["retailMemoLicenceText"].is_null());
+    }
+
+    /// Archiving, renaming or redesignating a licence after posting never reaches the document.
+    #[tokio::test]
+    async fn licence_changes_after_posting_never_reach_the_document() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (id, status, _) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, before) = invoice(&f, &id).await;
+        for statement in [
+            "UPDATE store_licences SET licence_type='Renamed',licence_number='X-1',normalized_licence_number='X1'",
+            "UPDATE store_licences SET include_on_retail_memo=0",
+            "UPDATE store_licences SET status='archived',archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='expired'",
+        ] {
+            sqlx::query(statement).execute(&f.pool).await.unwrap();
+            let (_, after) = invoice(&f, &id).await;
+            assert_eq!(
+                before["sellerSnapshot"], after["sellerSnapshot"],
+                "after {statement}"
+            );
+        }
+        // With its only designated licence archived, the next medicine sale is refused.
+        add_store_licence(&f, "Form 20B", "MH-20B-1", false).await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn unicode_licence_text_is_frozen_verbatim() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        undesignate_all(&f).await;
+        add_store_licence(&f, "फॉर्म २० <b>", "MH/२०-१२३४", true).await;
+        let (id, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(
+            document["sellerSnapshot"]["retailMemoLicenceText"],
+            "फॉर्म २० <b>: MH/२०-१२३४"
+        );
+    }
+
+    /// Designation is the owner's to set, through the licence API; omitted on an update it is kept.
+    #[tokio::test]
+    async fn the_licence_api_sets_and_keeps_the_designation_and_denies_a_cashier() {
+        let f = fixture().await;
+        let (status, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/licences",
+            json!({ "licenceType": "Form 21", "licenceNumber": "MH-21-1", "includeOnRetailMemo": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let licence = created["licences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["licenceNumber"] == "MH-21-1")
+            .unwrap()
+            .clone();
+        assert_eq!(licence["includeOnRetailMemo"], true);
+        let id = licence["id"].as_str().unwrap();
+
+        let (status, kept) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/store/licences/{id}"),
+            json!({ "expectedRevision": 1, "licenceType": "Form 21", "licenceNumber": "MH-21-1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        let after = kept["licences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            after["includeOnRetailMemo"], true,
+            "an omitted designation was cleared"
+        );
+
+        let (status, denied) = request_as(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/store/licences/{id}"),
+            json!({ "expectedRevision": 2, "licenceType": "Form 21", "licenceNumber": "MH-21-1", "includeOnRetailMemo": false }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    }
+
+    // --- HSN policy (Notification No. 78/2020-CT) ----------------------------------------------
+
+    /// Up to Rs 5 crore: HSN "may not" be mentioned on a tax invoice to an unregistered person.
+    #[tokio::test]
+    async fn up_to_five_crore_a_b2c_sale_needs_no_hsn() {
+        let f = fixture().await;
+        clear_hsn(&f, &f.product_id).await;
+        let (id, status, posted) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["hsnRequiredDigits"], 0);
+        assert_eq!(document["regulatory"]["hsnTurnoverBand"], "up_to_5_crore");
+        assert_eq!(
+            document["regulatory"]["hsnTurnoverFinancialYear"],
+            "2026-27"
+        );
+    }
+
+    /// Up to Rs 5 crore, registered recipient: four digits, and nothing is padded or guessed.
+    #[tokio::test]
+    async fn up_to_five_crore_a_b2b_sale_needs_four_digits() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        clear_hsn(&f, &f.product_id).await;
+        let (_, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields_of(&body), vec!["lines[1].hsnCode"]);
+
+        for (code, expected) in [
+            ("30", StatusCode::CONFLICT),
+            ("30A4", StatusCode::CONFLICT),
+            ("3004", StatusCode::OK),
+        ] {
+            assign_hsn(&f.pool, &f.product_id, code).await;
+            let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+            assert_eq!(status, expected, "{code}: {body}");
+            if status == StatusCode::OK {
+                let (_, document) = invoice(&f, &id).await;
+                assert_eq!(document["regulatory"]["hsnRequiredDigits"], 4);
+                assert_eq!(document["lines"][0]["hsnCode"], "3004");
+            }
+        }
+    }
+
+    /// More than Rs 5 crore: six digits on every invoice, B2C included.
+    #[tokio::test]
+    async fn above_five_crore_every_sale_needs_six_digits() {
+        let f = fixture().await;
+        set_invoice_facts(&f, "not_applicable", "above_5_crore", Some("2026-27")).await;
+        assign_hsn(&f.pool, &f.product_id, "3004").await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["issues"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("6 digits")
+        );
+        assign_hsn(&f.pool, &f.product_id, "300490").await;
+        let (id, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["hsnRequiredDigits"], 6);
+    }
+
+    /// A band recorded for another financial year governs nothing now. Six digits satisfy any band,
+    /// so they still post — with the policy honestly recorded as undetermined.
+    #[tokio::test]
+    async fn a_band_for_another_financial_year_is_not_applied() {
+        let f = fixture().await;
+        set_invoice_facts(&f, "not_applicable", "up_to_5_crore", Some("2025-26")).await;
+        assign_hsn(&f.pool, &f.product_id, "3004").await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields_of(&body), vec!["store.hsnTurnoverBand"]);
+        assign_hsn(&f.pool, &f.product_id, "30049099").await;
+        let (id, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["hsnTurnoverBand"], "unknown");
+        assert!(document["regulatory"]["hsnRequiredDigits"].is_null());
+        assert!(document["regulatory"]["hsnTurnoverFinancialYear"].is_null());
+    }
+
+    /// An unregistered seller issues no GST document, so no HSN policy applies to it.
+    #[tokio::test]
+    async fn an_unregistered_seller_needs_no_hsn_at_any_band() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        set_invoice_facts(&f, "unknown", "above_5_crore", Some("2026-27")).await;
+        clear_hsn(&f, &f.product_id).await;
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_hsn_edited_after_posting_never_reaches_the_document() {
+        let f = fixture().await;
+        let (id, status, _) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, before) = invoice(&f, &id).await;
+        assign_hsn(&f.pool, &f.product_id, "90189099").await;
+        sqlx::query("UPDATE hsn_codes SET description='Changed' WHERE hsn_code='30049099'")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (_, after) = invoice(&f, &id).await;
+        assert_eq!(before["lines"], after["lines"]);
+        assert_eq!(after["lines"][0]["hsnCode"], "30049099");
+    }
+
+    // --- Store facts API ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_invoice_compliance_facts_are_the_owners_to_record_and_validated() {
+        let f = fixture().await;
+        let revision = |body: &Value| body["revision"].as_i64().unwrap();
+        let (_, profile) =
+            request(f.pool.clone(), "GET", "/api/v1/store/profile", Value::Null).await;
+        assert_eq!(profile["rule46sDeclarationApplicability"], "not_applicable");
+        assert_eq!(profile["einvoiceApplicability"], "not_required");
+        let current = revision(&profile);
+
+        for (body, field) in [
+            (
+                json!({ "rule46sDeclarationApplicability": "maybe", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
+                "rule46sDeclarationApplicability",
+            ),
+            (
+                // The two facts are not interchangeable: Rule 46(s) has no 'required' value.
+                json!({ "rule46sDeclarationApplicability": "required", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
+                "rule46sDeclarationApplicability",
+            ),
+            (
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "applicable", "hsnTurnoverBand": "unknown" }),
+                "einvoiceApplicability",
+            ),
+            (
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "5_crore" }),
+                "hsnTurnoverBand",
+            ),
+            (
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "up_to_5_crore" }),
+                "hsnTurnoverFinancialYear",
+            ),
+            (
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown", "hsnTurnoverFinancialYear": "2026-27" }),
+                "hsnTurnoverFinancialYear",
+            ),
+            (
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "above_5_crore", "hsnTurnoverFinancialYear": "2026-28" }),
+                "hsnTurnoverFinancialYear",
+            ),
+        ] {
+            let mut body = body;
+            body["expectedRevision"] = json!(current);
+            let (status, refused) = request(
+                f.pool.clone(),
+                "PUT",
+                "/api/v1/store/invoice-compliance",
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}: {refused}"
+            );
+            assert_eq!(issue_fields_of(&refused), vec![field]);
+        }
+
+        let good = json!({
+            "expectedRevision": current, "rule46sDeclarationApplicability": "applicable",
+            "einvoiceApplicability": "not_required",
+            "hsnTurnoverBand": "above_5_crore", "hsnTurnoverFinancialYear": "2026-27"
+        });
+        let (status, denied) = request_as(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/invoice-compliance",
+            good.clone(),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, saved) = request(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/invoice-compliance",
+            good.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["hsnTurnoverBand"], "above_5_crore");
+        // Each fact is stored as given; neither was derived from the other.
+        assert_eq!(saved["rule46sDeclarationApplicability"], "applicable");
+        assert_eq!(saved["einvoiceApplicability"], "not_required");
+        // A stale write is refused, not merged.
+        let (status, stale) = request(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/invoice-compliance",
+            good,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+        assert_eq!(stale["code"], "revision_conflict");
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM master_change_events WHERE entity_type='store_tax_identity' \
+             AND change_payload LIKE '%hsnTurnoverBand%'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cashier_posts_under_the_recorded_facts_but_cannot_change_them() {
+        let f = fixture().await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, posted) = post_as_quoted_by(&f, &id, CASHIER).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (status, _) = request_as(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/tax-identity",
+            json!({ "expectedRevision": 1, "gstRegistrationStatus": "unregistered" }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // --- Database guards -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_compliance_snapshot_cannot_be_mutated_by_direct_sql() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (id, status, _) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK);
+        for assignment in [
+            "compliance_snapshot_version=0",
+            "store_gst_registration_status='unregistered'",
+            "seller_retail_licence_text='Forged: 1'",
+            "rule46s_declaration_snapshot='applicable'",
+            "einvoice_applicability_snapshot='not_required'",
+            "hsn_turnover_band_snapshot='above_5_crore'",
+            "hsn_turnover_financial_year_snapshot='2030-31'",
+            "hsn_required_digits=6",
+            "cgst_paise=0",
+        ] {
+            let attempt = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+            assert!(
+                attempt.is_err(),
+                "{assignment} was accepted on a posted Sale"
+            );
+        }
+        let line = sqlx::query("UPDATE sale_lines SET hsn_code='0000' WHERE sale_document_id=?")
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+        assert!(line.is_err(), "a posted line's HSN was rewritten");
+    }
+
+    /// With the posted-row guard removed, the completeness trigger still refuses an incoherent
+    /// version-1 snapshot: an unregistered seller carrying GST, or a registered one with no Rule
+    /// 46(s) fact.
+    #[tokio::test]
+    async fn the_database_refuses_an_incoherent_compliance_snapshot() {
+        let f = fixture().await;
+        let (id, status, _) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK);
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        for assignment in [
+            "store_gst_registration_status='unregistered',rule46s_declaration_snapshot=NULL,\
+             hsn_turnover_band_snapshot=NULL,hsn_turnover_financial_year_snapshot=NULL,hsn_required_digits=NULL",
+            "rule46s_declaration_snapshot=NULL",
+            // A B2C Sale records no Rule 48(4) determination.
+            "einvoice_applicability_snapshot='not_required'",
+            "store_gst_registration_status='unknown'",
+            "hsn_required_digits=NULL",
+        ] {
+            let attempt = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+            let message = attempt
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                message.contains("compliance_snapshot_incomplete"),
+                "{assignment}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draft_cannot_carry_a_compliance_snapshot() {
+        let f = fixture().await;
+        let id = open_sale(&f, json!({})).await;
+        let attempt =
+            sqlx::query("UPDATE sale_documents SET compliance_snapshot_version=1 WHERE id=?")
+                .bind(&id)
+                .execute(&f.pool)
+                .await;
+        assert!(attempt.is_err());
+    }
+
+    // --- Concurrency -------------------------------------------------------------------------
+
+    /// Posting races the owner switching the Store to unregistered. Whatever the interleaving, a
+    /// posted Sale is either taxed under 'registered' or untaxed under 'unregistered' — or refused
+    /// because the tender no longer matches. Never taxed-while-unregistered or the reverse.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_registration_changes_is_coherent() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let id = open_sale(&f, json!({})).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                sqlx::query(
+                    "UPDATE store_identity SET gst_registration_status='unregistered',gstin=NULL,\
+                     normalized_gstin=NULL",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) =
+                tokio::join!(post_sale_request(&f, &id, revision, &key, 8960), editor);
+            edited.unwrap();
+            if posted.0 == StatusCode::OK {
+                assert_eq!(
+                    posted.1["storeGstRegistrationStatus"], "registered",
+                    "attempt {attempt}"
+                );
+                assert_eq!(posted.1["cgstPaise"], 480, "attempt {attempt}");
+            } else {
+                assert_eq!(
+                    posted.1["code"], "tender_mismatch",
+                    "attempt {attempt}: {}",
+                    posted.1
+                );
+                assert_eq!(detail(&f, &id).await["status"], "draft");
+            }
+        }
+    }
+
+    /// Posting races a redesignation that moves the retail memo from one licence to another in one
+    /// transaction. The Sale freezes one side, never both or neither.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_designation_moves_freezes_one_state() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            make_medicine(&f, &f.product_id).await;
+            add_store_licence(&f, "Form 21", "MH-21-4321", false).await;
+            let id = open_sale(&f, json!({})).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                sqlx::query("UPDATE store_licences SET include_on_retail_memo=0 WHERE licence_number='MH-20-1234'")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE store_licences SET include_on_retail_memo=1 WHERE licence_number='MH-21-4321'")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) =
+                tokio::join!(post_sale_request(&f, &id, revision, &key, 8960), editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+            let text: String = sqlx::query_scalar(
+                "SELECT seller_retail_licence_text FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert!(
+                text == "Form 20: MH-20-1234" || text == "Form 21: MH-21-4321",
+                "attempt {attempt} froze {text}"
+            );
+        }
+    }
+
+    /// Posting races a change to both turnover facts together. The snapshot carries one pair.
+    #[tokio::test]
+    async fn a_sale_posted_while_the_turnover_facts_change_freezes_one_pair() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let id = open_sale(&f, json!({})).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                sqlx::query(
+                    "UPDATE store_identity SET rule46s_declaration_applicability='applicable',\
+                     hsn_turnover_band='above_5_crore'",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) =
+                tokio::join!(post_sale_request(&f, &id, revision, &key, 8960), editor);
+            edited.unwrap();
+            assert_eq!(posted.0, StatusCode::OK, "attempt {attempt}: {}", posted.1);
+            let (declaration, band, digits): (String, String, i64) = sqlx::query_as(
+                "SELECT rule46s_declaration_snapshot,hsn_turnover_band_snapshot,\
+                 hsn_required_digits FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            let coherent =
+                (declaration == "not_applicable" && band == "up_to_5_crore" && digits == 0)
+                    || (declaration == "applicable" && band == "above_5_crore" && digits == 6);
+            assert!(
+                coherent,
+                "attempt {attempt}: {declaration} / {band} / {digits}"
+            );
+        }
+    }
+
+    /// Everything 1L-A and 1L-A2 froze is still frozen beside the new facts.
+    #[tokio::test]
+    async fn the_seller_and_recipient_snapshots_are_intact_beside_the_new_facts() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        let (id, status, posted) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["sellerSnapshotVersion"], 1);
+        assert_eq!(document["recipient"]["snapshotVersion"], 1);
+        assert_eq!(document["recipient"]["address"]["line1"], "7 Mill Road");
+        assert_eq!(
+            document["sellerSnapshot"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        assert_eq!(document["regulatory"]["hsnRequiredDigits"], 4);
+        assert_eq!(document["document"]["documentType"], "tax_invoice");
+    }
+
+    // --- 1L-A3 corrective: Rule 46 belongs to a REGISTERED seller's tax invoice ---------------
+
+    /// Posts one pack of `lot` — a lot with no MRP, from `unpriced_lot` — at `rate`, so a boundary
+    /// amount is not refused by a batch's printed ceiling.
+    async fn post_unpriced(
+        f: &Fixture,
+        lot: &str,
+        header: Value,
+        rate: i64,
+    ) -> (String, StatusCode, Value) {
+        let id = open_sale(f, header).await;
+        add_line(f, &id, &f.product_id, &f.pack_id, lot, 1, rate).await;
+        let (status, body) = post_as_quoted(f, &id).await;
+        (id, status, body)
+    }
+
+    /// A. A registered seller's Sale to a registered buyer still needs Rule 46(d)'s address.
+    #[tokio::test]
+    async fn corrective_a_registered_seller_still_owes_rule_46d_to_a_registered_buyer() {
+        let f = fixture().await;
+        let gstin = valid_gstin("27", "AAACM1234K");
+        let buyer = registered_customer(&f.pool, "Mehta Medical Stores", &gstin).await;
+        let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+        assert_eq!(issue_fields(&body), vec!["customer.billingAddress"]);
+        assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+
+        add_billing_address(&f.pool, &buyer, "7 Mill Road", Some(MAHARASHTRA), true).await;
+        let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "tax_invoice");
+        assert_eq!(document["recipient"]["address"]["line1"], "7 Mill Road");
+    }
+
+    /// B and C. A registered seller's walk-in: nothing at ₹49,999.99, Rule 46(e) at ₹50,000.
+    #[tokio::test]
+    async fn corrective_b_c_a_registered_seller_keeps_the_rule_46e_boundary() {
+        let f = fixture().await;
+        let lot = unpriced_lot(&f).await;
+        let (_, status, body) = post_unpriced(&f, &lot, json!({}), 4_999_999).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["recipientAddressLine1"].is_null());
+
+        let (id, status, body) = post_unpriced(&f, &lot, json!({}), 5_000_000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+        assert_eq!(
+            quote_of(&f, &id).await["recipientParticulars"]["reasons"],
+            json!(["taxable_value_threshold"])
+        );
+    }
+
+    /// D. A registered seller's customer who asks for their particulars still gets Rule 46(f).
+    #[tokio::test]
+    async fn corrective_d_a_registered_seller_keeps_the_rule_46f_request() {
+        let f = fixture().await;
+        let id = open_sale(&f, json!({ "recipientParticularsRequested": true })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["sellerGstRegistrationStatus"], "registered");
+        assert_eq!(
+            quote["recipientParticulars"]["reasons"],
+            json!(["recipient_requested"])
+        );
+        let (status, body) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "recipient_particulars_incomplete");
+    }
+
+    /// E and I. An unregistered seller billing a GST-registered buyer issues its ordinary retail
+    /// cash memo: no GST, no Rule 46(d) address demanded, and the buyer's GSTIN — a fact — kept.
+    #[tokio::test]
+    async fn corrective_e_an_unregistered_seller_bills_a_registered_buyer_without_rule_46d() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        let gstin = valid_gstin("27", "AAACM1234K");
+        // No billing address at all: exactly what Rule 46(d) would have refused.
+        let buyer = registered_customer(&f.pool, "Mehta Medical Stores", &gstin).await;
+        let id = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["sellerGstRegistrationStatus"], "unregistered");
+        assert_eq!(quote["recipientParticulars"]["required"], false);
+        assert_eq!(quote["recipientParticulars"]["missing"], json!([]));
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["grandTotalPaise"], 8000);
+        for field in ["cgstPaise", "sgstPaise", "igstPaise", "cessPaise"] {
+            assert_eq!(posted[field], 0, "{field}");
+        }
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "retail_cash_memo");
+        assert_eq!(document["regulatory"]["sellerRegistered"], false);
+        assert_eq!(document["recipient"]["gstin"], gstin.as_str());
+        assert!(document["recipient"]["address"].is_null());
+        assert_eq!(posted["recipientParticularsRequested"], false);
+    }
+
+    /// F and G. An unregistered seller either side of ₹50,000: Rule 46(e) never activates, no GST
+    /// is charged, and the document is never a tax invoice.
+    #[tokio::test]
+    async fn corrective_f_g_an_unregistered_seller_crosses_fifty_thousand_without_rule_46e() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        let lot = unpriced_lot(&f).await;
+        for rate in [4_999_999, 5_000_000, 5_000_001] {
+            let (id, status, body) = post_unpriced(&f, &lot, json!({}), rate).await;
+            assert_eq!(status, StatusCode::OK, "{rate}: {body}");
+            assert_eq!(body["grandTotalPaise"], rate);
+            assert_eq!(body["cgstPaise"], 0);
+            assert!(body["recipientAddressLine1"].is_null(), "{rate}");
+            let (_, document) = invoice(&f, &id).await;
+            assert_eq!(document["document"]["documentType"], "retail_cash_memo");
+        }
+    }
+
+    /// The Drugs Rules memo is not relaxed with Rule 46: a medicine above ₹50,000 from an
+    /// unregistered seller still needs the designated licence.
+    #[tokio::test]
+    async fn corrective_the_drugs_memo_still_binds_an_unregistered_seller_above_fifty_thousand() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        make_medicine(&f, &f.product_id).await;
+        undesignate_all(&f).await;
+        let lot = unpriced_lot(&f).await;
+        let (_, status, body) = post_unpriced(&f, &lot, json!({}), 5_000_000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            issue_fields_of(&body),
+            vec!["store.licences.includeOnRetailMemo"]
+        );
+    }
+
+    /// H. The Rule 46(f) request has no meaning for an unregistered seller: a draft that says so
+    /// is not asked for particulars, and the posted memo does not claim a request was honoured.
+    #[tokio::test]
+    async fn corrective_h_a_rule_46f_request_asks_nothing_of_an_unregistered_seller() {
+        let f = fixture().await;
+        set_seller_status(&f, "unregistered").await;
+        let id = open_sale(&f, json!({ "recipientParticularsRequested": true })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["recipientParticulars"]["required"], false);
+        assert_eq!(quote["recipientParticulars"]["reasons"], json!([]));
+        let (status, posted) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["recipientParticularsRequested"], false);
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "retail_cash_memo");
+    }
+
+    /// K. The high-turnover pharmacy's ordinary counter bill is not refused because the Rule 46(s)
+    /// declaration will later print — whatever Rule 48(4) says about its B2B supplies.
+    #[tokio::test]
+    async fn corrective_k_a_rule_46s_b2c_sale_posts_and_freezes_the_declaration() {
+        for einvoice in ["unknown", "not_required", "required"] {
+            let f = fixture().await;
+            set_invoice_facts(&f, "applicable", "up_to_5_crore", Some("2026-27")).await;
+            set_einvoice(&f, einvoice).await;
+            let (id, status, body) = post_line(&f, None, 8000).await;
+            assert_eq!(status, StatusCode::OK, "{einvoice}: {body}");
+            let (_, document) = invoice(&f, &id).await;
+            assert_eq!(document["document"]["documentType"], "tax_invoice");
+            assert_eq!(document["regulatory"]["rule46sDeclaration"], "applicable");
+            assert!(document["regulatory"]["einvoiceApplicability"].is_null());
+            assert_eq!(document["regulatory"]["einvoiceApplicable"], false);
+        }
+    }
+
+    /// L and N. For a registered recipient the decision is Rule 48(4)'s, and the Rule 46(s) fact
+    /// neither helps nor hinders: 'not_required' posts under either Rule 46(s) answer.
+    #[tokio::test]
+    async fn corrective_l_n_a_b2b_sale_turns_on_einvoice_applicability_not_rule_46s() {
+        for rule46s in ["not_applicable", "applicable"] {
+            let f = fixture().await;
+            set_invoice_facts(&f, rule46s, "up_to_5_crore", Some("2026-27")).await;
+            set_einvoice(&f, "not_required").await;
+            let buyer = registered_buyer(&f).await;
+            let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+            assert_eq!(status, StatusCode::OK, "{rule46s}: {body}");
+            let (_, document) = invoice(&f, &id).await;
+            assert_eq!(document["document"]["documentType"], "tax_invoice");
+            assert_eq!(document["regulatory"]["rule46sDeclaration"], rule46s);
+            assert_eq!(
+                document["regulatory"]["einvoiceApplicability"],
+                "not_required"
+            );
+        }
+    }
+
+    /// M. Rule 48(4) requires an e-invoice and AUSHADHARTH cannot obtain an IRN: a typed refusal,
+    /// under either Rule 46(s) answer, and nothing is issued.
+    #[tokio::test]
+    async fn corrective_m_an_einvoice_required_b2b_sale_is_refused_with_a_typed_error() {
+        for rule46s in ["not_applicable", "applicable"] {
+            let f = fixture().await;
+            set_invoice_facts(&f, rule46s, "up_to_5_crore", Some("2026-27")).await;
+            set_einvoice(&f, "required").await;
+            let buyer = registered_buyer(&f).await;
+            let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "einvoice_required_unsupported");
+            assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+            assert_eq!(numbers_issued(&f).await, 0);
+        }
+    }
+
+    /// O. An unknown Rule 48(4) answer fails only the Sale that depends on it.
+    #[tokio::test]
+    async fn corrective_o_an_unknown_einvoice_answer_fails_only_a_b2b_sale() {
+        let f = fixture().await;
+        set_einvoice(&f, "unknown").await;
+        let buyer = registered_buyer(&f).await;
+        let (id, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "sale_compliance_incomplete");
+        assert_eq!(issue_fields_of(&body), vec!["store.einvoiceApplicability"]);
+        assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+
+        let (_, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// P. A posted document keeps the facts it was issued under when the Store's answers change.
+    #[tokio::test]
+    async fn corrective_p_the_snapshot_survives_every_store_fact_changing() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        let (b2b, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        set_invoice_facts(&f, "applicable", "above_5_crore", Some("2026-27")).await;
+        let (b2c, status, body) = post_line(&f, None, 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, b2b_before) = invoice(&f, &b2b).await;
+        let (_, b2c_before) = invoice(&f, &b2c).await;
+
+        set_einvoice(&f, "required").await;
+        set_invoice_facts(&f, "unknown", "unknown", None).await;
+        set_seller_status(&f, "unregistered").await;
+
+        let (_, b2b_after) = invoice(&f, &b2b).await;
+        let (_, b2c_after) = invoice(&f, &b2c).await;
+        assert_eq!(b2b_before["regulatory"], b2b_after["regulatory"]);
+        assert_eq!(b2c_before["regulatory"], b2c_after["regulatory"]);
+        assert_eq!(
+            b2b_after["regulatory"]["einvoiceApplicability"],
+            "not_required"
+        );
+        assert_eq!(
+            b2b_after["regulatory"]["rule46sDeclaration"],
+            "not_applicable"
+        );
+        assert_eq!(b2c_after["regulatory"]["rule46sDeclaration"], "applicable");
+        assert_eq!(b2c_after["regulatory"]["hsnRequiredDigits"], 6);
+        assert_eq!(b2b_after["totals"], b2b_before["totals"]);
+    }
+
+    /// Direct SQL cannot write a posted B2B document without its Rule 48(4) determination, cannot
+    /// record one as 'required', and cannot relax Rule 46(d) for a registered seller — while the
+    /// recreated 0018 trigger does release an unregistered seller from it.
+    #[tokio::test]
+    async fn corrective_the_database_holds_the_seller_gate_and_the_einvoice_fact() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        let (b2b, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        for (assignment, code) in [
+            (
+                "einvoice_applicability_snapshot=NULL",
+                "compliance_snapshot_incomplete",
+            ),
+            ("einvoice_applicability_snapshot='required'", "CHECK"),
+            (
+                "recipient_address_source=NULL,recipient_address_line1=NULL,recipient_city=NULL,\
+                 recipient_postal_code=NULL,recipient_state_id=NULL,recipient_state_name=NULL,\
+                 recipient_state_code=NULL",
+                "recipient_snapshot_incomplete",
+            ),
+        ] {
+            let message = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&b2b)
+            .execute(&f.pool)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+            assert!(message.contains(code), "{assignment}: {message}");
+        }
+
+        // The same address-less B2B snapshot is coherent for an unregistered seller with no GST.
+        set_seller_status(&f, "unregistered").await;
+        let buyer_without_address = registered_customer(
+            &f.pool,
+            "Shah Distributors",
+            &valid_gstin("27", "AAACS5678L"),
+        )
+        .await;
+        let (memo, status, body) = post_line(&f, Some(&buyer_without_address), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let address: Option<String> =
+            sqlx::query_scalar("SELECT recipient_address_line1 FROM sale_documents WHERE id=?")
+                .bind(&memo)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(address, None);
+        // ...and it still cannot be relabelled as a registered seller's document.
+        let message = sqlx::query(
+            "UPDATE sale_documents SET store_gst_registration_status='registered' WHERE id=?",
+        )
+        .bind(&memo)
+        .execute(&f.pool)
+        .await
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(
+            message.contains("snapshot_incomplete"),
+            "relabelled: {message}"
+        );
+    }
+
+    /// Posting races the owner switching Rule 48(4) to 'required'. Either the Sale posted first
+    /// under 'not_required', or it is refused — never a posted B2B document while 'required' held.
+    #[tokio::test]
+    async fn corrective_a_b2b_sale_racing_the_einvoice_answer_is_never_issued_under_required() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            let buyer = registered_buyer(&f).await;
+            let id = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            let revision = revision_of(&f, &id).await;
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                sqlx::query("UPDATE store_identity SET einvoice_applicability='required'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) =
+                tokio::join!(post_sale_request(&f, &id, revision, &key, 8960), editor);
+            edited.unwrap();
+            match posted.0 {
+                StatusCode::OK => {
+                    let snapshot: Option<String> = sqlx::query_scalar(
+                        "SELECT einvoice_applicability_snapshot FROM sale_documents WHERE id=?",
+                    )
+                    .bind(&id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        snapshot.as_deref(),
+                        Some("not_required"),
+                        "attempt {attempt}"
+                    );
+                }
+                StatusCode::CONFLICT => {
+                    assert_eq!(
+                        posted.1["code"], "einvoice_required_unsupported",
+                        "attempt {attempt}"
+                    );
+                    assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+                }
+                other => panic!("attempt {attempt}: {other} {}", posted.1),
+            }
         }
     }
 }

@@ -1,6 +1,12 @@
 //! Phase 1L-A2 — which recipient particulars a posted Sale must carry, and whether it has them.
 //!
-//! Three rules, taken from Rule 46 of the CGST Rules and nothing added to them:
+//! Three rules, taken from Rule 46 of the CGST Rules and nothing added to them — and applied only
+//! when the SELLER is GST-registered. Rule 46 prescribes the particulars of a tax invoice issued by
+//! a registered person; an unregistered seller issues no tax invoice, so none of (d), (e) or (f)
+//! can require particulars on its retail cash memo. A buyer who happens to be registered, a basket
+//! worth ₹50,000 or more, or a request for GST-invoice particulars changes nothing for such a
+//! seller. The Drugs Rules retail-memo facts are a separate requirement, settled in
+//! `invoice_compliance`, and are not relaxed by this:
 //!
 //! * **(d)** a REGISTERED recipient: name, address and GSTIN, at any value;
 //! * **(e)** an UNREGISTERED recipient where the TAXABLE value is ₹50,000 or more: name, address,
@@ -152,6 +158,9 @@ pub struct PartyRecipient {
 /// in the same transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientSource {
+    /// Whether the seller issues a GST tax invoice at all. False only for a Store positively
+    /// recorded as unregistered; posting refuses an unknown status before this is ever read.
+    pub seller_registered: bool,
     /// `None` is a walk-in.
     pub party: Option<PartyRecipient>,
     pub counter_name: Option<String>,
@@ -216,6 +225,10 @@ fn is_registered(source: &RecipientSource) -> bool {
 /// The Rule 46 reasons that apply to this Sale, in a fixed order.
 pub fn reasons(source: &RecipientSource) -> Vec<RequirementReason> {
     let mut reasons = Vec::new();
+    // No tax invoice, so no Rule 46 particular — not (d), not (e), not (f).
+    if !source.seller_registered {
+        return reasons;
+    }
     if is_registered(source) {
         reasons.push(RequirementReason::RegisteredRecipient);
     } else if source.taxable_supply_value_paise >= RECIPIENT_PARTICULARS_THRESHOLD_PAISE {
@@ -366,6 +379,7 @@ mod tests {
 
     fn walk_in(taxable: i64) -> RecipientSource {
         RecipientSource {
+            seller_registered: true,
             party: None,
             counter_name: None,
             counter_address: AddressFacts::default(),
@@ -403,6 +417,33 @@ mod tests {
         let snapshot = resolve(&walk_in(100)).unwrap();
         assert_eq!(snapshot.address, None);
         assert_eq!(snapshot.delivery_same_as_recipient, None);
+    }
+
+    #[test]
+    fn an_unregistered_seller_owes_no_rule_46_particular_at_all() {
+        // (d): a registered buyer; (e): each side of ₹50,000; (f): the customer asked. None applies.
+        for taxable in [4_999_999, 5_000_000, 5_000_001] {
+            let mut source = walk_in(taxable);
+            source.seller_registered = false;
+            source.particulars_requested = true;
+            assert!(reasons(&source).is_empty());
+            assert!(requirement(&source).missing.is_empty());
+            let snapshot = resolve(&source).unwrap();
+            assert!(!snapshot.particulars_requested);
+            assert_eq!(snapshot.address, None);
+            assert_eq!(snapshot.delivery_same_as_recipient, None);
+        }
+        let mut buyer = walk_in(100);
+        buyer.seller_registered = false;
+        buyer.party = Some(party("registered", Some(GSTIN), PartyBilling::None));
+        assert!(reasons(&buyer).is_empty());
+        assert_eq!(resolve(&buyer).unwrap().address, None);
+        // The same Sale from a registered seller is exactly as 0018 froze it.
+        buyer.seller_registered = true;
+        assert_eq!(
+            resolve(&buyer).unwrap_err(),
+            vec![MissingRecipientFact::PartyAddress]
+        );
     }
 
     #[test]
@@ -458,6 +499,7 @@ mod tests {
     #[test]
     fn a_registered_recipient_has_no_threshold() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party("registered", Some(GSTIN), PartyBilling::None)),
             ..walk_in(100)
         };
@@ -474,6 +516,7 @@ mod tests {
     #[test]
     fn a_registered_recipient_with_an_address_and_valid_gstin_resolves_at_one_rupee() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party(
                 "registered",
                 Some(GSTIN),
@@ -497,6 +540,7 @@ mod tests {
             .find(|candidate| normalize_gstin(candidate).is_ok())
             .expect("a valid check character exists");
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party(
                 "registered",
                 Some(&gstin),
@@ -561,6 +605,7 @@ mod tests {
     #[test]
     fn a_registered_gstin_failing_its_check_digit_is_missing() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party(
                 "registered",
                 Some("27AAPFU0939F1ZX"),
@@ -577,6 +622,7 @@ mod tests {
     #[test]
     fn an_unknown_registration_is_treated_as_unregistered() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party("unknown", None, PartyBilling::None)),
             ..walk_in(4_999_999)
         };
@@ -586,6 +632,7 @@ mod tests {
     #[test]
     fn several_billing_addresses_with_no_primary_are_not_guessed_between() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party("registered", Some(GSTIN), PartyBilling::Ambiguous)),
             ..walk_in(100)
         };
@@ -598,6 +645,7 @@ mod tests {
     #[test]
     fn an_unregistered_party_over_the_threshold_needs_a_state_on_its_address() {
         let source = RecipientSource {
+            seller_registered: true,
             party: Some(party(
                 "unregistered",
                 None,

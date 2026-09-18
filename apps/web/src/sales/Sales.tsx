@@ -323,7 +323,7 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
     }]),
     onSuccess: () => { refresh(); setNotice(null); },
     onSettled: () => { inFlight.current = false; },
-    onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : messageFor(caught, "This sale could not be posted."))
+    onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : postingProblem(caught))
   });
 
   const submitLine = (event: FormEvent) => {
@@ -505,6 +505,12 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
         <p className="pos-summary__count">{sale.lines.length} {sale.lines.length === 1 ? "line" : "lines"}</p>
         {quote.isPending && sale.lines.length > 0 ? <p className="pos-summary__pending" role="status">Working out the total…</p>
           : quote.isError ? <div className="inline-notice inline-notice--error" role="alert">{quoteProblem(quote.error)}</div>
+          : quote.data && quote.data.sellerGstRegistrationStatus === "unregistered" ? <dl className="totals-grid">
+              {/* Not a GST document: the pharmacy is recorded as unregistered, so no tax is charged. */}
+              <div><dt>Value of goods</dt><dd className="numeric">{paiseToAmountText(quote.data.taxableValuePaise)}</dd></div>
+              <div><dt>GST</dt><dd>Not charged</dd></div>
+              <div className="totals-grand"><dt>Amount payable</dt><dd className="numeric">{paiseToAmountText(quote.data.grandTotalPaise)}</dd></div>
+            </dl>
           : quote.data ? <dl className="totals-grid">
               <div><dt>Taxable value</dt><dd className="numeric">{paiseToAmountText(quote.data.taxableValuePaise)}</dd></div>
               {quote.data.taxTreatment === "intra_state"
@@ -536,13 +542,16 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
         <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing}>
           {post.isPending ? "Posting…" : quote.data ? `Take ${paiseToAmountText(quote.data.grandTotalPaise)} and post` : "Post"}
         </button>
-        <p className="pos-summary__note">Posting issues the invoice number, charges the GST and takes the stock out. It cannot be undone.</p>
+        <p className="pos-summary__note">{quote.data?.sellerGstRegistrationStatus === "unregistered"
+          ? "Posting issues the cash memo number and takes the stock out. This pharmacy is recorded as not GST-registered, so no GST is charged. It cannot be undone."
+          : "Posting issues the invoice number, charges the GST and takes the stock out. It cannot be undone."}</p>
       </aside>
 
       <CustomerPanel
         key={sale.id}
         sale={sale}
         requirement={requirement ?? null}
+        sellerRegistered={quote.data ? quote.data.sellerGstRegistrationStatus === "registered" : null}
         open={customerOpen}
         onOpenChange={setCustomerOpen}
         onSaved={refresh}
@@ -622,9 +631,14 @@ function AddressFields({ prefix, legend, value, onChange, states }: {
  * Most counter sales are walk-ins, so this sits below the bill rather than in front of it. A name
  * typed here is invoice text and nothing more; only a real party row carries identity.
  */
-function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeName }: {
+function CustomerPanel({ sale, requirement, sellerRegistered, open, onOpenChange, onSaved, storeName }: {
   sale: SaleDetail;
   requirement: RecipientRequirement | null;
+  /**
+   * Whether this pharmacy issues GST tax invoices, from the quote; null until a quote is available.
+   * Rule 46 — and so every recipient particular below — belongs to a registered seller's tax invoice.
+   */
+  sellerRegistered: boolean | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
@@ -668,10 +682,12 @@ function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeNa
     ? selectedParty.gstRegistrationStatus === "registered"
     : savedCustomer && Boolean(requirement?.reasons.includes("registered_recipient")));
   const thresholdReached = requirement !== null && requirement.taxableSupplyValuePaise >= requirement.thresholdPaise;
-  const reasons: RecipientRequirementReason[] = [
+  // An unregistered seller issues a retail cash memo, not a tax invoice: no Rule 46 reason applies.
+  const gstInvoice = sellerRegistered !== false;
+  const reasons: RecipientRequirementReason[] = gstInvoice ? [
     ...(registeredPath ? ["registered_recipient" as const] : thresholdReached ? ["taxable_value_threshold" as const] : []),
     ...(requested ? ["recipient_requested" as const] : [])
-  ];
+  ] : [];
   const statutory = reasons.length > 0;
   const walkIn = customerPartyId === "";
   const partyMissing = savedCustomer && !walkIn
@@ -683,7 +699,8 @@ function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeNa
       customerPartyId: customerPartyId || null,
       customerNameText: customerNameText.trim() || null,
       businessDate: sale.businessDate,
-      recipientParticularsRequested: requested,
+      // Never recorded as a GST-invoice request where no GST invoice exists to honour it.
+      recipientParticularsRequested: gstInvoice ? requested : false,
       // A named customer's address is read from their record at posting and is never sent.
       recipientAddress: walkIn ? addressInput(address) : null,
       // Rule 46(d) asks for no address of delivery, so a registered customer carries none.
@@ -728,10 +745,12 @@ function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeNa
             <input id="pos-customer-name" maxLength={200} value={customerNameText} onChange={(event) => setCustomerNameText(event.target.value)} />
             <small>Printed on the invoice for a walk-in who asks for a name. It creates no customer record.</small>
           </div>
-          <label className="check-field catalog-span">
-            <input id="pos-recipient-requested" type="checkbox" checked={requested} onChange={(event) => setRequested(event.target.checked)} />
-            <span>Customer asked for their details on the invoice<small>Their name and address are then recorded on the invoice at any amount.</small></span>
-          </label>
+          {gstInvoice
+            ? <label className="check-field catalog-span">
+                <input id="pos-recipient-requested" type="checkbox" checked={requested} onChange={(event) => setRequested(event.target.checked)} />
+                <span>Customer asked for their details on the invoice<small>Their name and address are then recorded on the invoice at any amount.</small></span>
+              </label>
+            : <p className="panel-note catalog-span">This pharmacy is recorded as not GST-registered, so this sale is a retail cash memo, not a GST tax invoice. No GST-invoice particulars are asked for.</p>}
 
           {statutory && <div className="pos-recipient catalog-span">
             <ul className="pos-customer__reasons">{reasons.map((reason) => <li key={reason}>{REASON_TEXT[reason]}</li>)}</ul>
@@ -766,6 +785,11 @@ function CustomerPanel({ sale, requirement, open, onOpenChange, onSaved, storeNa
 // ---------------------------------------------------------------------------------------------
 
 function PostedInvoice({ sale }: { sale: SaleDetail }) {
+  // Worded from what was frozen: the seller's status at posting AND the tax actually charged. A
+  // product's GST classification is catalogue metadata and says nothing about whether GST was
+  // charged. A Sale posted before Phase 1L-A3 that did record GST keeps showing it, as recorded.
+  const taxCharged = sale.cgstPaise + sale.sgstPaise + sale.igstPaise + sale.cessPaise;
+  const noGst = sale.storeGstRegistrationStatus === "unregistered" && taxCharged === 0;
   return <>
     <header className="page-header">
       <div>
@@ -780,12 +804,14 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
     </header>
 
     <section className="master-panel" aria-labelledby="sale-invoice-title">
-      <h2 id="sale-invoice-title">Invoice</h2>
+      <h2 id="sale-invoice-title">{noGst ? "Retail cash memo" : "Invoice"}</h2>
       <dl className="detail-grid">
-        <div><dt>Invoice number</dt><dd>{sale.documentNumber}</dd></div>
+        <div><dt>{noGst ? "Memo number" : "Invoice number"}</dt><dd>{sale.documentNumber}</dd></div>
         <div><dt>Business date</dt><dd>{sale.businessDate}</dd></div>
         <div><dt>Financial year</dt><dd>{sale.financialYear}</dd></div>
-        <div><dt>Tax treatment</dt><dd>{sale.taxTreatment ? TREATMENT_LABELS[sale.taxTreatment] : "—"}</dd></div>
+        {noGst
+          ? <div><dt>GST</dt><dd>Not charged: this pharmacy was not GST-registered when the sale was posted</dd></div>
+          : <div><dt>Tax treatment</dt><dd>{sale.taxTreatment ? TREATMENT_LABELS[sale.taxTreatment] : "—"}</dd></div>}
         <div><dt>Store GSTIN</dt><dd>{sale.storeNormalizedGstin ?? "Not registered"}</dd></div>
         <div><dt>Customer GSTIN</dt><dd>{sale.customerNormalizedGstin ?? "—"}</dd></div>
         {sale.recipientAddressLine1 && <div><dt>Customer address</dt><dd>{addressText([sale.recipientAddressLine1, sale.recipientAddressLine2, sale.recipientCity, sale.recipientPostalCode, sale.recipientStateName])}</dd></div>}
@@ -794,29 +820,35 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
       </dl>
 
       <div className="table-scroll"><table className="data-table">
-        <thead><tr><th scope="col">#</th><th scope="col">Item</th><th scope="col">Batch</th><th scope="col">HSN</th><th scope="col" className="numeric">Quantity</th><th scope="col" className="numeric">Rate</th><th scope="col" className="numeric">Taxable</th><th scope="col" className="numeric">GST</th><th scope="col" className="numeric">Total</th></tr></thead>
+        <thead><tr><th scope="col">#</th><th scope="col">Item</th><th scope="col">Batch</th><th scope="col">HSN</th><th scope="col" className="numeric">Quantity</th><th scope="col" className="numeric">Rate</th><th scope="col" className="numeric">{noGst ? "Value" : "Taxable"}</th>{!noGst && <th scope="col" className="numeric">GST</th>}<th scope="col" className="numeric">Total</th></tr></thead>
         <tbody>{sale.lines.map((line) => <tr key={line.id}>
           <td data-label="#">{line.lineNumber}</td>
-          <td data-label="Item">{line.productDisplayName}<br /><small className="row-subtext">{line.packDisplayLabel}{line.taxTreatmentKind ? ` · ${TAX_KIND_LABELS[line.taxTreatmentKind]}` : ""}</small></td>
+          <td data-label="Item">{line.productDisplayName}<br /><small className="row-subtext">{line.packDisplayLabel}{line.taxTreatmentKind && !noGst ? ` · ${TAX_KIND_LABELS[line.taxTreatmentKind]}` : ""}</small></td>
           <td data-label="Batch">{line.batchNumber}{line.batchExpiresOn ? <><br /><small className="row-subtext">Expires {line.batchExpiresOn}</small></> : null}</td>
           <td data-label="HSN">{line.hsnCode ?? "—"}</td>
           <td data-label="Quantity" className="numeric">{quantityText(line)}</td>
           <td data-label="Rate" className="numeric">{paiseToAmountText(line.sellingRatePaise)}</td>
-          <td data-label="Taxable" className="numeric">{paiseToAmountText(line.taxableValuePaise)}</td>
-          <td data-label="GST" className="numeric">{paiseToAmountText(line.cgstPaise + line.sgstPaise + line.igstPaise + line.cessPaise)}</td>
+          <td data-label={noGst ? "Value" : "Taxable"} className="numeric">{paiseToAmountText(line.taxableValuePaise)}</td>
+          {!noGst && <td data-label="GST" className="numeric">{paiseToAmountText(line.cgstPaise + line.sgstPaise + line.igstPaise + line.cessPaise)}</td>}
           <td data-label="Total" className="numeric">{paiseToAmountText(line.lineTotalPaise)}</td>
         </tr>)}</tbody>
       </table></div>
 
-      <dl className="totals-grid">
-        <div><dt>Taxable value</dt><dd className="numeric">{paiseToAmountText(sale.taxableValuePaise)}</dd></div>
-        {sale.taxTreatment === "intra_state"
-          ? <><div><dt>CGST</dt><dd className="numeric">{paiseToAmountText(sale.cgstPaise)}</dd></div>
-              <div><dt>SGST</dt><dd className="numeric">{paiseToAmountText(sale.sgstPaise)}</dd></div></>
-          : <div><dt>IGST</dt><dd className="numeric">{paiseToAmountText(sale.igstPaise)}</dd></div>}
-        {sale.cessPaise > 0 && <div><dt>Cess</dt><dd className="numeric">{paiseToAmountText(sale.cessPaise)}</dd></div>}
-        <div className="totals-grand"><dt>Invoice total</dt><dd className="numeric">{paiseToAmountText(sale.grandTotalPaise)}</dd></div>
-      </dl>
+      {noGst
+        ? <dl className="totals-grid">
+            <div><dt>Value of goods</dt><dd className="numeric">{paiseToAmountText(sale.taxableValuePaise)}</dd></div>
+            <div><dt>GST</dt><dd>Not charged</dd></div>
+            <div className="totals-grand"><dt>Memo total</dt><dd className="numeric">{paiseToAmountText(sale.grandTotalPaise)}</dd></div>
+          </dl>
+        : <dl className="totals-grid">
+            <div><dt>Taxable value</dt><dd className="numeric">{paiseToAmountText(sale.taxableValuePaise)}</dd></div>
+            {sale.taxTreatment === "intra_state"
+              ? <><div><dt>CGST</dt><dd className="numeric">{paiseToAmountText(sale.cgstPaise)}</dd></div>
+                  <div><dt>SGST</dt><dd className="numeric">{paiseToAmountText(sale.sgstPaise)}</dd></div></>
+              : <div><dt>IGST</dt><dd className="numeric">{paiseToAmountText(sale.igstPaise)}</dd></div>}
+            {sale.cessPaise > 0 && <div><dt>Cess</dt><dd className="numeric">{paiseToAmountText(sale.cessPaise)}</dd></div>}
+            <div className="totals-grand"><dt>Invoice total</dt><dd className="numeric">{paiseToAmountText(sale.grandTotalPaise)}</dd></div>
+          </dl>}
 
       {sale.tenders.length > 0 && <p className="pos-summary__note">Paid by {TENDER_LABELS[sale.tenders[0].method]} · {paiseToAmountText(sale.tenders[0].amountPaise)}{sale.tenders[0].referenceText ? ` · ${sale.tenders[0].referenceText}` : ""}</p>}
 
@@ -863,9 +895,10 @@ function batchNote(batch: SellableBatch): string {
 }
 
 function quoteProblem(error: unknown): string {
-  return error instanceof LocalServiceError
-    ? `${error.message} The bill cannot be totalled until that line is corrected.`
-    : "The total could not be worked out.";
+  if (!(error instanceof LocalServiceError)) return "The total could not be worked out.";
+  // Not a line's fault: whether GST applies at all is a Store fact only the owner can record.
+  if (error.code === "store_gst_status_unresolved") return `${error.message} The bill cannot be totalled until then.`;
+  return `${error.message} The bill cannot be totalled until that line is corrected.`;
 }
 
 /**
@@ -884,6 +917,23 @@ function rejectInto(setNotice: (message: string) => void) {
 
 function messageFor(caught: unknown, fallback: string): string {
   return caught instanceof LocalServiceError ? caught.message : fallback;
+}
+
+/**
+ * A posting refusal that names what is missing says so item by item. For these codes the issue
+ * messages are written for the counter by the Store Service; every other refusal keeps its one
+ * plain sentence.
+ */
+const ITEMISED_REFUSALS = new Set([
+  "store_legal_profile_incomplete",
+  "recipient_particulars_incomplete",
+  "sale_compliance_incomplete"
+]);
+
+function postingProblem(caught: unknown): string {
+  const message = messageFor(caught, "This sale could not be posted.");
+  if (!(caught instanceof LocalServiceError) || !ITEMISED_REFUSALS.has(caught.code) || caught.issues.length === 0) return message;
+  return `${message} ${caught.issues.map((issue) => issue.message).join(" ")}`;
 }
 
 function isStale(error: unknown): boolean {

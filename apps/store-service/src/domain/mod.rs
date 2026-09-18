@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod catalog;
+pub mod invoice_compliance;
 pub mod money;
 pub mod parties;
 pub mod price_control;

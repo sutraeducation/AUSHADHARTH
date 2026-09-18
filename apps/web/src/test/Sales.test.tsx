@@ -123,6 +123,8 @@ type Options = {
   writeError?: { code: string; status: number; extra?: Record<string, unknown> };
   quoteError?: { code: string; status: number };
   failList?: boolean;
+  /** The Store's GST registration, as the quote reports it. Registered unless a test says not. */
+  seller?: "registered" | "unregistered";
 };
 
 /**
@@ -148,10 +150,12 @@ function saleService(options: Options = {}) {
    * so taxable supply and taxable value coincide; the service's own tests prove the case where they
    * do not.
    */
+  const sellerRegistered = (options.seller ?? "registered") === "registered";
   const requirementFor = (document: SaleDetail, taxable: number): SaleQuote["recipientParticulars"] => {
     const party = CUSTOMERS.find((each) => each.id === document.customerPartyId);
     const registered = party?.gstRegistrationStatus === "registered";
-    const reasons: SaleQuote["recipientParticulars"]["reasons"] = [
+    // As the Store Service does: Rule 46 belongs to a registered seller's tax invoice only.
+    const reasons: SaleQuote["recipientParticulars"]["reasons"] = !sellerRegistered ? [] : [
       ...(registered ? ["registered_recipient" as const] : taxable >= THRESHOLD ? ["taxable_value_threshold" as const] : []),
       ...(document.recipientParticularsRequested ? ["recipient_requested" as const] : [])
     ];
@@ -167,9 +171,10 @@ function saleService(options: Options = {}) {
 
   const quoteFor = (document: SaleDetail): SaleQuote => {
     const taxable = document.lines.reduce((total, each) => total + each.taxableValuePaise, 0);
-    const half = Math.round((taxable * 600) / 10_000);
+    const half = sellerRegistered ? Math.round((taxable * 600) / 10_000) : 0;
     return {
       recipientParticulars: requirementFor(document, taxable),
+      sellerGstRegistrationStatus: sellerRegistered ? "registered" : "unregistered",
       saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state",
       taxableValuePaise: taxable, cgstPaise: half, sgstPaise: half, igstPaise: 0, cessPaise: 0,
       grandTotalPaise: taxable + half * 2,
@@ -670,6 +675,78 @@ describe("Point of sale", () => {
     expect(await screen.findByText(/changed after you opened it/)).toBeInTheDocument();
   });
 
+  // Phase 1L-A3: a refusal that names what is missing says each thing, not just "incomplete".
+  it("itemises every fact the posted document still needs", async () => {
+    const issues = [
+      { field: "lines[1].hsnCode", message: "Record a 4-digit HSN code for line 1 before posting." },
+      { field: "store.licences.includeOnRetailMemo", message: "Mark which licence is printed on retail memos in Store Profile." }
+    ];
+    const service = saleService({
+      documents: [sale({ lines: [line()] })],
+      writeError: { code: "sale_compliance_incomplete", status: 409, extra: { issues } }
+    });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    fireEvent.click(await screen.findByRole("button", { name: "Take 179.20 and post" }));
+
+    const alert = await screen.findByText(/needs details recorded before it can be posted/);
+    expect(alert).toHaveTextContent("Record a 4-digit HSN code for line 1 before posting.");
+    expect(alert).toHaveTextContent("Mark which licence is printed on retail memos in Store Profile.");
+    expect(alert).not.toHaveTextContent("raw backend detail");
+  });
+
+  it("refuses to total a bill while the pharmacy's GST registration is unrecorded", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({ lines: [line()] })],
+      quoteError: { code: "store_gst_status_unresolved", status: 409 }
+    }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    const summary = await screen.findByLabelText("Bill total");
+    await waitFor(() => expect(within(summary).getByRole("alert")).toHaveTextContent("whether this pharmacy is GST-registered"));
+    // Not blamed on a line the cashier could "correct".
+    expect(within(summary).getByRole("alert")).not.toHaveTextContent("that line is corrected");
+    expect(screen.getByRole("button", { name: "Post" })).toBeDisabled();
+  });
+
+  // Phase 1L-A3 corrective — an unregistered pharmacy's counter.
+  it("totals an unregistered pharmacy's bill without GST wording", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({ seller: "unregistered", documents: [sale({ lines: [line()] })] }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    const summary = await screen.findByLabelText("Bill total");
+    await waitFor(() => expect(within(summary).getByText("Not charged")).toBeInTheDocument());
+    expect(within(summary).queryByText("CGST")).not.toBeInTheDocument();
+    expect(within(summary).queryByText("SGST")).not.toBeInTheDocument();
+    expect(within(summary).queryByText("Taxable value")).not.toBeInTheDocument();
+    expect(within(summary).getByText(/no GST is charged/)).toBeInTheDocument();
+    expect(within(summary).queryByText(/charges the GST/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Take 160.00 and post" })).toBeEnabled();
+  });
+
+  it("offers an unregistered pharmacy no GST-invoice request and never sends one", async () => {
+    const service = saleService({
+      seller: "unregistered",
+      documents: [sale({ lines: [line()], recipientParticularsRequested: true })]
+    });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    await screen.findByRole("button", { name: "Take 160.00 and post" });
+    fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
+    expect(screen.queryByLabelText(/Customer asked for their details/)).not.toBeInTheDocument();
+    expect(screen.getByText(/retail cash memo, not a GST tax invoice/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save customer" }));
+    const saved = await waitForWrite(service, (write) => write.method === "PUT");
+    expect(saved.body.recipientParticularsRequested).toBe(false);
+  });
+
+  it("keeps the Rule 46(f) request for a registered pharmacy", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({ documents: [sale({ lines: [line()] })] }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    await screen.findByRole("button", { name: "Take 179.20 and post" });
+    fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
+    expect(screen.getByLabelText(/Customer asked for their details/)).toBeInTheDocument();
+    expect(screen.queryByText(/retail cash memo, not a GST tax invoice/)).not.toBeInTheDocument();
+  });
+
   it("names a registered customer without making every sale ask for one", async () => {
     const service = saleService();
     renderApp(`/app/sales/${IDs.sale}`, service);
@@ -860,6 +937,45 @@ describe("Posted invoice", () => {
     const table = screen.getByRole("table");
     expect(within(table).getByText("30049099")).toBeInTheDocument();
     expect(within(table).getByText("2 Strip of 10s")).toBeInTheDocument();
+  });
+
+  // Phase 1L-A3 corrective: an unregistered seller's zero-GST Sale is not a GST document.
+  const unregisteredMemo = () => postedSale({
+    storeGstRegistrationStatus: "unregistered", storeNormalizedGstin: null,
+    cgstPaise: 0, sgstPaise: 0, grandTotalPaise: 16_000,
+    lines: [line({
+      saleDocumentId: IDs.posted, hsnCode: "30049099",
+      // The product's own GST classification, kept as catalogue fact. Not what was charged.
+      taxTreatmentKind: "taxable",
+      productDisplayName: "Crocin 500 mg Tablet", packDisplayLabel: "Strip of 10", baseUnitLabel: "Tablet",
+      batchNumber: "B-2601", batchExpiresOn: "2028-03-31", batchMrpPaise: 9_550,
+      lineTotalPaise: 16_000, priceControlStatus: "unknown"
+    })],
+    tenders: [{ id: "01997a00-0000-7000-8000-000000000090", saleDocumentId: IDs.posted, method: "cash", amountPaise: 16_000, referenceText: null }]
+  });
+
+  it("presents an unregistered seller's zero-GST sale as a retail cash memo", async () => {
+    renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [unregisteredMemo()] }));
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
+    expect(screen.getByRole("heading", { name: "Retail cash memo" })).toBeInTheDocument();
+    expect(screen.queryByText("CGST + SGST (same State)")).not.toBeInTheDocument();
+    expect(screen.getByText(/Not charged: this pharmacy was not GST-registered/)).toBeInTheDocument();
+    expect(screen.queryByText("CGST")).not.toBeInTheDocument();
+    expect(screen.queryByText("SGST")).not.toBeInTheDocument();
+    const table = screen.getByRole("table");
+    expect(within(table).queryByText(/Taxable/)).not.toBeInTheDocument();
+    expect(within(table).queryByRole("columnheader", { name: "GST" })).not.toBeInTheDocument();
+    expect(within(table).getByText("30049099")).toBeInTheDocument();
+    // The stored amounts are shown as stored.
+    expect(screen.getAllByText("160.00").length).toBeGreaterThan(0);
+  });
+
+  it("still shows GST a pre-1L-A3 unregistered sale did record, exactly as recorded", async () => {
+    renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale({ storeGstRegistrationStatus: "unregistered", storeNormalizedGstin: null })] }));
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
+    expect(screen.queryByRole("heading", { name: "Retail cash memo" })).not.toBeInTheDocument();
+    expect(screen.getByText("CGST")).toBeInTheDocument();
+    expect(screen.getAllByText("9.60").length).toBeGreaterThan(0);
   });
 
   it("offers no way to edit a posted invoice", async () => {

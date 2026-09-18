@@ -199,7 +199,7 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
       const document = state.documents.get(quote[1])!;
       const totals = priced(document);
       return route.fulfill({ json: {
-        saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state",
+        saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state", sellerGstRegistrationStatus: "registered",
         taxableValuePaise: totals.taxable, cgstPaise: totals.cgst, sgstPaise: totals.sgst,
         igstPaise: 0, cessPaise: 0, grandTotalPaise: totals.total,
         recipientParticulars: recipientRequirement(document, totals.taxable),

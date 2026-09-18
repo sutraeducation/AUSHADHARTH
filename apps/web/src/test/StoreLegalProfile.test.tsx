@@ -39,6 +39,7 @@ function blank(overrides: Partial<StoreProfile> = {}): StoreProfile {
     gstRegistrationStatus: "unknown", gstin: null, normalizedGstin: null,
     placeOfSupplyStateId: null, taxComplete: false,
     address: null, licences: [],
+    rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown", hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null,
     sellerComplete: false,
     missingSellerFacts: [MISSING.legalName, MISSING.address, MISSING.licences],
     ...overrides
@@ -51,7 +52,7 @@ function complete(overrides: Partial<StoreProfile> = {}): StoreProfile {
     primaryPhone: "02012345678",
     primaryEmail: "counter@example.test",
     address: { id: "01997000-0000-7000-8000-00000000ab01", revision: 1, line1: "12 Market Road", line2: null, city: "Pune", stateId: IDs.maharashtra, postalCode: "411001", countryCode: "IN" },
-    licences: [{ id: IDs.licence, revision: 1, status: "active", licenceType: "Form 20", licenceNumber: "MH-20-1234", issuingAuthority: "FDA Maharashtra", validFrom: null, validUpto: "2031-12-31" }],
+    licences: [{ id: IDs.licence, revision: 1, status: "active", licenceType: "Form 20", licenceNumber: "MH-20-1234", issuingAuthority: "FDA Maharashtra", validFrom: null, validUpto: "2031-12-31", includeOnRetailMemo: true }],
     sellerComplete: true,
     missingSellerFacts: [],
     ...overrides
@@ -98,7 +99,10 @@ function storeService(options: Options = {}) {
         state.current = { ...state.current, address: { id: "01997000-0000-7000-8000-00000000ab01", revision: (state.current.address?.revision ?? 0) + 1, line1: String(body.line1), line2: (body.line2 as string | null) ?? null, city: (body.city as string | null) ?? null, stateId: (body.stateId as string | null) ?? null, postalCode: (body.postalCode as string | null) ?? null, countryCode: "IN" } };
       }
       if (url.pathname === "/api/v1/store/licences") {
-        state.current = { ...state.current, licences: [...state.current.licences, { id: IDs.licence, revision: 1, status: "active", licenceType: String(body.licenceType), licenceNumber: String(body.licenceNumber), issuingAuthority: (body.issuingAuthority as string | null) ?? null, validFrom: null, validUpto: null }] };
+        state.current = { ...state.current, licences: [...state.current.licences, { id: IDs.licence, revision: 1, status: "active", licenceType: String(body.licenceType), licenceNumber: String(body.licenceNumber), issuingAuthority: (body.issuingAuthority as string | null) ?? null, validFrom: null, validUpto: null, includeOnRetailMemo: Boolean(body.includeOnRetailMemo) }] };
+      }
+      if (url.pathname === "/api/v1/store/invoice-compliance") {
+        state.current = { ...state.current, revision: state.current.revision + 1, rule46sDeclarationApplicability: body.rule46sDeclarationApplicability, einvoiceApplicability: body.einvoiceApplicability, hsnTurnoverBand: body.hsnTurnoverBand, hsnTurnoverFinancialYear: body.hsnTurnoverFinancialYear };
       }
       if (url.pathname.endsWith("/archive")) {
         state.current = { ...state.current, licences: state.current.licences.map((licence) => ({ ...licence, status: "archived" as const, revision: licence.revision + 1 })), sellerComplete: false, missingSellerFacts: [MISSING.licences] };
@@ -254,7 +258,7 @@ describe("Store legal profile", () => {
 
   it("restores an archived licence", async () => {
     const archived = complete({
-      licences: [{ id: IDs.licence, revision: 2, status: "archived", licenceType: "Form 20", licenceNumber: "MH-20-1234", issuingAuthority: null, validFrom: null, validUpto: null }],
+      licences: [{ id: IDs.licence, revision: 2, status: "archived", licenceType: "Form 20", licenceNumber: "MH-20-1234", issuingAuthority: null, validFrom: null, validUpto: null, includeOnRetailMemo: true }],
       sellerComplete: false,
       missingSellerFacts: [MISSING.licences]
     });
@@ -294,9 +298,118 @@ describe("Store legal profile", () => {
     expect(await screen.findByText("Read-only access")).toBeInTheDocument();
     expect(await screen.findByText("Care Pharmacy Private Limited")).toBeInTheDocument();
     expect(screen.getByText("MH-20-1234")).toBeInTheDocument();
-    for (const name of ["Edit Identity", "Edit Address", "Record Address", "Add Licence", "Archive", "Edit Tax Identity"]) {
+    for (const name of ["Edit Identity", "Edit Address", "Record Address", "Add Licence", "Archive", "Edit Tax Identity", "Edit Turnover Facts"]) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
     }
+  });
+
+  // Phase 1L-A3 — facts only the pharmacy can supply.
+  it("shows unrecorded turnover facts as not recorded rather than guessing them", async () => {
+    renderApp(storeService({ initial: complete() }));
+    const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
+    // Three separate facts, each unrecorded — Rule 46(s), Rule 48(4) and the HSN band.
+    expect(within(panel).getAllByText("Not recorded yet")).toHaveLength(3);
+    expect(within(panel).getByText(/only you can supply/i)).toBeInTheDocument();
+    // Factual wording only: the screen never certifies anything.
+    expect(screen.queryByText(/compliant/i)).not.toBeInTheDocument();
+  });
+
+  it("records the Rule 46(s) fact and the HSN band with its financial year", async () => {
+    const state = renderApp(storeService({ initial: complete() }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Turnover Facts" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit Turnover Facts" });
+    fireEvent.change(within(dialog).getByLabelText(/Rule 46\(s\) declaration/), { target: { value: "not_applicable" } });
+    fireEvent.change(within(dialog).getByLabelText(/E-invoicing for GST-registered customers/), { target: { value: "not_required" } });
+    fireEvent.change(within(dialog).getByLabelText(/Aggregate turnover/), { target: { value: "up_to_5_crore" } });
+    fireEvent.change(within(dialog).getByLabelText(/Financial year of invoices/), { target: { value: "2026-27" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Turnover Facts" }));
+
+    await waitFor(() => expect(state.saved).toHaveLength(1));
+    expect(state.saved[0]).toMatchObject({
+      path: "/api/v1/store/invoice-compliance",
+      body: { expectedRevision: 1, rule46sDeclarationApplicability: "not_applicable", einvoiceApplicability: "not_required", hsnTurnoverBand: "up_to_5_crore", hsnTurnoverFinancialYear: "2026-27" }
+    });
+    const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
+    expect(await within(panel).findByText("Up to ₹5 crore")).toBeInTheDocument();
+    expect(within(panel).getByText("2026-27")).toBeInTheDocument();
+  });
+
+  it("records the Rule 46(s) declaration and e-invoicing as two separate answers", async () => {
+    const state = renderApp(storeService({ initial: complete({ hsnTurnoverBand: "above_5_crore", hsnTurnoverFinancialYear: "2026-27" }) }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Turnover Facts" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit Turnover Facts" });
+    // The high-turnover pharmacy whose counter bills carry the declaration without being e-invoices.
+    fireEvent.change(within(dialog).getByLabelText(/Rule 46\(s\) declaration/), { target: { value: "applicable" } });
+    // Choosing one answer changes nothing about the other.
+    expect(within(dialog).getByLabelText(/E-invoicing for GST-registered customers/)).toHaveValue("unknown");
+    fireEvent.change(within(dialog).getByLabelText(/E-invoicing for GST-registered customers/), { target: { value: "not_required" } });
+    expect(within(dialog).getByText(/It does not stop any sale/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Turnover Facts" }));
+
+    await waitFor(() => expect(state.saved).toHaveLength(1));
+    expect(state.saved[0].body).toMatchObject({ rule46sDeclarationApplicability: "applicable", einvoiceApplicability: "not_required" });
+    const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
+    expect(await within(panel).findByText("Applies: recorded on every invoice")).toBeInTheDocument();
+    expect(within(panel).getByText("Not required")).toBeInTheDocument();
+  });
+
+  it("will not send a turnover band without the financial year it governs", async () => {
+    const state = renderApp(storeService({ initial: complete() }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Turnover Facts" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Aggregate turnover/), { target: { value: "above_5_crore" } });
+    fireEvent.change(within(dialog).getByLabelText(/Financial year of invoices/), { target: { value: "2026" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Turnover Facts" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(/2026-27/);
+    expect(state.saved).toHaveLength(0);
+  });
+
+  it("sends no year when the band is set back to unknown", async () => {
+    const state = renderApp(storeService({ initial: complete({ hsnTurnoverBand: "up_to_5_crore", hsnTurnoverFinancialYear: "2026-27" }) }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Turnover Facts" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Aggregate turnover/), { target: { value: "unknown" } });
+    expect(within(dialog).queryByLabelText(/Financial year of invoices/)).not.toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Turnover Facts" }));
+    await waitFor(() => expect(state.saved).toHaveLength(1));
+    expect(state.saved[0].body).toMatchObject({ hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null });
+  });
+
+  it("designates a licence for retail memos only when the owner ticks it", async () => {
+    const state = renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: "Add Licence" }));
+    let dialog = await screen.findByRole("dialog", { name: "Add Licence" });
+    fireEvent.change(within(dialog).getByLabelText(/Licence type/), { target: { value: "Form 20" } });
+    fireEvent.change(within(dialog).getByLabelText(/Licence number/), { target: { value: "MH-20-1" } });
+    // Not ticked: the type "Form 20" alone designates nothing.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Licence" }));
+    await waitFor(() => expect(state.saved).toHaveLength(1));
+    expect(state.saved[0].body).toMatchObject({ includeOnRetailMemo: false });
+    expect(await screen.findByText("Not designated")).toBeInTheDocument();
+    expect(screen.getByText("No licence designated for retail memos")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Licence" }));
+    dialog = await screen.findByRole("dialog", { name: "Add Licence" });
+    fireEvent.change(within(dialog).getByLabelText(/Licence type/), { target: { value: "Form 21" } });
+    fireEvent.change(within(dialog).getByLabelText(/Licence number/), { target: { value: "MH-21-1" } });
+    fireEvent.click(within(dialog).getByLabelText(/Print this licence number on retail memos/));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Licence" }));
+    await waitFor(() => expect(state.saved).toHaveLength(2));
+    expect(state.saved[1].body).toMatchObject({ includeOnRetailMemo: true });
+    expect(await screen.findByText("Printed on retail memos")).toBeInTheDocument();
+    expect(screen.queryByText("No licence designated for retail memos")).not.toBeInTheDocument();
+  });
+
+  it("explains that an unrecorded GST registration stops sales", async () => {
+    renderApp(storeService({ initial: complete() }));
+    expect(await screen.findByText("GST registration not recorded")).toBeInTheDocument();
+    expect(screen.getByText(/refused rather than guessed/i)).toBeInTheDocument();
+  });
+
+  it("says an unregistered pharmacy charges no GST", async () => {
+    renderApp(storeService({ initial: complete({ gstRegistrationStatus: "unregistered" }) }));
+    expect(await screen.findByText(/sales charge no GST/i)).toBeInTheDocument();
+    expect(screen.queryByText("GST registration not recorded")).not.toBeInTheDocument();
   });
 
   /// Phase 1L-A stops at the document's facts. Nothing here prints.

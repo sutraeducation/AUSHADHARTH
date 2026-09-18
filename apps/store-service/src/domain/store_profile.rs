@@ -18,6 +18,9 @@ pub struct SellerLicence {
     pub licence_number: String,
     /// Alphanumerics only, upper-cased. Used for ordering and duplicate detection, never printed.
     pub normalized_licence_number: String,
+    /// The operator designated this licence for printing on retail drug memos (Phase 1L-A3).
+    /// Never inferred from `licence_type`.
+    pub include_on_retail_memo: bool,
 }
 
 /// A seller fact a memo cannot lawfully be issued without.
@@ -67,6 +70,8 @@ pub struct SellerSnapshot {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub licence_text: String,
+    /// The designated licences only, rendered the same way; `None` when none is designated.
+    pub retail_memo_licence_text: Option<String>,
 }
 
 /// The seller as the Store currently stands, before it is known to be complete.
@@ -174,6 +179,14 @@ pub fn resolve(source: &SellerProfileSource) -> Result<SellerSnapshot, Vec<Missi
         phone: trimmed(source.phone.as_deref()),
         email: trimmed(source.email.as_deref()),
         licence_text: licence_text(&source.active_licences).unwrap_or_default(),
+        retail_memo_licence_text: licence_text(
+            &source
+                .active_licences
+                .iter()
+                .filter(|licence| licence.include_on_retail_memo)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
     })
 }
 
@@ -190,6 +203,7 @@ mod tests {
 
     fn licence(licence_type: &str, number: &str) -> SellerLicence {
         SellerLicence {
+            include_on_retail_memo: false,
             licence_type: licence_type.to_owned(),
             licence_number: number.to_owned(),
             normalized_licence_number: number

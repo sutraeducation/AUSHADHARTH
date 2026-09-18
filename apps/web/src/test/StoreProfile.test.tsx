@@ -29,6 +29,7 @@ function profile(overrides: Partial<StoreProfile> = {}): StoreProfile {
     gstRegistrationStatus: "unknown", gstin: null, normalizedGstin: null,
     placeOfSupplyStateId: null, taxComplete: false,
     address: null, licences: [],
+    rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown", hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null,
     sellerComplete: false,
     missingSellerFacts: [
       { field: "legalName", message: "Record the pharmacy's registered name in Store Profile." },

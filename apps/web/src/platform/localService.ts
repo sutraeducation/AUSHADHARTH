@@ -201,6 +201,13 @@ export function safeErrorMessage(code?: string): string {
     // Phase 1L-A2: CGST Rule 46 requires the customer's particulars on this invoice — a registered
     // customer, ₹50,000 or more of taxable value, or a customer who asked.
     case "recipient_particulars_incomplete": return "This invoice must show the customer's details. Complete them before posting.";
+    // Phase 1L-A3: the Store has not recorded whether it is GST-registered, so whether this sale
+    // charges GST cannot be decided. Only the owner can record it.
+    case "store_gst_status_unresolved": return "Record in Store Profile whether this pharmacy is GST-registered before selling.";
+    // Phase 1L-A3: a fact the posted document must carry is missing; the issues name each one.
+    case "sale_compliance_incomplete": return "This sale needs details recorded before it can be posted.";
+    // Phase 1L-A3: the owner recorded that Rule 48(4) requires e-invoices for registered customers.
+    case "einvoice_required_unsupported": return "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices. Bill this customer outside AUSHADHARTH.";
     case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
     case "store_licence_archived": return "This licence is archived. Restore it before editing it.";
     case "store_profile_conflict": return "Those pharmacy details could not be saved as entered.";

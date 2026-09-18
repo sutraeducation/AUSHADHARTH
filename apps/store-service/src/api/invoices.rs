@@ -167,6 +167,10 @@ struct SellerSnapshotSection {
     phone: Option<String>,
     email: Option<String>,
     licence_text: String,
+    /// Phase 1L-A3: only the licences the pharmacy designated for the retail drug memo, frozen at
+    /// posting. Null on a Sale posted before designation existed, or when none was designated and
+    /// none was required.
+    retail_memo_licence_text: Option<String>,
     gst_registration_status: Option<String>,
     gstin: Option<String>,
 }
@@ -315,6 +319,27 @@ struct RegulatorySection {
     /// Deliberately absent from this product: no e-invoice, no IRN, no QR. Stated so a renderer
     /// cannot mistake absence for "not yet fetched".
     einvoice_applicable: bool,
+    /// CGST Rule 46(p). Always false: a counter Sale charges and records its own tax, and this
+    /// product has no reverse-charge workflow. Stated rather than left for a renderer to assume.
+    reverse_charge: bool,
+    /// 0: posted before Phase 1L-A3. Every fact below is then UNKNOWN, not "none", and the tax
+    /// shown is whatever was frozen at the time. 1: the seller's GST status governed the tax charged
+    /// and each fact below is the fact at posting.
+    compliance_snapshot_version: i64,
+    /// Rule 46(s): 'applicable' when this document carries the declaration, 'not_applicable' when
+    /// it does not. Null for an unregistered seller or a version-0 Sale. The declaration's wording
+    /// belongs to the renderer, not the data.
+    rule46s_declaration: Option<String>,
+    /// Rule 48(4): 'not_required' on a registered seller's document to a registered recipient — the
+    /// only document whose issue depended on it. Null everywhere else, meaning "not needed for this
+    /// document", never "not required". Never 'required': such a Sale is refused, not posted.
+    einvoice_applicability: Option<String>,
+    /// The HSN policy (Notification No. 78/2020-CT) in force at posting.
+    hsn_turnover_band: Option<String>,
+    hsn_turnover_financial_year: Option<String>,
+    /// 0 = HSN not required on this document, 4 or 6 = required and present at that precision,
+    /// null = not determined (band unknown, every line carried six digits) or not a GST document.
+    hsn_required_digits: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -389,6 +414,13 @@ struct HeaderRow {
     delivery_postal_code: Option<String>,
     delivery_state_name: Option<String>,
     delivery_state_code: Option<String>,
+    seller_retail_licence_text: Option<String>,
+    compliance_snapshot_version: i64,
+    rule46s_declaration_snapshot: Option<String>,
+    einvoice_applicability_snapshot: Option<String>,
+    hsn_turnover_band_snapshot: Option<String>,
+    hsn_turnover_financial_year_snapshot: Option<String>,
+    hsn_required_digits: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -445,7 +477,9 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
          recipient_address_line1,recipient_address_line2,recipient_city,recipient_postal_code,\
          recipient_state_name,recipient_state_code,delivery_same_as_recipient,\
          delivery_address_line1,delivery_address_line2,delivery_city,delivery_postal_code,\
-         delivery_state_name,delivery_state_code \
+         delivery_state_name,delivery_state_code,seller_retail_licence_text,\
+         compliance_snapshot_version,rule46s_declaration_snapshot,einvoice_applicability_snapshot,\
+         hsn_turnover_band_snapshot,hsn_turnover_financial_year_snapshot,hsn_required_digits \
          FROM sale_documents WHERE id=?",
     )
     .bind(id)
@@ -499,6 +533,7 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
         phone: header.seller_phone.clone(),
         email: header.seller_email.clone(),
         licence_text: header.seller_licence_text.clone().unwrap_or_default(),
+        retail_memo_licence_text: header.seller_retail_licence_text.clone(),
         gst_registration_status: header.store_gst_registration_status.clone(),
         gstin: header.store_normalized_gstin.clone(),
     });
@@ -560,6 +595,13 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
             seller_registered,
             tax_treatment: header.tax_treatment.clone(),
             einvoice_applicable: false,
+            reverse_charge: false,
+            compliance_snapshot_version: header.compliance_snapshot_version,
+            rule46s_declaration: header.rule46s_declaration_snapshot.clone(),
+            einvoice_applicability: header.einvoice_applicability_snapshot.clone(),
+            hsn_turnover_band: header.hsn_turnover_band_snapshot.clone(),
+            hsn_turnover_financial_year: header.hsn_turnover_financial_year_snapshot.clone(),
+            hsn_required_digits: header.hsn_required_digits,
         },
     })
 }
@@ -590,6 +632,7 @@ async fn current_profile(pool: &SqlitePool) -> Result<CurrentSellerProfile, Invo
             .into_iter()
             .map(
                 |(licence_type, licence_number)| crate::domain::store_profile::SellerLicence {
+                    include_on_retail_memo: false,
                     normalized_licence_number: crate::domain::parties::normalize_licence_comparison(
                         &licence_number,
                     ),
@@ -843,12 +886,18 @@ fn check_invariants(
     // The database already refuses an incoherent version-1 recipient snapshot. This is the renderer
     // refusing to present one if that guard were ever bypassed: a registered recipient without the
     // Rule 46(d) address, or a "delivered elsewhere" without the address it names.
+    //
+    // Rule 46(d) governs a registered seller's tax invoice, so the renderer asks it of exactly the
+    // documents the database does: any whose frozen seller is not positively unregistered. An
+    // unregistered seller's retail cash memo to a registered buyer carries the buyer's GSTIN as a
+    // fact and no Rule 46 address.
     if header.recipient_snapshot_version >= 1 {
         let has_address = header
             .recipient_address_line1
             .as_deref()
             .is_some_and(|line| !line.trim().is_empty());
-        if header.customer_gst_registration_status.as_deref() == Some("registered")
+        if header.store_gst_registration_status.as_deref() != Some("unregistered")
+            && header.customer_gst_registration_status.as_deref() == Some("registered")
             && (!has_address || header.customer_normalized_gstin.is_none())
         {
             return Err(InvoiceError::InvariantFailed(

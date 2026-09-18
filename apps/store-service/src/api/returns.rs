@@ -4682,11 +4682,24 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
-             normalized_licence_number,created_at_utc,updated_at_utc) \
+             normalized_licence_number,created_at_utc,updated_at_utc,include_on_retail_memo) \
              VALUES (?,?,'Form 20','MH-20-1234','MH201234',\
-             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),1)",
         )
         .bind(Uuid::now_v7().to_string())
+        .bind(store_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        // Phase 1L-A3: the facts a registered pharmacy records before selling. Turnover never
+        // crossed the e-invoicing threshold, and it was up to Rs 5 crore in the year before the
+        // fixture's financial year — so HSN is required on B2B invoices only.
+        sqlx::query(
+            "UPDATE store_identity SET rule46s_declaration_applicability='not_applicable',\
+             einvoice_applicability='not_required',\
+             hsn_turnover_band='up_to_5_crore',hsn_turnover_financial_year='2026-27' \
+             WHERE store_id=?",
+        )
         .bind(store_id)
         .execute(pool)
         .await

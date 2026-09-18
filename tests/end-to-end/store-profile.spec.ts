@@ -27,6 +27,7 @@ function asProfile(current: Record<string, unknown>) {
     gstRegistrationStatus: current.gstRegistrationStatus, gstin: current.gstin,
     normalizedGstin: current.normalizedGstin, placeOfSupplyStateId: current.placeOfSupplyStateId,
     taxComplete: current.complete, address: null, licences: [],
+    rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown", hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null,
     sellerComplete: false,
     missingSellerFacts: [
       { field: "legalName", message: "Record the pharmacy's registered name in Store Profile." },

@@ -1,5 +1,8 @@
 import {
   StoreProfileSchema,
+  type EinvoiceApplicability,
+  type HsnTurnoverBand,
+  type Rule46sDeclarationApplicability,
   type StoreProfile
 } from "@aushadharth/contracts";
 import { localServiceRequest } from "../platform/localService";
@@ -16,6 +19,7 @@ import { localServiceRequest } from "../platform/localService";
 const PROFILE = "/api/v1/store/profile";
 const ADDRESS = "/api/v1/store/address";
 const LICENCES = "/api/v1/store/licences";
+const INVOICE_COMPLIANCE = "/api/v1/store/invoice-compliance";
 
 export interface StoreIdentityInput {
   expectedRevision: number;
@@ -45,6 +49,17 @@ export interface StoreLicenceInput {
   validFrom: string | null;
   validUpto: string | null;
   reason?: string;
+  /** Phase 1L-A3: print this licence on retail drug memos. */
+  includeOnRetailMemo?: boolean;
+}
+
+export interface InvoiceComplianceInput {
+  expectedRevision: number;
+  rule46sDeclarationApplicability: Rule46sDeclarationApplicability;
+  einvoiceApplicability: EinvoiceApplicability;
+  hsnTurnoverBand: HsnTurnoverBand;
+  hsnTurnoverFinancialYear: string | null;
+  reason?: string;
 }
 
 export async function getStoreProfile(): Promise<StoreProfile> {
@@ -61,6 +76,16 @@ export async function updateStoreIdentity(input: StoreIdentityInput): Promise<St
 export async function updateStoreAddress(input: StoreAddressInput): Promise<StoreProfile> {
   return StoreProfileSchema.parse(
     await localServiceRequest(ADDRESS, { method: "PUT", body: JSON.stringify(input) })
+  );
+}
+
+/**
+ * The two turnover facts only the pharmacy can know: whether the Rule 46(s) declaration applies,
+ * and the band that fixes HSN digits for one financial year. Owner/Admin only.
+ */
+export async function updateInvoiceCompliance(input: InvoiceComplianceInput): Promise<StoreProfile> {
+  return StoreProfileSchema.parse(
+    await localServiceRequest(INVOICE_COMPLIANCE, { method: "PUT", body: JSON.stringify(input) })
   );
 }
 

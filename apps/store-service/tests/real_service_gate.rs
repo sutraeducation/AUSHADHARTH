@@ -928,7 +928,9 @@ async fn complete_legal_profile(service: &Service, cookie: &str) {
         service,
         "POST",
         "/api/v1/store/licences",
-        Some(json!({ "licenceType": "Form 20", "licenceNumber": "MH-20-1234" })),
+        Some(json!({
+            "licenceType": "Form 20", "licenceNumber": "MH-20-1234", "includeOnRetailMemo": true
+        })),
         Some(cookie),
     )
     .await;
@@ -937,6 +939,29 @@ async fn complete_legal_profile(service: &Service, cookie: &str) {
         licence.body["sellerComplete"], true,
         "the profile is still incomplete after all three particulars were recorded"
     );
+    assert_eq!(licence.body["licences"][0]["includeOnRetailMemo"], true);
+
+    // Phase 1L-A3: the turnover facts only the pharmacy can know, recorded over real HTTP. Up to
+    // Rs 5 crore in the year before the gate's 2026-27 sales, never above the e-invoicing
+    // threshold (no Rule 46(s) declaration), and not required to e-invoice (Rule 48(4)).
+    assert_eq!(licence.body["rule46sDeclarationApplicability"], "unknown");
+    assert_eq!(licence.body["einvoiceApplicability"], "unknown");
+    let facts = call(
+        service,
+        "PUT",
+        "/api/v1/store/invoice-compliance",
+        Some(json!({
+            "expectedRevision": licence.body["revision"],
+            "rule46sDeclarationApplicability": "not_applicable",
+            "einvoiceApplicability": "not_required",
+            "hsnTurnoverBand": "up_to_5_crore",
+            "hsnTurnoverFinancialYear": "2026-27"
+        })),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(facts.status, 200, "{:?}", facts.body);
+    assert_eq!(facts.body["hsnTurnoverFinancialYear"], "2026-27");
 }
 
 async fn seed_purchase_world(
@@ -4685,4 +4710,100 @@ async fn real_service_requires_and_freezes_requested_recipient_particulars_over_
     assert_eq!(recipient["address"]["line1"], "4 Lake View Society");
     assert_eq!(recipient["address"]["stateCode"], "27");
     assert_eq!(recipient["delivery"]["sameAsRecipient"], true);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1L-A3 — the seller's GST registration governs the tax
+// ---------------------------------------------------------------------------------------------
+
+/// Across a real socket: while the Store's registration is recorded as unknown, no sale is taxed or
+/// posted; once the owner records it as unregistered, the same basket posts with no GST at all and
+/// the canonical invoice says so from frozen facts.
+#[tokio::test]
+async fn real_service_charges_no_gst_for_an_unregistered_seller_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let set_status = async |status: &str, gstin: Option<&str>| {
+        let current = call(
+            &service,
+            "GET",
+            "/api/v1/store/tax-identity",
+            None,
+            Some(&world.cookie),
+        )
+        .await;
+        let reply = call(
+            &service,
+            "PUT",
+            "/api/v1/store/tax-identity",
+            Some(json!({
+                "expectedRevision": current.body["revision"], "gstRegistrationStatus": status,
+                "gstin": gstin, "placeOfSupplyStateId": MAHARASHTRA
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{:?}", reply.body);
+    };
+
+    set_status("unknown", None).await;
+    let sale_id = sale_draft(&service, &world, None).await;
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 409, "{:?}", quote.body);
+    assert_eq!(quote.body["code"], "store_gst_status_unresolved");
+
+    set_status("unregistered", None).await;
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    assert_eq!(quote.body["cgstPaise"], 0);
+    assert_eq!(quote.body["grandTotalPaise"], 8000);
+
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000000e9",
+        8000,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["sgstPaise"], 0);
+
+    let document = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/invoice"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    assert_eq!(
+        document.body["document"]["documentType"],
+        "retail_cash_memo"
+    );
+    assert_eq!(document.body["regulatory"]["complianceSnapshotVersion"], 1);
+    assert_eq!(document.body["totals"]["grandTotalPaise"], 8000);
+    assert_eq!(
+        document.body["sellerSnapshot"]["retailMemoLicenceText"],
+        "Form 20: MH-20-1234"
+    );
 }

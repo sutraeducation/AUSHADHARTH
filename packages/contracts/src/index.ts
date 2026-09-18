@@ -1313,6 +1313,8 @@ export const SaleQuoteSchema = z.object({
   saleDocumentId: z.string(),
   revision: z.number().int().positive(),
   taxTreatment: SaleTaxTreatmentSchema,
+  /** Phase 1L-A3: the seller status the quote was computed under. An unknown status is refused. */
+  sellerGstRegistrationStatus: z.enum(["registered", "unregistered"]),
   taxableValuePaise: z.number().int(),
   cgstPaise: z.number().int(),
   sgstPaise: z.number().int(),
@@ -1357,6 +1359,12 @@ export const SaleErrorCodeSchema = z.enum([
   "store_legal_profile_incomplete",
   // Phase 1L-A2: Rule 46 requires recipient particulars this Sale does not have yet.
   "recipient_particulars_incomplete",
+  // Phase 1L-A3: the Store's GST registration is not recorded, so whether to charge GST is unknown.
+  "store_gst_status_unresolved",
+  // Phase 1L-A3: a Rule 46(s), HSN or retail-memo licence fact the posted document needs is missing.
+  "sale_compliance_incomplete",
+  // Phase 1L-A3: Rule 48(4) requires an e-invoice for this registered customer; none can be issued.
+  "einvoice_required_unsupported",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -2072,7 +2080,33 @@ export const StoreLicenceSchema = z.object({
   licenceNumber: z.string(),
   issuingAuthority: z.string().nullable(),
   validFrom: z.string().nullable(),
-  validUpto: z.string().nullable()
+  validUpto: z.string().nullable(),
+  /**
+   * Phase 1L-A3: the owner designated this licence's number for the retail drug memo. A factual
+   * designation by the pharmacy — never inferred from `licenceType`.
+   */
+  includeOnRetailMemo: z.boolean()
+});
+
+/**
+ * Whether the CGST Rule 46(s) declaration applies to this business's non-IRN invoices, as the owner
+ * recorded it. A separate fact from Rule 48(4) e-invoicing below; neither is derived from the other.
+ */
+export const Rule46sDeclarationApplicabilitySchema = z.enum(["unknown", "not_applicable", "applicable"]);
+
+/** Whether CGST Rule 48(4) requires this business to e-invoice supplies to registered persons. */
+export const EinvoiceApplicabilitySchema = z.enum(["unknown", "not_required", "required"]);
+
+/** Aggregate turnover in the preceding financial year, as Notification No. 78/2020-CT bands it. */
+export const HsnTurnoverBandSchema = z.enum(["unknown", "up_to_5_crore", "above_5_crore"]);
+
+export const UpdateInvoiceComplianceRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  rule46sDeclarationApplicability: Rule46sDeclarationApplicabilitySchema,
+  einvoiceApplicability: EinvoiceApplicabilitySchema,
+  hsnTurnoverBand: HsnTurnoverBandSchema,
+  hsnTurnoverFinancialYear: z.string().nullable(),
+  reason: z.string().nullable().optional()
 });
 
 /** One seller particular the Store is still missing, named so the operator can be sent to it. */
@@ -2100,7 +2134,13 @@ export const StoreProfileSchema = z.object({
   licences: StoreLicenceSchema.array(),
   /** A Sale may be posted. An unregistered pharmacy still needs a name, an address and a licence. */
   sellerComplete: z.boolean(),
-  missingSellerFacts: MissingSellerFactSchema.array()
+  missingSellerFacts: MissingSellerFactSchema.array(),
+  /** Phase 1L-A3 facts only the pharmacy can know. Never computed from local Sales. */
+  rule46sDeclarationApplicability: Rule46sDeclarationApplicabilitySchema,
+  einvoiceApplicability: EinvoiceApplicabilitySchema,
+  hsnTurnoverBand: HsnTurnoverBandSchema,
+  /** The financial year of invoices the band governs. Null exactly when the band is unknown. */
+  hsnTurnoverFinancialYear: z.string().nullable()
 });
 
 /**
@@ -2130,6 +2170,8 @@ export const InvoiceSellerSnapshotSchema = z.object({
   phone: z.string().nullable(),
   email: z.string().nullable(),
   licenceText: z.string(),
+  /** Phase 1L-A3: the designated retail-memo licences only, frozen at posting. */
+  retailMemoLicenceText: z.string().nullable(),
   gstRegistrationStatus: z.string().nullable(),
   gstin: z.string().nullable()
 });
@@ -2260,7 +2302,22 @@ export const InvoiceSchema = z.object({
     sellerRegistered: z.boolean(),
     taxTreatment: z.string().nullable(),
     /** Always false in this product: no e-invoice, no IRN, no QR. */
-    einvoiceApplicable: z.boolean()
+    einvoiceApplicable: z.boolean(),
+    /** CGST Rule 46(p). Always false: a counter Sale charges its own tax. */
+    reverseCharge: z.boolean(),
+    /** 0: posted before Phase 1L-A3, so every fact below is unknown. 1: frozen at posting. */
+    complianceSnapshotVersion: z.number().int(),
+    /** Rule 46(s): whether this document carries the declaration. Null when not a GST document. */
+    rule46sDeclaration: z.enum(["not_applicable", "applicable"]).nullable(),
+    /**
+     * Rule 48(4), recorded only on a registered seller's document to a registered recipient, where
+     * it is always "not_required". Null means "not needed for this document", never "not required".
+     */
+    einvoiceApplicability: z.literal("not_required").nullable(),
+    hsnTurnoverBand: HsnTurnoverBandSchema.nullable(),
+    hsnTurnoverFinancialYear: z.string().nullable(),
+    /** 0 not required, 4 or 6 required, null not determined or not a GST document. */
+    hsnRequiredDigits: z.number().int().nullable()
   })
 });
 
@@ -2285,6 +2342,10 @@ export const StoreProfileErrorCodeSchema = z.enum([
 
 export type StoreAddress = z.infer<typeof StoreAddressSchema>;
 export type StoreLicence = z.infer<typeof StoreLicenceSchema>;
+export type Rule46sDeclarationApplicability = z.infer<typeof Rule46sDeclarationApplicabilitySchema>;
+export type EinvoiceApplicability = z.infer<typeof EinvoiceApplicabilitySchema>;
+export type HsnTurnoverBand = z.infer<typeof HsnTurnoverBandSchema>;
+export type UpdateInvoiceComplianceRequest = z.infer<typeof UpdateInvoiceComplianceRequestSchema>;
 export type MissingSellerFact = z.infer<typeof MissingSellerFactSchema>;
 export type StoreProfile = z.infer<typeof StoreProfileSchema>;
 export type InvoiceDocumentType = z.infer<typeof InvoiceDocumentTypeSchema>;
