@@ -117,15 +117,40 @@ describe("store profile and invoice error mapping", () => {
     expect(safeErrorMessage("store_legal_profile_incomplete")).toContain("Store Profile");
   });
 
-  /** Phase 1L-A stops at the document's facts. No renderer, no print path, no PDF dependency. */
-  it("adds no printing to the web application", () => {
+  /**
+   * Phase 1L-B prints, but only from the document surface. Store Profile is a settings screen and
+   * the shared stylesheet is not a print target: print rules live beside the document they lay out,
+   * so a change to either of these cannot quietly alter what reaches paper.
+   */
+  it("keeps printing out of the Store Profile screen and the shared stylesheet", () => {
     for (const relative of [
       "apps/web/src/settings/StoreProfile.tsx",
       "apps/web/src/settings/storeProfileApi.ts",
       "apps/web/src/app/styles.css"
     ]) {
       const source = readFileSync(locateRepositoryFile(relative), "utf8");
-      for (const forbidden of ["@media print", "@page", "window.print", "jspdf", "pdfmake", "html2canvas"]) {
+      for (const forbidden of ["@media print", "@page", "window.print"]) {
+        expect(source.includes(forbidden), `${relative} contains ${forbidden}`).toBe(false);
+      }
+    }
+  });
+
+  /**
+   * Printing is the browser's, start to finish: no document generator, no code that renders a
+   * barcode or a QR, and no dependency that would put either in the bundle.
+   */
+  it("adds no PDF, QR or driver-level printing anywhere in the web application", () => {
+    const manifest = readFileSync(locateRepositoryFile("apps/web/package.json"), "utf8");
+    for (const forbidden of ["jspdf", "pdfmake", "html2canvas", "qrcode", "react-to-print", "escpos", "printer"]) {
+      expect(manifest.includes(forbidden), `apps/web/package.json depends on ${forbidden}`).toBe(false);
+    }
+    for (const relative of [
+      "apps/web/src/print/SalePrintPage.tsx",
+      "apps/web/src/print/saleDocument.ts",
+      "apps/web/src/print/print.css"
+    ]) {
+      const source = readFileSync(locateRepositoryFile(relative), "utf8");
+      for (const forbidden of ["jspdf", "pdfmake", "html2canvas", "qrcode", "toDataURL", "escpos", "navigator.usb"]) {
         expect(source.includes(forbidden), `${relative} contains ${forbidden}`).toBe(false);
       }
     }

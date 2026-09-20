@@ -334,9 +334,12 @@ struct RegulatorySection {
     /// shown is whatever was frozen at the time. 1: the seller's GST status governed the tax charged
     /// and each fact below is the fact at posting.
     compliance_snapshot_version: i64,
-    /// Rule 46(s): 'applicable' when this document carries the declaration, 'not_applicable' when
-    /// it does not. Null for an unregistered seller or a version-0 Sale. The declaration's wording
-    /// belongs to the renderer, not the data.
+    /// Rule 46(s): the seller's position frozen at posting — 'applicable' when this business must
+    /// carry the declaration on the invoices it issues, 'not_applicable' when it must not. Null for
+    /// an unregistered seller or a version-0 Sale. Clause (s) attaches where an invoice is issued,
+    /// so whether it reaches THIS document also depends on the document type: Rule 49 carries only
+    /// the provisos to Rule 46 into a bill of supply. Both that placement and the declaration's
+    /// wording belong to the renderer, not the data.
     rule46s_declaration: Option<String>,
     /// Rule 48(4): 'not_required' on a registered seller's document to a registered recipient — the
     /// only document whose issue depended on it. Null everywhere else, meaning "not needed for this

@@ -1058,6 +1058,18 @@ describe("Posted invoice", () => {
     expect(screen.getAllByText("9.60").length).toBeGreaterThan(0);
   });
 
+  /** Phase 1L-B: the posted document is where printing starts, and a draft has no such door. */
+  it("offers printing from a posted invoice and from nowhere else", async () => {
+    renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale()] }));
+    await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
+    expect(screen.getByRole("link", { name: "Print" })).toHaveAttribute("href", `/app/sales/${IDs.posted}/print`);
+
+    cleanup();
+    renderApp(`/app/sales/${IDs.sale}`, saleService({ documents: [sale({ lines: [line()] })] }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(screen.queryByRole("link", { name: "Print" })).not.toBeInTheDocument();
+  });
+
   it("offers no way to edit a posted invoice", async () => {
     renderApp(`/app/sales/${IDs.posted}`, saleService({ documents: [postedSale()] }));
     await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });

@@ -821,6 +821,7 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
         <p>Posted {sale.postedAtUtc?.slice(0, 10)} · {sale.customerDisplayName ?? sale.customerNameText ?? "Walk-in"}</p>
       </div>
       <div className="page-header__actions">
+        <Link className="button button--primary" to={`/app/sales/${sale.id}/print`}>Print</Link>
         <Link className="button button--secondary" to={`/app/sales/${sale.id}/return`}>Return Items</Link>
         <Link className="button button--secondary" to="/app/sales">Back to Sales</Link>
       </div>

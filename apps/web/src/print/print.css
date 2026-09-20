@@ -1,0 +1,112 @@
+/*
+ * Phase 1L-B — how the semantic document is laid out on paper.
+ *
+ * Presentation only. Nothing here decides what a document says; the same facts are arranged for a
+ * sheet or for a roll. Two rules run through it: monochrome legibility, because a thermal head and
+ * an office laser both print black on white and a background colour carries no meaning; and no
+ * horizontal overflow, because a receipt that runs off the right edge of the roll is a lost fact.
+ */
+
+.print-page { display: grid; gap: 18px; }
+
+/* The preview frame. The sheet below is sized as the paper is, so what is on screen is what prints. */
+.print-sheet {
+  margin: 0 auto;
+  padding: 0;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: white;
+}
+
+.print-sheet--a4 .doc { width: 100%; max-width: 190mm; padding: 12mm 10mm; margin: 0 auto; }
+.print-sheet--thermal .doc { width: 72mm; padding: 4mm 2mm; margin: 0 auto; }
+
+.doc {
+  box-sizing: border-box;
+  color: black;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.doc p { margin: 0; }
+.doc small { display: block; color: #333; font-size: .9em; }
+
+.doc__head { text-align: center; border-bottom: 1px solid black; padding-bottom: 6px; margin-bottom: 8px; }
+.doc__title { margin: 0; font-size: 16px; letter-spacing: .06em; }
+.doc__copy { margin-top: 3px; font-weight: 700; letter-spacing: .04em; }
+.doc__legacy { margin-top: 4px; padding: 3px; border: 1px solid black; font-weight: 700; }
+
+.doc__seller { margin-bottom: 8px; }
+.doc__seller-name { font-size: 13px; font-weight: 700; }
+.doc__licence { font-weight: 700; }
+.doc__unrecorded { font-style: italic; }
+
+.doc__meta { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 4px 0; border-top: 1px solid black; border-bottom: 1px solid black; margin-bottom: 8px; }
+.doc__meta span { color: #333; }
+
+.doc__recipient { margin-bottom: 8px; }
+.doc__section-label { font-weight: 700; text-transform: uppercase; font-size: .9em; letter-spacing: .04em; }
+
+.doc__lines { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+.doc__lines th, .doc__lines td { padding: 3px 2px; text-align: left; vertical-align: top; word-break: break-word; }
+.doc__lines thead th { border-bottom: 1px solid black; font-size: .9em; text-transform: uppercase; }
+.doc__lines tbody tr { border-bottom: 1px dotted #999; }
+.doc__lines .numeric { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.doc__totals { display: grid; gap: 2px; justify-content: end; margin-bottom: 8px; }
+.doc__totals p { display: grid; grid-template-columns: auto minmax(70px, auto); gap: 12px; }
+.doc__totals strong { text-align: right; font-variant-numeric: tabular-nums; }
+.doc__grand { padding-top: 3px; border-top: 1px solid black; font-size: 1.15em; }
+
+.doc__payment, .doc__declaration, .doc__unrecorded-list { margin-bottom: 8px; word-break: break-word; }
+.doc__declaration { padding: 4px; border: 1px solid black; }
+
+.doc__signature { margin-top: 14px; text-align: right; }
+.doc__signature-space { height: 16mm; }
+.doc__signature p { border-top: 1px solid black; display: inline-block; padding-top: 3px; min-width: 45mm; }
+
+.doc__reprint { margin-top: 8px; font-size: .9em; }
+
+/* The roll carries the HSN under the item name instead, where the column does not fit. */
+.doc__inline-hsn { display: none; }
+.print-sheet--thermal .doc__inline-hsn { display: block; }
+
+/* --- 80mm roll ------------------------------------------------------------------------------
+ * A roll is not a small sheet. The columns a counter slip cannot afford are dropped (batch and
+ * expiry move under the item name, and they are simply not shown), the totals stop being a right
+ * column, and the signature space shrinks to what a thumb-width roll can carry.
+ */
+.print-sheet--thermal .doc { font-size: 10px; }
+.print-sheet--thermal .doc__title { font-size: 13px; }
+.print-sheet--thermal .doc__meta { display: grid; grid-template-columns: 1fr; gap: 1px; }
+/* Hidden by what the cell IS, never by where it sits: the columns move when a document carries no
+ * tax, and a position-based rule would hide the wrong one. */
+.print-sheet--thermal .doc__hsn, .print-sheet--thermal .doc__taxable { display: none; }
+.print-sheet--thermal .doc__totals { justify-content: stretch; }
+.print-sheet--thermal .doc__totals p { grid-template-columns: 1fr auto; }
+.print-sheet--thermal .doc__signature { text-align: left; }
+.print-sheet--thermal .doc__signature-space { height: 10mm; }
+.print-sheet--thermal .doc__signature p { min-width: 40mm; }
+
+@media print {
+  /* Only the document reaches the paper. The workspace chrome is removed outright rather than
+   * merely hidden, so it leaves no empty first page behind it. */
+  .sidebar, .topbar, .print-hide { display: none !important; }
+  .app-layout, .workspace, .main-content, .print-page { display: block !important; margin: 0 !important; padding: 0 !important; background: white !important; }
+  .print-sheet {
+    width: auto;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    overflow: visible;
+  }
+  .print-sheet--a4 .doc, .print-sheet--thermal .doc { width: auto; max-width: none; padding: 0; margin: 0; }
+  /* A long bill continues onto the next sheet with its column headings intact, and the parts a
+   * reader must not find split are kept whole. */
+  .doc__lines thead { display: table-header-group; }
+  .doc__lines tr { break-inside: avoid; }
+  .doc__totals, .doc__declaration, .doc__signature, .doc__payment, .doc__head { break-inside: avoid; }
+}
