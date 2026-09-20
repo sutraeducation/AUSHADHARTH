@@ -28,8 +28,8 @@ use super::reference_masters::ReferenceState;
 use crate::domain::{
     catalog::{CatalogValidationIssue, optional_text, validate_date, validate_uuid_v7},
     invoice_compliance::{
-        self, ComplianceIssue, ComplianceRefusal, ComplianceSource, EinvoiceApplicability, HsnBand,
-        Rule46sDeclaration, SellerGst,
+        self, ComplianceIssue, ComplianceRefusal, ComplianceSource, DynamicQrApplicability,
+        EinvoiceApplicability, HsnBand, Rule46sDeclaration, SellerGst, TenderFact,
     },
     money::{self, LineAmounts, MoneyError, RateComponents, TaxTreatment},
     price_control::{self, Comparability, PriceControlStatus},
@@ -76,6 +76,14 @@ pub(crate) enum SaleError {
     /// and this Sale is to one. AUSHADHARTH cannot obtain an IRN, and Rule 48(5) says a document
     /// issued any other way "shall not be treated as an invoice", so it is not issued at all.
     EinvoiceRequired,
+    /// Notification No. 14/2020-CT applies to this B2C invoice, which relies on the payment
+    /// cross-reference, and these tenders (by position) are card or UPI payments with no transaction
+    /// reference. Carries one issue per tender.
+    PaymentReferenceRequired(Vec<usize>),
+    /// A registered seller's Sale to a registered recipient mixing taxable and untaxed supplies.
+    /// No document AUSHADHARTH issues covers it (Rule 46A is for unregistered recipients), so it is
+    /// refused before anything is posted rather than left without a document afterwards.
+    RegisteredRecipientMixedSupply,
     ClassificationIncomplete,
     TaxRateNotFound,
     PackMismatch,
@@ -232,6 +240,30 @@ impl IntoResponse for SaleError {
                 simple(
                     "einvoice_required_unsupported",
                     "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices.",
+                ),
+            ),
+            Self::PaymentReferenceRequired(tenders) => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "payment_reference_required",
+                    message: "Enter the card or UPI transaction reference before posting.",
+                    issues: tenders
+                        .iter()
+                        .map(|index| ErrorIssue {
+                            field: format!("tenders[{index}].referenceText"),
+                            message: "Enter the transaction reference shown on the card slip or UPI app. This pharmacy records it on the invoice as the payment cross-reference.".to_owned(),
+                        })
+                        .collect(),
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::RegisteredRecipientMixedSupply => (
+                StatusCode::CONFLICT,
+                simple(
+                    "registered_recipient_mixed_supply_unsupported",
+                    "A GST-registered customer's bill cannot mix taxable and untaxed items. Bill them separately.",
                 ),
             ),
             Self::SaleComplianceIncomplete(issues) => (
@@ -445,6 +477,9 @@ fn map_database_error(error: sqlx::Error) -> SaleError {
         }
         if message.contains("customer_not_eligible") {
             return SaleError::CustomerNotEligible;
+        }
+        if message.contains("registered_recipient_mixed_supply") {
+            return SaleError::RegisteredRecipientMixedSupply;
         }
         // The service validates a draft's recipient fields before writing them, so the database
         // refusing them means a request slipped past that validation. Said as a validation failure
@@ -1432,6 +1467,13 @@ struct QuoteResponse {
     grand_total_paise: i64,
     lines: Vec<QuoteLineResponse>,
     recipient_particulars: RecipientRequirementResponse,
+    /// Notification No. 14/2020-CT as it stands for this bill: `null` when it cannot reach the
+    /// document (unregistered seller, registered customer, or no taxable line); otherwise the
+    /// Store's answer — `unknown` (posting will be refused), `not_required` or `required` (a
+    /// card or UPI payment needs its transaction reference). Informational: posting decides.
+    dynamic_qr_applicability: Option<&'static str>,
+    /// A registered customer's bill mixing taxable and untaxed items, which posting refuses.
+    registered_recipient_mixed_supply: bool,
 }
 
 /// What Rule 46 will ask of this Sale's recipient if it is posted as it stands.
@@ -1573,6 +1615,31 @@ async fn quote_sale(
         seller,
     )
     .await?;
+    let recipient_registered = customer
+        .as_ref()
+        .is_some_and(|party| party.gst_registration_status == "registered");
+    let (has_taxable_line, has_untaxed_line) =
+        treatment_mix(taxable_supply.iter().map(|(kind, _)| kind.as_deref()));
+    let dynamic_qr_applicability = if invoice_compliance::dynamic_qr_in_scope(
+        seller,
+        recipient_registered,
+        has_taxable_line,
+    ) {
+        let recorded: String = sqlx::query_scalar(
+            "SELECT dynamic_qr_applicability FROM store_identity WHERE store_id=?",
+        )
+        .bind(&header.store_id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        Some(
+            DynamicQrApplicability::parse(&recorded)
+                .ok_or(SaleError::Internal)?
+                .as_str(),
+        )
+    } else {
+        None
+    };
 
     Ok(Json(QuoteResponse {
         sale_document_id: id,
@@ -1592,6 +1659,13 @@ async fn quote_sale(
         recipient_particulars: RecipientRequirementResponse::from(
             recipient::requirement(&source),
             taxable_supply_value_paise,
+        ),
+        dynamic_qr_applicability,
+        registered_recipient_mixed_supply: invoice_compliance::registered_recipient_mixed_supply(
+            seller,
+            recipient_registered,
+            has_taxable_line,
+            has_untaxed_line,
         ),
     }))
 }
@@ -1748,7 +1822,7 @@ async fn post_within_transaction(
     let store = sqlx::query_as::<_, StoreTaxSource>(
         "SELECT normalized_gstin,place_of_supply_state_id,gst_registration_status,\
          rule46s_declaration_applicability,einvoice_applicability,hsn_turnover_band,\
-         hsn_turnover_financial_year FROM store_identity WHERE store_id=?",
+         hsn_turnover_financial_year,dynamic_qr_applicability FROM store_identity WHERE store_id=?",
     )
     .bind(&store_id)
     .fetch_optional(&mut **connection)
@@ -1762,6 +1836,7 @@ async fn post_within_transaction(
         einvoice_applicability,
         hsn_turnover_band,
         hsn_turnover_financial_year,
+        dynamic_qr_applicability,
     } = store.ok_or(SaleError::NotFound)?;
     let store_state_id = store_state_id.ok_or(SaleError::StoreTaxIncomplete)?;
     let store_state_code = state_code(connection, &store_state_id).await?;
@@ -1807,6 +1882,25 @@ async fn post_within_transaction(
             .map(|entry| entry.amounts)
             .collect::<Vec<_>>(),
     )?;
+
+    // A registered customer's mixed taxable/untaxed bill has no document AUSHADHARTH can issue.
+    // Refused here, while nothing has been written: no number, no stock, no tender.
+    let recipient_registered = customer
+        .as_ref()
+        .is_some_and(|party| party.gst_registration_status == "registered");
+    let (has_taxable_line, has_untaxed_line) = treatment_mix(
+        computed
+            .iter()
+            .map(|entry| entry.tax_treatment_kind.as_deref()),
+    );
+    if invoice_compliance::registered_recipient_mixed_supply(
+        seller_tax,
+        recipient_registered,
+        has_taxable_line,
+        has_untaxed_line,
+    ) {
+        return Err(SaleError::RegisteredRecipientMixedSupply);
+    }
 
     // The recipient's statutory particulars are resolved HERE, once the taxable value that decides
     // Rule 46(e) is final, and on the same connection that already read the customer inside this
@@ -1869,9 +1963,7 @@ async fn post_within_transaction(
         hsn_band_financial_year: hsn_turnover_financial_year.clone(),
         sale_financial_year: sales::indian_financial_year(&business_date)
             .ok_or_else(|| validation_of("businessDate", "must be a valid YYYY-MM-DD date"))?,
-        recipient_registered: customer
-            .as_ref()
-            .is_some_and(|party| party.gst_registration_status == "registered"),
+        recipient_registered,
         line_hsn: lines
             .iter()
             .zip(computed.iter())
@@ -1879,10 +1971,23 @@ async fn post_within_transaction(
             .collect(),
         requires_retail_licence,
         designated_licence_text: seller.retail_memo_licence_text.clone(),
+        dynamic_qr: DynamicQrApplicability::parse(&dynamic_qr_applicability)
+            .ok_or(SaleError::Internal)?,
+        has_taxable_line,
+        tenders: tenders
+            .iter()
+            .map(|tender| TenderFact {
+                method: tender.method.clone(),
+                has_reference: tender.reference_text.is_some(),
+            })
+            .collect(),
     })
     .map_err(|refusal| match refusal {
         ComplianceRefusal::Incomplete(issues) => SaleError::SaleComplianceIncomplete(issues),
         ComplianceRefusal::EinvoiceRequired => SaleError::EinvoiceRequired,
+        ComplianceRefusal::PaymentReferenceRequired(tenders) => {
+            SaleError::PaymentReferenceRequired(tenders)
+        }
     })?;
 
     // Tender is evidence, not accounting, but it must still add up to what was charged: a shortfall
@@ -2048,7 +2153,8 @@ async fn post_within_transaction(
          delivery_state_name=?,delivery_state_code=?,\
          compliance_snapshot_version=1,seller_retail_licence_text=?,\
          rule46s_declaration_snapshot=?,einvoice_applicability_snapshot=?,\
-         hsn_turnover_band_snapshot=?,\
+         hsn_turnover_band_snapshot=?,dynamic_qr_snapshot_version=1,\
+         dynamic_qr_applicability_snapshot=?,\
          hsn_turnover_financial_year_snapshot=?,hsn_required_digits=?,\
          updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
     )
@@ -2111,6 +2217,7 @@ async fn post_within_transaction(
     .bind(compliance.rule46s.map(Rule46sDeclaration::as_str))
     .bind(compliance.einvoice.map(EinvoiceApplicability::as_str))
     .bind(compliance.hsn_band.map(HsnBand::as_str))
+    .bind(compliance.dynamic_qr.map(DynamicQrApplicability::as_str))
     .bind(&compliance.hsn_band_financial_year)
     .bind(compliance.hsn_required_digits.map(i64::from))
     .bind(&now)
@@ -2799,6 +2906,17 @@ struct StoreTaxSource {
     einvoice_applicability: String,
     hsn_turnover_band: String,
     hsn_turnover_financial_year: Option<String>,
+    dynamic_qr_applicability: String,
+}
+
+/// Whether any line's treatment is `taxable`, and whether any is untaxed (exempt, nil-rated or
+/// outside GST) — the two halves of the document classification `invoices::classify` makes.
+fn treatment_mix<'a>(kinds: impl Iterator<Item = Option<&'a str>>) -> (bool, bool) {
+    kinds.fold((false, false), |(taxable, untaxed), kind| match kind {
+        Some("taxable") => (true, untaxed),
+        Some("exempt" | "nil_rated" | "non_gst") => (taxable, true),
+        _ => (taxable, untaxed),
+    })
 }
 
 /// The seller-status authority the quote and the posting share. `unknown` decides nothing.
@@ -4885,6 +5003,7 @@ mod tests {
         sqlx::query(
             "UPDATE store_identity SET rule46s_declaration_applicability='not_applicable',\
              einvoice_applicability='not_required',\
+             dynamic_qr_applicability='not_required',\
              hsn_turnover_band='up_to_5_crore',hsn_turnover_financial_year='2026-27' \
              WHERE store_id=?",
         )
@@ -7533,7 +7652,8 @@ mod tests {
              store_gst_registration_status='unregistered',seller_retail_licence_text=NULL,\
              rule46s_declaration_snapshot=NULL,einvoice_applicability_snapshot=NULL,\
              hsn_turnover_band_snapshot=NULL,hsn_turnover_financial_year_snapshot=NULL,\
-             hsn_required_digits=NULL WHERE id=?",
+             hsn_required_digits=NULL,dynamic_qr_snapshot_version=0,\
+             dynamic_qr_applicability_snapshot=NULL WHERE id=?",
         )
         .bind(&taxed)
         .execute(&f.pool)
@@ -7897,32 +8017,32 @@ mod tests {
 
         for (body, field) in [
             (
-                json!({ "rule46sDeclarationApplicability": "maybe", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
+                json!({ "rule46sDeclarationApplicability": "maybe", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
                 "rule46sDeclarationApplicability",
             ),
             (
                 // The two facts are not interchangeable: Rule 46(s) has no 'required' value.
-                json!({ "rule46sDeclarationApplicability": "required", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
+                json!({ "rule46sDeclarationApplicability": "required", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
                 "rule46sDeclarationApplicability",
             ),
             (
-                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "applicable", "hsnTurnoverBand": "unknown" }),
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "applicable", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "unknown" }),
                 "einvoiceApplicability",
             ),
             (
-                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "5_crore" }),
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "5_crore" }),
                 "hsnTurnoverBand",
             ),
             (
-                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "up_to_5_crore" }),
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "up_to_5_crore" }),
                 "hsnTurnoverFinancialYear",
             ),
             (
-                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "unknown", "hsnTurnoverFinancialYear": "2026-27" }),
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "unknown", "hsnTurnoverFinancialYear": "2026-27" }),
                 "hsnTurnoverFinancialYear",
             ),
             (
-                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "hsnTurnoverBand": "above_5_crore", "hsnTurnoverFinancialYear": "2026-28" }),
+                json!({ "rule46sDeclarationApplicability": "unknown", "einvoiceApplicability": "unknown", "dynamicQrApplicability": "unknown", "hsnTurnoverBand": "above_5_crore", "hsnTurnoverFinancialYear": "2026-28" }),
                 "hsnTurnoverFinancialYear",
             ),
         ] {
@@ -7945,7 +8065,7 @@ mod tests {
 
         let good = json!({
             "expectedRevision": current, "rule46sDeclarationApplicability": "applicable",
-            "einvoiceApplicability": "not_required",
+            "einvoiceApplicability": "not_required", "dynamicQrApplicability": "required",
             "hsnTurnoverBand": "above_5_crore", "hsnTurnoverFinancialYear": "2026-27"
         });
         let (status, denied) = request_as(
@@ -8058,11 +8178,12 @@ mod tests {
             .unwrap();
         for assignment in [
             "store_gst_registration_status='unregistered',rule46s_declaration_snapshot=NULL,\
-             hsn_turnover_band_snapshot=NULL,hsn_turnover_financial_year_snapshot=NULL,hsn_required_digits=NULL",
+             hsn_turnover_band_snapshot=NULL,hsn_turnover_financial_year_snapshot=NULL,hsn_required_digits=NULL,\
+             dynamic_qr_applicability_snapshot=NULL",
             "rule46s_declaration_snapshot=NULL",
             // A B2C Sale records no Rule 48(4) determination.
             "einvoice_applicability_snapshot='not_required'",
-            "store_gst_registration_status='unknown'",
+            "store_gst_registration_status='unknown',dynamic_qr_applicability_snapshot=NULL",
             "hsn_required_digits=NULL",
         ] {
             let attempt = sqlx::query(&format!(
@@ -8609,6 +8730,797 @@ mod tests {
                 StatusCode::CONFLICT => {
                     assert_eq!(
                         posted.1["code"], "einvoice_required_unsupported",
+                        "attempt {attempt}"
+                    );
+                    assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+                }
+                other => panic!("attempt {attempt}: {other} {}", posted.1),
+            }
+        }
+    }
+
+    // --- Phase 1L-A4: Notification No. 14/2020-CT and document issuability -------------------
+
+    async fn set_dynamic_qr(f: &Fixture, applicability: &str) {
+        sqlx::query("UPDATE store_identity SET dynamic_qr_applicability=? WHERE store_id=?")
+            .bind(applicability)
+            .bind(&f.store_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Posts for exactly the quoted amount with one tender of `method`, carrying `reference`.
+    async fn post_paid_by(
+        f: &Fixture,
+        id: &str,
+        method: &str,
+        reference: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let revision = revision_of(f, id).await;
+        let total = quote_of(f, id).await["grandTotalPaise"].as_i64().unwrap();
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/post"),
+            json!({
+                "expectedRevision": revision,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "tenders": [{ "method": method, "amountPaise": total, "referenceText": reference }]
+            }),
+        )
+        .await
+    }
+
+    /// A walk-in draft with one taxable line of the fixture product.
+    async fn b2c_draft(f: &Fixture) -> String {
+        let id = open_sale(f, json!({})).await;
+        add_line(f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        id
+    }
+
+    /// A product of the given GST treatment on its own lot.
+    async fn untaxed_lot(f: &Fixture, treatment: &str) -> (String, String, String) {
+        let slug = treatment.replace('_', "-");
+        let category = insert_category(&f.pool, &format!("{slug}-goods"), treatment).await;
+        let (product, pack) =
+            insert_product(&f.pool, &format!("{treatment} item"), TABLET, 0, 10).await;
+        enable_sale(&f.pool, &f.store_id, &product, &pack, 1, 0).await;
+        classify(&f.pool, &product, &category).await;
+        // A real HSN, so the A3 HSN policy is never the reason a B2B bill posts or not here.
+        assign_hsn(&f.pool, &product, "30059040").await;
+        let batch = insert_batch(
+            &f.pool,
+            &pack,
+            &format!("{slug}-1"),
+            Some("2027-12-31"),
+            None,
+        )
+        .await;
+        add_stock(
+            &f.pool,
+            &f.store_id,
+            &product,
+            &pack,
+            &batch,
+            100_000,
+            &f.owner_id,
+        )
+        .await;
+        (product, pack, batch)
+    }
+
+    async fn tender_rows(f: &Fixture, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?")
+            .bind(id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn dynamic_qr_snapshot(f: &Fixture, id: &str) -> (i64, Option<String>) {
+        sqlx::query_as(
+            "SELECT dynamic_qr_snapshot_version,dynamic_qr_applicability_snapshot \
+             FROM sale_documents WHERE id=?",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a4_not_required_b2c_posts_with_ordinary_tenders() {
+        let f = fixture().await;
+        let id = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &id, "upi", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            dynamic_qr_snapshot(&f, &id).await,
+            (1, Some("not_required".to_owned()))
+        );
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["dynamicQrSnapshotVersion"], 1);
+        assert_eq!(
+            document["regulatory"]["dynamicQrApplicability"],
+            "not_required"
+        );
+        assert!(document["tender"][0]["referenceText"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a4_unknown_b2c_is_refused_before_anything_is_written() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "unknown").await;
+        let id = b2c_draft(&f).await;
+        assert_eq!(quote_of(&f, &id).await["dynamicQrApplicability"], "unknown");
+        let (status, body) = post_paid_by(&f, &id, "cash", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "sale_compliance_incomplete");
+        assert_eq!(issue_fields_of(&body), vec!["store.dynamicQrApplicability"]);
+        assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+        assert_eq!(tender_rows(&f, &id).await, 0);
+        assert_eq!(numbers_issued(&f).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a4_required_cash_posts_with_its_cross_reference_facts() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let id = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &id, "cash", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["dynamicQrApplicability"], "required");
+        let tender = &document["tender"][0];
+        assert_eq!(tender["method"], "cash");
+        assert_eq!(tender["amountPaise"], 8960);
+        assert!(tender["referenceText"].is_null());
+        // The tender's own recorded time, exactly as stored.
+        let stored: String =
+            sqlx::query_scalar("SELECT created_at_utc FROM sale_tenders WHERE sale_document_id=?")
+                .bind(&id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(tender["recordedAtUtc"], stored.as_str());
+    }
+
+    #[tokio::test]
+    async fn a4_required_upi_and_card_post_with_their_references() {
+        for method in ["upi", "card"] {
+            let f = fixture().await;
+            set_dynamic_qr(&f, "required").await;
+            let id = b2c_draft(&f).await;
+            let (status, body) = post_paid_by(&f, &id, method, Some("  TXN-9281-A  ")).await;
+            assert_eq!(status, StatusCode::OK, "{method}: {body}");
+            let (_, document) = invoice(&f, &id).await;
+            let tender = &document["tender"][0];
+            assert_eq!(tender["method"], method);
+            assert_eq!(tender["referenceText"], "TXN-9281-A");
+            assert_eq!(tender["amountPaise"], 8960);
+            assert!(tender["recordedAtUtc"].as_str().unwrap().ends_with('Z'));
+        }
+    }
+
+    #[tokio::test]
+    async fn a4_required_electronic_payment_without_a_reference_is_refused() {
+        for (method, reference) in [
+            ("upi", None),
+            ("card", None),
+            ("upi", Some("   ")),
+            ("card", Some("")),
+        ] {
+            let f = fixture().await;
+            set_dynamic_qr(&f, "required").await;
+            let id = b2c_draft(&f).await;
+            let (status, body) = post_paid_by(&f, &id, method, reference).await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{method} {reference:?}: {body}"
+            );
+            assert_eq!(body["code"], "payment_reference_required");
+            assert_eq!(issue_fields_of(&body), vec!["tenders[0].referenceText"]);
+            assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+            assert_eq!(tender_rows(&f, &id).await, 0);
+            assert_eq!(numbers_issued(&f).await, 0);
+        }
+    }
+
+    /// The POS takes one payment per Sale. A split tender stays refused whatever the Store's answer,
+    /// so no partial cross-reference can ever be recorded.
+    #[tokio::test]
+    async fn a4_a_split_tender_is_still_refused_without_side_effects() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let id = b2c_draft(&f).await;
+        let revision = revision_of(&f, &id).await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/post"),
+            json!({
+                "expectedRevision": revision,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "tenders": [
+                    { "method": "cash", "amountPaise": 4000 },
+                    { "method": "upi", "amountPaise": 4960, "referenceText": "TXN-1" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "tender_mismatch");
+        assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+        assert_eq!(tender_rows(&f, &id).await, 0);
+    }
+
+    /// The answer changes what the document records, never what the customer pays.
+    #[tokio::test]
+    async fn a4_the_dynamic_qr_answer_never_changes_the_arithmetic() {
+        let f = fixture().await;
+        let id = b2c_draft(&f).await;
+        let mut quotes = Vec::new();
+        for answer in ["unknown", "not_required", "required"] {
+            set_dynamic_qr(&f, answer).await;
+            let quote = quote_of(&f, &id).await;
+            assert_eq!(quote["dynamicQrApplicability"], answer);
+            quotes.push(quote);
+        }
+        for field in [
+            "taxableValuePaise",
+            "cgstPaise",
+            "sgstPaise",
+            "igstPaise",
+            "cessPaise",
+            "grandTotalPaise",
+        ] {
+            assert_eq!(quotes[0][field], quotes[1][field], "{field}");
+            assert_eq!(quotes[1][field], quotes[2][field], "{field}");
+        }
+        assert_eq!(quotes[0]["lines"], quotes[2]["lines"]);
+        let (status, posted) = post_paid_by(&f, &id, "cash", None).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["grandTotalPaise"], quotes[2]["grandTotalPaise"]);
+    }
+
+    #[tokio::test]
+    async fn a4_the_snapshot_survives_the_store_changing_its_answer() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let id = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &id, "card", Some("AUTH-771")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, before) = invoice(&f, &id).await;
+        for answer in ["not_required", "unknown"] {
+            set_dynamic_qr(&f, answer).await;
+            let (_, after) = invoice(&f, &id).await;
+            assert_eq!(before["regulatory"], after["regulatory"]);
+            assert_eq!(before["tender"], after["tender"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a4_posted_payment_evidence_cannot_be_rewritten_or_added_to() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let id = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &id, "upi", Some("UPI-1")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for assignment in [
+            "dynamic_qr_snapshot_version=0",
+            "dynamic_qr_applicability_snapshot='not_required'",
+            "dynamic_qr_applicability_snapshot=NULL",
+        ] {
+            let attempt = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(&id)
+            .execute(&f.pool)
+            .await;
+            assert!(attempt.is_err(), "{assignment} accepted on a posted Sale");
+        }
+        for statement in [
+            "UPDATE sale_tenders SET reference_text='FORGED' WHERE sale_document_id=?",
+            "UPDATE sale_tenders SET created_at_utc='2020-01-01T00:00:00.000Z' WHERE sale_document_id=?",
+            "DELETE FROM sale_tenders WHERE sale_document_id=?",
+        ] {
+            let attempt = sqlx::query(statement).bind(&id).execute(&f.pool).await;
+            assert!(attempt.is_err(), "{statement} accepted");
+        }
+        let forged = sqlx::query(
+            "INSERT INTO sale_tenders (id,sale_document_id,method,amount_paise,reference_text,\
+             created_at_utc) VALUES (?,?,'upi',1,'FORGED','2026-09-18T00:00:00.000Z')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&id)
+        .execute(&f.pool)
+        .await;
+        assert!(
+            forged
+                .err()
+                .is_some_and(|error| error.to_string().contains("sale_document_is_posted")),
+            "a tender was added to a posted Sale"
+        );
+    }
+
+    /// With the posted-row guard removed, the coherence trigger still refuses a version-1 snapshot
+    /// that contradicts the document it sits on.
+    #[tokio::test]
+    async fn a4_the_database_refuses_an_incoherent_dynamic_qr_snapshot() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let b2c = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &b2c, "card", Some("AUTH-1")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let buyer = registered_buyer(&f).await;
+        let (b2b, status, body) = post_line(&f, Some(&buyer), 8000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for trigger in [
+            "sale_documents_posted_no_update",
+            "sale_tenders_posted_no_update",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(&f.pool)
+                .await
+                .unwrap();
+        }
+        let refused = |message: String| message.contains("dynamic_qr_snapshot_incomplete");
+        for (id, assignment) in [
+            (&b2c, "dynamic_qr_applicability_snapshot=NULL"),
+            (&b2b, "dynamic_qr_applicability_snapshot='not_required'"),
+            (&b2c, "compliance_snapshot_version=0"),
+        ] {
+            let message = sqlx::query(&format!(
+                "UPDATE sale_documents SET {assignment} WHERE id=?"
+            ))
+            .bind(id)
+            .execute(&f.pool)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+            assert!(
+                refused(message.clone()) || message.contains("snapshot_incomplete"),
+                "{assignment}: {message}"
+            );
+        }
+        // Stripping the reference from a 'required' card payment makes the header incoherent.
+        sqlx::query("UPDATE sale_tenders SET reference_text=NULL WHERE sale_document_id=?")
+            .bind(&b2c)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let message =
+            sqlx::query("UPDATE sale_documents SET updated_at_utc=updated_at_utc WHERE id=?")
+                .bind(&b2c)
+                .execute(&f.pool)
+                .await
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+        assert!(refused(message.clone()), "{message}");
+    }
+
+    /// A draft carries no applicability. Setting the version on a draft trips two guards at once —
+    /// the draft guard and the coherence guard (a draft has no compliance snapshot) — and SQLite
+    /// reports whichever runs first, so either refusal is the right one. Setting the value alone
+    /// trips only the draft guard, which is asserted exactly.
+    #[tokio::test]
+    async fn a4_a_draft_cannot_carry_a_dynamic_qr_snapshot() {
+        let f = fixture().await;
+        let id = b2c_draft(&f).await;
+        let refusal = |assignment: &str| {
+            let pool = f.pool.clone();
+            let id = id.clone();
+            let statement = format!("UPDATE sale_documents SET {assignment} WHERE id=?");
+            async move {
+                sqlx::query(&statement)
+                    .bind(&id)
+                    .execute(&pool)
+                    .await
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
+            }
+        };
+        let message = refusal("dynamic_qr_snapshot_version=1").await;
+        assert!(
+            message.contains("dynamic_qr_snapshot_before_posting")
+                || message.contains("dynamic_qr_snapshot_incomplete"),
+            "{message}"
+        );
+        let message = refusal("dynamic_qr_applicability_snapshot='required'").await;
+        assert!(
+            message.contains("dynamic_qr_snapshot_before_posting"),
+            "{message}"
+        );
+        assert_eq!(dynamic_qr_snapshot(&f, &id).await, (0, None));
+    }
+
+    /// B2B is outside the notification: an unknown or 'required' answer changes nothing there, and
+    /// the A3 e-invoice decision is exactly as it was.
+    #[tokio::test]
+    async fn a4_b2b_is_untouched_by_the_dynamic_qr_answer() {
+        for answer in ["unknown", "required"] {
+            let f = fixture().await;
+            set_dynamic_qr(&f, answer).await;
+            let buyer = registered_buyer(&f).await;
+            let id = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            assert!(quote_of(&f, &id).await["dynamicQrApplicability"].is_null());
+            let (status, body) = post_paid_by(&f, &id, "card", None).await;
+            assert_eq!(status, StatusCode::OK, "{answer}: {body}");
+            assert_eq!(dynamic_qr_snapshot(&f, &id).await, (1, None));
+
+            set_einvoice(&f, "required").await;
+            let (_, status, body) = post_line(&f, Some(&buyer), 8000).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "einvoice_required_unsupported");
+        }
+    }
+
+    /// A bill of supply is not a tax invoice, so the notification cannot reach it.
+    #[tokio::test]
+    async fn a4_a_bill_of_supply_is_untouched_by_the_dynamic_qr_answer() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "unknown").await;
+        let (product, pack, batch) = untaxed_lot(&f, "exempt").await;
+        let id = open_sale(&f, json!({})).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+        assert!(quote_of(&f, &id).await["dynamicQrApplicability"].is_null());
+        let (status, body) = post_paid_by(&f, &id, "upi", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(dynamic_qr_snapshot(&f, &id).await, (1, None));
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["document"]["documentType"], "bill_of_supply");
+    }
+
+    #[tokio::test]
+    async fn a4_an_unregistered_seller_is_untouched_by_the_dynamic_qr_answer() {
+        for answer in ["unknown", "required"] {
+            let f = fixture().await;
+            set_seller_status(&f, "unregistered").await;
+            set_dynamic_qr(&f, answer).await;
+            let id = b2c_draft(&f).await;
+            assert!(quote_of(&f, &id).await["dynamicQrApplicability"].is_null());
+            let (status, body) = post_paid_by(&f, &id, "upi", None).await;
+            assert_eq!(status, StatusCode::OK, "{answer}: {body}");
+            assert_eq!(body["cgstPaise"], 0);
+            assert_eq!(dynamic_qr_snapshot(&f, &id).await, (1, None));
+            let (_, document) = invoice(&f, &id).await;
+            assert_eq!(document["document"]["documentType"], "retail_cash_memo");
+        }
+    }
+
+    /// Whether Notification No. 14/2020-CT reaches a Rule 46A invoice-cum-bill of supply is not settled
+    /// by any primary source; it is kept in scope as a conservative product decision (see
+    /// `invoice_compliance::dynamic_qr_in_scope`). This pins that decision.
+    #[tokio::test]
+    async fn a4_an_invoice_cum_bill_of_supply_follows_the_dynamic_qr_answer() {
+        let f = fixture().await;
+        let (product, pack, batch) = untaxed_lot(&f, "exempt").await;
+        let id = b2c_draft(&f).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+
+        set_dynamic_qr(&f, "unknown").await;
+        let (status, body) = post_paid_by(&f, &id, "cash", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issue_fields_of(&body), vec!["store.dynamicQrApplicability"]);
+
+        set_dynamic_qr(&f, "required").await;
+        let (status, body) = post_paid_by(&f, &id, "upi", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "payment_reference_required");
+
+        let (status, body) = post_paid_by(&f, &id, "upi", Some("UPI-55")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(
+            document["document"]["documentType"],
+            "invoice_cum_bill_of_supply"
+        );
+        assert_eq!(document["regulatory"]["dynamicQrApplicability"], "required");
+    }
+
+    /// A registered customer's bill that mixes taxable and untaxed goods is refused before posting,
+    /// for every untaxed treatment, and leaves no trace.
+    #[tokio::test]
+    async fn a4_a_registered_recipients_mixed_supply_is_refused_before_posting() {
+        for treatment in ["exempt", "nil_rated", "non_gst"] {
+            let f = fixture().await;
+            let buyer = registered_buyer(&f).await;
+            let (product, pack, batch) = untaxed_lot(&f, treatment).await;
+            let id = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+            add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+            add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+            assert_eq!(
+                quote_of(&f, &id).await["registeredRecipientMixedSupply"],
+                true,
+                "{treatment}"
+            );
+            let (status, body) = post_paid_by(&f, &id, "cash", None).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{treatment}: {body}");
+            assert_eq!(
+                body["code"],
+                "registered_recipient_mixed_supply_unsupported"
+            );
+            assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+            assert_eq!(
+                balance(&f, &batch).await,
+                100_000,
+                "{treatment} stock moved"
+            );
+            assert_eq!(tender_rows(&f, &id).await, 0);
+            assert_eq!(numbers_issued(&f).await, 0, "a number was consumed");
+            let snapshots: (i64, i64, i64) = sqlx::query_as(
+                "SELECT seller_snapshot_version,compliance_snapshot_version,\
+                 dynamic_qr_snapshot_version FROM sale_documents WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert_eq!(snapshots, (0, 0, 0));
+        }
+    }
+
+    /// The refusal is only for the mix: taxable-only and untaxed-only bills to the same registered
+    /// customer post exactly as before, and so does a mixed bill to a walk-in.
+    #[tokio::test]
+    async fn a4_single_treatment_b2b_and_walk_in_mixed_bills_still_post() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        let (product, pack, batch) = untaxed_lot(&f, "exempt").await;
+
+        let taxable = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+        add_line(
+            &f,
+            &taxable,
+            &f.product_id,
+            &f.pack_id,
+            &f.batch_id,
+            1,
+            8000,
+        )
+        .await;
+        let (status, body) = post_paid_by(&f, &taxable, "cash", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let untaxed = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+        add_line(&f, &untaxed, &product, &pack, &batch, 1, 5000).await;
+        assert_eq!(
+            quote_of(&f, &untaxed).await["registeredRecipientMixedSupply"],
+            false
+        );
+        let (status, body) = post_paid_by(&f, &untaxed, "cash", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &untaxed).await;
+        assert_eq!(document["document"]["documentType"], "bill_of_supply");
+
+        let walk_in = b2c_draft(&f).await;
+        add_line(&f, &walk_in, &product, &pack, &batch, 1, 5000).await;
+        let (status, body) = post_paid_by(&f, &walk_in, "cash", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &walk_in).await;
+        assert_eq!(
+            document["document"]["documentType"],
+            "invoice_cum_bill_of_supply"
+        );
+    }
+
+    /// The database refuses the mixed-supply transition itself, whoever attempts it.
+    #[tokio::test]
+    async fn a4_the_database_refuses_to_post_a_registered_mixed_supply() {
+        let f = fixture().await;
+        let buyer = registered_buyer(&f).await;
+        let (product, pack, batch) = untaxed_lot(&f, "exempt").await;
+        let id = open_sale(&f, json!({ "customerPartyId": buyer })).await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
+        // Freeze the two treatments on the draft lines, as posting would, then try the header.
+        sqlx::query(
+            "UPDATE sale_lines SET tax_treatment_kind=CASE WHEN product_id=? THEN 'exempt' \
+             ELSE 'taxable' END WHERE sale_document_id=?",
+        )
+        .bind(&product)
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let message = sqlx::query(
+            "UPDATE sale_documents SET status='posted',store_gst_registration_status='registered',\
+             customer_gst_registration_status='registered',series_code='INV',financial_year='2026-27',\
+             sequence_value=99,document_number='INV/2627/000099',posted_by_user_id=created_by_user_id,\
+             posted_at_utc=updated_at_utc,posting_idempotency_key=?,posting_fingerprint=? WHERE id=?",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind("d".repeat(64))
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(
+            message.contains("registered_recipient_mixed_supply"),
+            "{message}"
+        );
+        assert_eq!(detail(&f, &id).await["status"], "draft");
+    }
+
+    /// Rule 46(s), Rule 48(4) and the HSN policy come out exactly as they would without the new
+    /// answer, and the new answer comes out exactly as recorded whatever they say.
+    #[tokio::test]
+    async fn a4_dynamic_qr_is_independent_of_rule_46s_einvoice_and_hsn() {
+        for (rule46s, einvoice, dynamic_qr) in [
+            ("applicable", "required", "not_required"),
+            ("not_applicable", "not_required", "required"),
+            ("applicable", "not_required", "required"),
+        ] {
+            let f = fixture().await;
+            set_invoice_facts(&f, rule46s, "above_5_crore", Some("2026-27")).await;
+            set_einvoice(&f, einvoice).await;
+            set_dynamic_qr(&f, dynamic_qr).await;
+            let id = b2c_draft(&f).await;
+            let (status, body) = post_paid_by(&f, &id, "card", Some("AUTH-5")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (_, document) = invoice(&f, &id).await;
+            let regulatory = &document["regulatory"];
+            assert_eq!(regulatory["rule46sDeclaration"], rule46s);
+            assert!(regulatory["einvoiceApplicability"].is_null());
+            assert_eq!(regulatory["hsnRequiredDigits"], 6);
+            assert_eq!(regulatory["dynamicQrApplicability"], dynamic_qr);
+        }
+    }
+
+    /// A Sale posted before this phase reports its applicability as unknown (version 0), and its
+    /// tender still carries the time it was actually recorded.
+    #[tokio::test]
+    async fn a4_a_pre_a4_sale_reports_unknown_without_inventing_anything() {
+        let f = fixture().await;
+        let id = b2c_draft(&f).await;
+        let (status, body) = post_paid_by(&f, &id, "card", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        sqlx::query("DROP TRIGGER sale_documents_posted_no_update")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sale_documents SET dynamic_qr_snapshot_version=0,\
+             dynamic_qr_applicability_snapshot=NULL WHERE id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["dynamicQrSnapshotVersion"], 0);
+        assert!(document["regulatory"]["dynamicQrApplicability"].is_null());
+        assert!(document["tender"][0]["referenceText"].is_null());
+        let stored: String =
+            sqlx::query_scalar("SELECT created_at_utc FROM sale_tenders WHERE sale_document_id=?")
+                .bind(&id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(document["tender"][0]["recordedAtUtc"], stored.as_str());
+    }
+
+    /// The seller, recipient and A3 compliance snapshots are all intact beside the new facts.
+    #[tokio::test]
+    async fn a4_every_earlier_snapshot_is_intact_beside_the_new_facts() {
+        let f = fixture().await;
+        set_dynamic_qr(&f, "required").await;
+        let id = open_sale(
+            &f,
+            json!({ "customerNameText": "Asha Patil", "recipientParticularsRequested": true,
+                    "recipientAddress": counter_address() }),
+        )
+        .await;
+        add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
+        let (status, body) = post_paid_by(&f, &id, "upi", Some("UPI-9")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, document) = invoice(&f, &id).await;
+        assert_eq!(document["regulatory"]["sellerSnapshotVersion"], 1);
+        assert_eq!(document["regulatory"]["complianceSnapshotVersion"], 1);
+        assert_eq!(document["recipient"]["snapshotVersion"], 1);
+        assert_eq!(document["recipient"]["address"]["line1"], COUNTER_ADDRESS);
+        assert_eq!(
+            document["sellerSnapshot"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        assert_eq!(document["regulatory"]["dynamicQrApplicability"], "required");
+        assert_eq!(document["tender"][0]["referenceText"], "UPI-9");
+    }
+
+    #[tokio::test]
+    async fn a4_the_dynamic_qr_answer_is_the_owners_to_record_validated_and_audited() {
+        let f = fixture().await;
+        let (_, profile) =
+            request(f.pool.clone(), "GET", "/api/v1/store/profile", Value::Null).await;
+        assert_eq!(profile["dynamicQrApplicability"], "not_required");
+        let body = |dynamic_qr: &str, revision: i64| {
+            json!({
+                "expectedRevision": revision, "rule46sDeclarationApplicability": "not_applicable",
+                "einvoiceApplicability": "not_required", "dynamicQrApplicability": dynamic_qr,
+                "hsnTurnoverBand": "up_to_5_crore", "hsnTurnoverFinancialYear": "2026-27"
+            })
+        };
+        let revision = profile["revision"].as_i64().unwrap();
+        for invalid in ["applicable", "maybe", ""] {
+            let (status, refused) = request(
+                f.pool.clone(),
+                "PUT",
+                "/api/v1/store/invoice-compliance",
+                body(invalid, revision),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+            assert_eq!(issue_fields_of(&refused), vec!["dynamicQrApplicability"]);
+        }
+        let (status, _) = request_as(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/invoice-compliance",
+            body("required", revision),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, saved) = request(
+            f.pool.clone(),
+            "PUT",
+            "/api/v1/store/invoice-compliance",
+            body("required", revision),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["dynamicQrApplicability"], "required");
+        // Recorded as given; neither of the other two answers moved.
+        assert_eq!(saved["rule46sDeclarationApplicability"], "not_applicable");
+        assert_eq!(saved["einvoiceApplicability"], "not_required");
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM master_change_events WHERE entity_type='store_tax_identity' \
+             AND change_payload LIKE '%\"dynamicQrApplicability\":\"required\"%'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    /// Posting races the owner withdrawing the answer. Either the Sale posted under the answer it
+    /// read, or it was refused for the unknown answer — never a torn snapshot.
+    #[tokio::test]
+    async fn a4_a_sale_racing_the_dynamic_qr_answer_freezes_one_coherent_fact() {
+        for attempt in 0..12 {
+            let f = fixture().await;
+            set_dynamic_qr(&f, "required").await;
+            let id = b2c_draft(&f).await;
+            let revision = revision_of(&f, &id).await;
+            let pool = f.pool.clone();
+            let editor = tokio::spawn(async move {
+                sqlx::query("UPDATE store_identity SET dynamic_qr_applicability='unknown'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            });
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) =
+                tokio::join!(post_sale_request(&f, &id, revision, &key, 8960), editor);
+            edited.unwrap();
+            match posted.0 {
+                StatusCode::OK => assert_eq!(
+                    dynamic_qr_snapshot(&f, &id).await,
+                    (1, Some("required".to_owned())),
+                    "attempt {attempt}"
+                ),
+                StatusCode::CONFLICT => {
+                    assert_eq!(
+                        issue_fields_of(&posted.1),
+                        vec!["store.dynamicQrApplicability"],
                         "attempt {attempt}"
                     );
                     assert_nothing_posted(&f, &id, &f.batch_id, 100).await;

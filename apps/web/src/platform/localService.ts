@@ -207,6 +207,11 @@ export function safeErrorMessage(code?: string): string {
     // Phase 1L-A3: a fact the posted document must carry is missing; the issues name each one.
     case "sale_compliance_incomplete": return "This sale needs details recorded before it can be posted.";
     // Phase 1L-A3: the owner recorded that Rule 48(4) requires e-invoices for registered customers.
+    // Phase 1L-A4: under Notification No. 14/2020-CT the invoice carries the payment cross-reference,
+    // and a card or UPI payment's reference cannot be derived — only the operator has it.
+    case "payment_reference_required": return "Enter the card or UPI transaction reference before posting.";
+    // Phase 1L-A4: no document AUSHADHARTH issues covers this mix for a GST-registered customer.
+    case "registered_recipient_mixed_supply_unsupported": return "A GST-registered customer's bill cannot mix taxable and untaxed items. Bill them separately.";
     case "einvoice_required_unsupported": return "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices. Bill this customer outside AUSHADHARTH.";
     case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
     case "store_licence_archived": return "This licence is archived. Restore it before editing it.";

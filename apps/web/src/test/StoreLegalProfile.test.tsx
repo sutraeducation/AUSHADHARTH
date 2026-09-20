@@ -39,7 +39,7 @@ function blank(overrides: Partial<StoreProfile> = {}): StoreProfile {
     gstRegistrationStatus: "unknown", gstin: null, normalizedGstin: null,
     placeOfSupplyStateId: null, taxComplete: false,
     address: null, licences: [],
-    rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown", hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null,
+    rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown", dynamicQrApplicability: "unknown", hsnTurnoverBand: "unknown", hsnTurnoverFinancialYear: null,
     sellerComplete: false,
     missingSellerFacts: [MISSING.legalName, MISSING.address, MISSING.licences],
     ...overrides
@@ -102,7 +102,7 @@ function storeService(options: Options = {}) {
         state.current = { ...state.current, licences: [...state.current.licences, { id: IDs.licence, revision: 1, status: "active", licenceType: String(body.licenceType), licenceNumber: String(body.licenceNumber), issuingAuthority: (body.issuingAuthority as string | null) ?? null, validFrom: null, validUpto: null, includeOnRetailMemo: Boolean(body.includeOnRetailMemo) }] };
       }
       if (url.pathname === "/api/v1/store/invoice-compliance") {
-        state.current = { ...state.current, revision: state.current.revision + 1, rule46sDeclarationApplicability: body.rule46sDeclarationApplicability, einvoiceApplicability: body.einvoiceApplicability, hsnTurnoverBand: body.hsnTurnoverBand, hsnTurnoverFinancialYear: body.hsnTurnoverFinancialYear };
+        state.current = { ...state.current, revision: state.current.revision + 1, rule46sDeclarationApplicability: body.rule46sDeclarationApplicability, einvoiceApplicability: body.einvoiceApplicability, dynamicQrApplicability: body.dynamicQrApplicability, hsnTurnoverBand: body.hsnTurnoverBand, hsnTurnoverFinancialYear: body.hsnTurnoverFinancialYear };
       }
       if (url.pathname.endsWith("/archive")) {
         state.current = { ...state.current, licences: state.current.licences.map((licence) => ({ ...licence, status: "archived" as const, revision: licence.revision + 1 })), sellerComplete: false, missingSellerFacts: [MISSING.licences] };
@@ -307,8 +307,8 @@ describe("Store legal profile", () => {
   it("shows unrecorded turnover facts as not recorded rather than guessing them", async () => {
     renderApp(storeService({ initial: complete() }));
     const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
-    // Three separate facts, each unrecorded — Rule 46(s), Rule 48(4) and the HSN band.
-    expect(within(panel).getAllByText("Not recorded yet")).toHaveLength(3);
+    // Four separate facts, each unrecorded — Rule 46(s), Rule 48(4), Dynamic QR and the HSN band.
+    expect(within(panel).getAllByText("Not recorded yet")).toHaveLength(4);
     expect(within(panel).getByText(/only you can supply/i)).toBeInTheDocument();
     // Factual wording only: the screen never certifies anything.
     expect(screen.queryByText(/compliant/i)).not.toBeInTheDocument();
@@ -327,7 +327,7 @@ describe("Store legal profile", () => {
     await waitFor(() => expect(state.saved).toHaveLength(1));
     expect(state.saved[0]).toMatchObject({
       path: "/api/v1/store/invoice-compliance",
-      body: { expectedRevision: 1, rule46sDeclarationApplicability: "not_applicable", einvoiceApplicability: "not_required", hsnTurnoverBand: "up_to_5_crore", hsnTurnoverFinancialYear: "2026-27" }
+      body: { expectedRevision: 1, rule46sDeclarationApplicability: "not_applicable", einvoiceApplicability: "not_required", dynamicQrApplicability: "unknown", hsnTurnoverBand: "up_to_5_crore", hsnTurnoverFinancialYear: "2026-27" }
     });
     const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
     expect(await within(panel).findByText("Up to ₹5 crore")).toBeInTheDocument();
@@ -351,6 +351,25 @@ describe("Store legal profile", () => {
     const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
     expect(await within(panel).findByText("Applies: recorded on every invoice")).toBeInTheDocument();
     expect(within(panel).getByText("Not required")).toBeInTheDocument();
+  });
+
+  it("records the Dynamic QR answer as its own fact and says no QR is generated", async () => {
+    const state = renderApp(storeService({ initial: complete() }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Turnover Facts" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit Turnover Facts" });
+    const dynamicQr = within(dialog).getByLabelText(/Dynamic QR for unregistered customers/);
+    expect(within(dialog).getByText(/does not generate a QR code/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/₹500 crore/)).toBeInTheDocument();
+    fireEvent.change(dynamicQr, { target: { value: "required" } });
+    // Choosing it moves neither of the other two answers.
+    expect(within(dialog).getByLabelText(/Rule 46\(s\) declaration/)).toHaveValue("unknown");
+    expect(within(dialog).getByLabelText(/E-invoicing for GST-registered customers/)).toHaveValue("unknown");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Turnover Facts" }));
+
+    await waitFor(() => expect(state.saved).toHaveLength(1));
+    expect(state.saved[0].body).toMatchObject({ dynamicQrApplicability: "required", rule46sDeclarationApplicability: "unknown", einvoiceApplicability: "unknown" });
+    const panel = (await screen.findByRole("heading", { name: "Turnover Facts" })).closest("section")!;
+    expect(await within(panel).findByText("Required: payment details recorded on each invoice")).toBeInTheDocument();
   });
 
   it("will not send a turnover band without the financial year it governs", async () => {

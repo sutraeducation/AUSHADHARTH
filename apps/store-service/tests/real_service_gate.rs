@@ -954,6 +954,7 @@ async fn complete_legal_profile(service: &Service, cookie: &str) {
             "expectedRevision": licence.body["revision"],
             "rule46sDeclarationApplicability": "not_applicable",
             "einvoiceApplicability": "not_required",
+            "dynamicQrApplicability": "not_required",
             "hsnTurnoverBand": "up_to_5_crore",
             "hsnTurnoverFinancialYear": "2026-27"
         })),
@@ -4805,5 +4806,97 @@ async fn real_service_charges_no_gst_for_an_unregistered_seller_over_http() {
     assert_eq!(
         document.body["sellerSnapshot"]["retailMemoLicenceText"],
         "Form 20: MH-20-1234"
+    );
+}
+
+/// Phase 1L-A4 over real HTTP: the owner records that Notification No. 14/2020-CT applies, a UPI
+/// payment without its transaction reference is refused, and with it the invoice carries the frozen
+/// payment cross-reference and the applicability it was issued under.
+#[tokio::test]
+async fn real_service_requires_the_payment_cross_reference_under_dynamic_qr_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let profile = call(
+        &service,
+        "GET",
+        "/api/v1/store/profile",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(profile.body["dynamicQrApplicability"], "not_required");
+    let facts = call(
+        &service,
+        "PUT",
+        "/api/v1/store/invoice-compliance",
+        Some(json!({
+            "expectedRevision": profile.body["revision"],
+            "rule46sDeclarationApplicability": "not_applicable",
+            "einvoiceApplicability": "not_required",
+            "dynamicQrApplicability": "required",
+            "hsnTurnoverBand": "up_to_5_crore",
+            "hsnTurnoverFinancialYear": "2026-27"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(facts.status, 200, "{:?}", facts.body);
+    assert_eq!(facts.body["dynamicQrApplicability"], "required");
+
+    let sale_id = sale_draft(&service, &world, None).await;
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    assert_eq!(quote.body["dynamicQrApplicability"], "required");
+    let total = quote.body["grandTotalPaise"].clone();
+
+    let pay = async |reference: Option<&str>, key: &str| {
+        call(
+            &service,
+            "POST",
+            &format!("/api/v1/sales/{sale_id}/post"),
+            Some(json!({
+                "expectedRevision": 2,
+                "idempotencyKey": key,
+                "tenders": [{ "method": "upi", "amountPaise": total, "referenceText": reference }]
+            })),
+            Some(&world.cookie),
+        )
+        .await
+    };
+    let refused = pay(None, "01997a00-0000-7000-8000-0000000000f1").await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "payment_reference_required");
+
+    let posted = pay(Some("UPI-4471"), "01997a00-0000-7000-8000-0000000000f2").await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let document = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/invoice"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    assert_eq!(
+        document.body["regulatory"]["dynamicQrApplicability"],
+        "required"
+    );
+    assert_eq!(document.body["tender"][0]["method"], "upi");
+    assert_eq!(document.body["tender"][0]["referenceText"], "UPI-4471");
+    assert!(
+        document.body["tender"][0]["recordedAtUtc"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z'))
     );
 }

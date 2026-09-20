@@ -4697,6 +4697,7 @@ mod tests {
         sqlx::query(
             "UPDATE store_identity SET rule46s_declaration_applicability='not_applicable',\
              einvoice_applicability='not_required',\
+             dynamic_qr_applicability='not_required',\
              hsn_turnover_band='up_to_5_crore',hsn_turnover_financial_year='2026-27' \
              WHERE store_id=?",
         )

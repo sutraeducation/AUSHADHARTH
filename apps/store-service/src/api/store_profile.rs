@@ -594,6 +594,10 @@ struct StoreProfileResponse {
     /// Whether Rule 48(4) requires this business to e-invoice supplies to registered persons:
     /// 'unknown', 'not_required' or 'required'. A separate fact, never derived from the one above.
     einvoice_applicability: String,
+    /// Phase 1L-A4. Whether Notification No. 14/2020-CT (Dynamic QR on B2C invoices) applies to
+    /// this business: 'unknown', 'not_required' or 'required'. A third separate fact, derived from
+    /// neither of the two above.
+    dynamic_qr_applicability: String,
     /// The aggregate-turnover band that fixes HSN digits, and the financial year of invoices it
     /// governs. 'unknown' carries no year.
     hsn_turnover_band: String,
@@ -664,9 +668,10 @@ async fn fetch_profile(pool: &SqlitePool) -> Result<StoreProfileResponse, StoreP
         einvoice_applicability,
         hsn_turnover_band,
         hsn_turnover_financial_year,
-    ): (String, String, String, Option<String>) = sqlx::query_as(
+        dynamic_qr_applicability,
+    ): (String, String, String, Option<String>, String) = sqlx::query_as(
         "SELECT rule46s_declaration_applicability,einvoice_applicability,hsn_turnover_band,\
-         hsn_turnover_financial_year FROM store_identity WHERE store_id=?",
+         hsn_turnover_financial_year,dynamic_qr_applicability FROM store_identity WHERE store_id=?",
     )
     .bind(&row.store_id)
     .fetch_one(pool)
@@ -676,6 +681,7 @@ async fn fetch_profile(pool: &SqlitePool) -> Result<StoreProfileResponse, StoreP
     Ok(StoreProfileResponse {
         rule46s_declaration_applicability,
         einvoice_applicability,
+        dynamic_qr_applicability,
         hsn_turnover_band,
         hsn_turnover_financial_year,
         tax_complete: row.place_of_supply_state_id.is_some(),
@@ -842,13 +848,27 @@ struct UpdateInvoiceComplianceRequest {
     expected_revision: i64,
     rule46s_declaration_applicability: String,
     einvoice_applicability: String,
+    dynamic_qr_applicability: String,
     hsn_turnover_band: String,
     hsn_turnover_financial_year: Option<String>,
     reason: Option<String>,
 }
 
+/// The Store's turnover facts as they stand, read before an update so the audit records both sides.
+#[derive(Debug, FromRow)]
+struct InvoiceFactsRow {
+    store_id: String,
+    revision: i64,
+    rule46s_declaration_applicability: String,
+    einvoice_applicability: String,
+    hsn_turnover_band: String,
+    hsn_turnover_financial_year: Option<String>,
+    dynamic_qr_applicability: String,
+}
+
 const RULE46S_APPLICABILITY: [&str; 3] = ["unknown", "not_applicable", "applicable"];
 const EINVOICE_APPLICABILITY: [&str; 3] = ["unknown", "not_required", "required"];
+const DYNAMIC_QR_APPLICABILITY: [&str; 3] = ["unknown", "not_required", "required"];
 const HSN_TURNOVER_BANDS: [&str; 3] = ["unknown", "up_to_5_crore", "above_5_crore"];
 
 /// A financial year as the rest of the product writes it: '2026-27', whose second half is the
@@ -868,12 +888,13 @@ fn valid_financial_year(value: &str) -> bool {
     }
 }
 
-/// Records the three turnover facts only the pharmacy can know. Owner/Admin only.
+/// Records the four turnover facts only the pharmacy can know. Owner/Admin only.
 ///
 /// None is computed from AUSHADHARTH's own Sales: Rule 46(s) looks at aggregate turnover in any
 /// financial year since 2017-18, Rule 48(4) at the notified class (which also excludes and exempts
-/// named persons), and the HSN band at the whole preceding year — all across the whole business
-/// rather than one counter's database. Each is validated on its own; none constrains another,
+/// named persons), Notification No. 14/2020-CT at turnover above Rs 500 crore in any financial year
+/// since 2017-18 with its own exclusions, and the HSN band at the whole preceding year — all across
+/// the whole business rather than one counter's database. Each is validated on its own; none constrains another,
 /// because the law does not make any of them follow from the others.
 async fn put_invoice_compliance(
     State(state): State<ReferenceState>,
@@ -896,6 +917,13 @@ async fn put_invoice_compliance(
     if !EINVOICE_APPLICABILITY.contains(&einvoice.as_str()) {
         return Err(validation(
             "einvoiceApplicability",
+            "must be unknown, not_required, or required",
+        ));
+    }
+    let dynamic_qr = request.dynamic_qr_applicability.trim().to_ascii_lowercase();
+    if !DYNAMIC_QR_APPLICABILITY.contains(&dynamic_qr.as_str()) {
+        return Err(validation(
+            "dynamicQrApplicability",
             "must be unknown, not_required, or required",
         ));
     }
@@ -937,15 +965,23 @@ async fn put_invoice_compliance(
         .begin()
         .await
         .map_err(|_| StoreProfileError::Internal)?;
-    let current: Option<(String, i64, String, String, String, Option<String>)> = sqlx::query_as(
+    let current: Option<InvoiceFactsRow> = sqlx::query_as(
         "SELECT store_id,revision,rule46s_declaration_applicability,einvoice_applicability,\
-         hsn_turnover_band,hsn_turnover_financial_year FROM store_identity LIMIT 1",
+         hsn_turnover_band,hsn_turnover_financial_year,dynamic_qr_applicability \
+         FROM store_identity LIMIT 1",
     )
     .fetch_optional(&mut *transaction)
     .await
     .map_err(map_database_error)?;
-    let (store_id, revision, previous_declaration, previous_einvoice, previous_band, previous_year) =
-        current.ok_or(StoreProfileError::NotFound)?;
+    let InvoiceFactsRow {
+        store_id,
+        revision,
+        rule46s_declaration_applicability: previous_declaration,
+        einvoice_applicability: previous_einvoice,
+        hsn_turnover_band: previous_band,
+        hsn_turnover_financial_year: previous_year,
+        dynamic_qr_applicability: previous_dynamic_qr,
+    } = current.ok_or(StoreProfileError::NotFound)?;
     if revision != request.expected_revision {
         return Err(StoreProfileError::Revision {
             expected: request.expected_revision,
@@ -956,12 +992,13 @@ async fn put_invoice_compliance(
     let next = revision + 1;
     sqlx::query(
         "UPDATE store_identity SET revision=?,rule46s_declaration_applicability=?,\
-         einvoice_applicability=?,hsn_turnover_band=?,hsn_turnover_financial_year=? \
-         WHERE store_id=? AND revision=?",
+         einvoice_applicability=?,dynamic_qr_applicability=?,hsn_turnover_band=?,\
+         hsn_turnover_financial_year=? WHERE store_id=? AND revision=?",
     )
     .bind(next)
     .bind(&declaration)
     .bind(&einvoice)
+    .bind(&dynamic_qr)
     .bind(&band)
     .bind(&financial_year)
     .bind(&store_id)
@@ -982,12 +1019,14 @@ async fn put_invoice_compliance(
                 "previous": {
                     "rule46sDeclarationApplicability": previous_declaration,
                     "einvoiceApplicability": previous_einvoice,
+                    "dynamicQrApplicability": previous_dynamic_qr,
                     "hsnTurnoverBand": previous_band,
                     "hsnTurnoverFinancialYear": previous_year,
                 },
                 "next": {
                     "rule46sDeclarationApplicability": declaration,
                     "einvoiceApplicability": einvoice,
+                    "dynamicQrApplicability": dynamic_qr,
                     "hsnTurnoverBand": band,
                     "hsnTurnoverFinancialYear": financial_year,
                 },

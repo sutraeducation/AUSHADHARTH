@@ -125,6 +125,10 @@ type Options = {
   failList?: boolean;
   /** The Store's GST registration, as the quote reports it. Registered unless a test says not. */
   seller?: "registered" | "unregistered";
+  /** Notification No. 14/2020-CT as the quote reports it; "not_required" for a registered seller. */
+  dynamicQr?: "unknown" | "not_required" | "required" | null;
+  /** The quote's flag for a registered customer's mixed taxable/untaxed bill. */
+  mixedSupply?: boolean;
 };
 
 /**
@@ -175,6 +179,8 @@ function saleService(options: Options = {}) {
     return {
       recipientParticulars: requirementFor(document, taxable),
       sellerGstRegistrationStatus: sellerRegistered ? "registered" : "unregistered",
+      dynamicQrApplicability: options.dynamicQr !== undefined ? options.dynamicQr : sellerRegistered ? "not_required" : null,
+      registeredRecipientMixedSupply: options.mixedSupply ?? false,
       saleDocumentId: document.id, revision: document.revision, taxTreatment: "intra_state",
       taxableValuePaise: taxable, cgstPaise: half, sgstPaise: half, igstPaise: 0, cessPaise: 0,
       grandTotalPaise: taxable + half * 2,
@@ -745,6 +751,80 @@ describe("Point of sale", () => {
     fireEvent.click(screen.getByRole("button", { name: "Change customer" }));
     expect(screen.getByLabelText(/Customer asked for their details/)).toBeInTheDocument();
     expect(screen.queryByText(/retail cash memo, not a GST tax invoice/)).not.toBeInTheDocument();
+  });
+
+  // Phase 1L-A4 — Notification No. 14/2020-CT and document issuability at the counter.
+  it("requires the transaction reference for a UPI payment when Dynamic QR applies", async () => {
+    const service = saleService({ dynamicQr: "required", documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    await screen.findByRole("button", { name: "Take 179.20 and post" });
+    fireEvent.change(screen.getByLabelText("Paid by"), { target: { value: "upi" } });
+    const reference = screen.getByLabelText(/Transaction reference/);
+    expect(reference).toHaveAttribute("aria-required", "true");
+    expect(screen.getByText(/recorded on the invoice with the amount, mode and time/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Take 179.20 and post" }));
+    expect(await screen.findByText("Enter the card or UPI transaction reference before posting.")).toBeInTheDocument();
+    expect(writes(service).some((write) => write.path.endsWith("/post"))).toBe(false);
+    expect(document.activeElement).toBe(reference);
+
+    fireEvent.change(reference, { target: { value: "  UPI-4471 " } });
+    fireEvent.click(screen.getByRole("button", { name: "Take 179.20 and post" }));
+    const posted = await waitForWrite(service, (write) => write.path.endsWith("/post"));
+    expect(posted.body.tenders).toEqual([{ method: "upi", amountPaise: 17_920, referenceText: "UPI-4471" }]);
+  });
+
+  it("asks nothing more of a cash payment when Dynamic QR applies", async () => {
+    const service = saleService({ dynamicQr: "required", documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    fireEvent.click(await screen.findByRole("button", { name: "Take 179.20 and post" }));
+    const posted = await waitForWrite(service, (write) => write.path.endsWith("/post"));
+    expect(posted.body.tenders).toEqual([{ method: "cash", amountPaise: 17_920, referenceText: null }]);
+  });
+
+  it("keeps the reference optional where Dynamic QR does not apply", async () => {
+    const service = saleService({ dynamicQr: "not_required", documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    await screen.findByRole("button", { name: "Take 179.20 and post" });
+    fireEvent.change(screen.getByLabelText("Paid by"), { target: { value: "card" } });
+    expect(screen.getByLabelText("Reference")).not.toHaveAttribute("aria-required", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Take 179.20 and post" }));
+    const posted = await waitForWrite(service, (write) => write.path.endsWith("/post"));
+    expect(posted.body.tenders).toEqual([{ method: "card", amountPaise: 17_920, referenceText: null }]);
+  });
+
+  it("stops the counter when the Dynamic QR answer is not recorded", async () => {
+    const service = saleService({ dynamicQr: "unknown", documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByText("Dynamic QR requirement not recorded")).toBeInTheDocument();
+    expect(screen.getByText(/until the owner records it/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
+  });
+
+  it("stops a registered customer's mixed taxable and untaxed bill before posting", async () => {
+    const service = saleService({ mixedSupply: true, documents: [sale({ lines: [line()] })] });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByText("Taxable and untaxed items for a GST-registered customer")).toBeInTheDocument();
+    expect(screen.getByText(/Bill the taxable and untaxed items separately/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
+    expect(writes(service).some((write) => write.path.endsWith("/post"))).toBe(false);
+  });
+
+  it("explains the service's payment-reference refusal in the counter's words", async () => {
+    const service = saleService({
+      documents: [sale({ lines: [line()] })],
+      writeError: { code: "payment_reference_required", status: 409, extra: { issues: [{ field: "tenders[0].referenceText", message: "Enter the transaction reference." }] } }
+    });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    fireEvent.click(await screen.findByRole("button", { name: "Take 179.20 and post" }));
+    expect(await screen.findByText(/Enter the card or UPI transaction reference before posting/)).toBeInTheDocument();
+    expect(screen.queryByText("raw backend detail")).not.toBeInTheDocument();
   });
 
   it("names a registered customer without making every sale ask for one", async () => {

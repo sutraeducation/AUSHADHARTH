@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
+  DynamicQrApplicability,
   EinvoiceApplicability,
   GstRegistrationStatus,
   HsnTurnoverBand,
@@ -43,6 +44,12 @@ const EINVOICE_LABELS: Record<EinvoiceApplicability, string> = {
   unknown: "Not recorded yet",
   not_required: "Not required",
   required: "Required: sales to registered customers are refused"
+};
+
+const DYNAMIC_QR_LABELS: Record<DynamicQrApplicability, string> = {
+  unknown: "Not recorded yet",
+  not_required: "Not required",
+  required: "Required: payment details recorded on each invoice"
 };
 
 const HSN_BAND_LABELS: Record<HsnTurnoverBand, string> = {
@@ -160,6 +167,7 @@ export function StoreProfilePage() {
           <dl className="detail-grid">
             <div><dt>Rule 46(s) declaration</dt><dd>{RULE46S_LABELS[profile.data.rule46sDeclarationApplicability]}</dd></div>
             <div><dt>E-invoicing for registered customers (Rule 48(4))</dt><dd>{EINVOICE_LABELS[profile.data.einvoiceApplicability]}</dd></div>
+            <div><dt>Dynamic QR for unregistered customers (Notification 14/2020)</dt><dd>{DYNAMIC_QR_LABELS[profile.data.dynamicQrApplicability]}</dd></div>
             <div><dt>Aggregate turnover band (HSN digits)</dt><dd>{HSN_BAND_LABELS[profile.data.hsnTurnoverBand]}</dd></div>
             <div><dt>Applies to invoices in financial year</dt><dd>{profile.data.hsnTurnoverFinancialYear ?? "—"}</dd></div>
           </dl>
@@ -528,6 +536,7 @@ function InvoiceFactsDialog({ current, onClose, onSaved }: {
 }) {
   const [declaration, setDeclaration] = useState<Rule46sDeclarationApplicability>(current.rule46sDeclarationApplicability);
   const [einvoice, setEinvoice] = useState<EinvoiceApplicability>(current.einvoiceApplicability);
+  const [dynamicQr, setDynamicQr] = useState<DynamicQrApplicability>(current.dynamicQrApplicability);
   const [band, setBand] = useState<HsnTurnoverBand>(current.hsnTurnoverBand);
   const [financialYear, setFinancialYear] = useState(current.hsnTurnoverFinancialYear ?? "");
   const [error, setError] = useState<string | null>(null);
@@ -537,6 +546,7 @@ function InvoiceFactsDialog({ current, onClose, onSaved }: {
       expectedRevision: current.revision,
       rule46sDeclarationApplicability: declaration,
       einvoiceApplicability: einvoice,
+      dynamicQrApplicability: dynamicQr,
       hsnTurnoverBand: band,
       // A year belongs to a band; with no band there is nothing for it to qualify.
       hsnTurnoverFinancialYear: band === "unknown" ? null : financialYear.trim()
@@ -572,6 +582,15 @@ function InvoiceFactsDialog({ current, onClose, onSaved }: {
           <option value="required">Required</option>
         </select>
         <small>A separate question: whether your business must issue e-invoices to GST-registered customers. Only sales to those customers depend on it. AUSHADHARTH cannot issue e-invoices, so while this is “Required” those sales are refused.</small>
+      </div>
+      <div className="field">
+        <label htmlFor="facts-dynamic-qr">Dynamic QR for unregistered customers (Notification 14/2020)</label>
+        <select id="facts-dynamic-qr" value={dynamicQr} onChange={(event) => setDynamicQr(event.target.value as DynamicQrApplicability)}>
+          <option value="unknown">Not recorded yet</option>
+          <option value="not_required">Not required</option>
+          <option value="required">Required</option>
+        </select>
+        <small>A third question, separate from both above: whether your business’s aggregate turnover exceeded ₹500 crore in any financial year since 2017-18, outside the notification’s exclusions. It affects only GST invoices to unregistered customers. AUSHADHARTH does not generate a QR code: every sale here is paid in full before the invoice is issued, so where this is “Required” it records the payment details on the invoice instead, and a card or UPI payment needs its transaction reference.</small>
       </div>
       <div className="field">
         <label htmlFor="facts-band">Aggregate turnover in the preceding financial year</label>

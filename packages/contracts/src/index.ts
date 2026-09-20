@@ -1322,7 +1322,15 @@ export const SaleQuoteSchema = z.object({
   cessPaise: z.number().int(),
   grandTotalPaise: z.number().int(),
   lines: z.array(SaleQuoteLineSchema).default([]),
-  recipientParticulars: z.lazy(() => RecipientRequirementSchema)
+  recipientParticulars: z.lazy(() => RecipientRequirementSchema),
+  /**
+   * Phase 1L-A4: Notification No. 14/2020-CT for this bill. Null where it cannot apply; otherwise
+   * the Store's answer. "unknown" means posting will be refused; "required" means a card or UPI
+   * payment needs its transaction reference.
+   */
+  dynamicQrApplicability: z.enum(["unknown", "not_required", "required"]).nullable(),
+  /** A registered customer's bill mixing taxable and untaxed items, which posting refuses. */
+  registeredRecipientMixedSupply: z.boolean()
 });
 
 /** Why an invoice must show recipient particulars: Rule 46(d), 46(e) and 46(f) respectively. */
@@ -1365,6 +1373,11 @@ export const SaleErrorCodeSchema = z.enum([
   "sale_compliance_incomplete",
   // Phase 1L-A3: Rule 48(4) requires an e-invoice for this registered customer; none can be issued.
   "einvoice_required_unsupported",
+  // Phase 1L-A4: a card or UPI payment needs its transaction reference as the invoice's payment
+  // cross-reference under Notification No. 14/2020-CT.
+  "payment_reference_required",
+  // Phase 1L-A4: a registered customer's bill cannot mix taxable and untaxed items.
+  "registered_recipient_mixed_supply_unsupported",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -2097,6 +2110,13 @@ export const Rule46sDeclarationApplicabilitySchema = z.enum(["unknown", "not_app
 /** Whether CGST Rule 48(4) requires this business to e-invoice supplies to registered persons. */
 export const EinvoiceApplicabilitySchema = z.enum(["unknown", "not_required", "required"]);
 
+/**
+ * Whether Notification No. 14/2020-CT (Dynamic QR on invoices to unregistered customers) applies to
+ * this business, as the owner recorded it. A third separate fact: neither Rule 46(s) nor Rule 48(4)
+ * answers it. AUSHADHARTH generates no QR.
+ */
+export const DynamicQrApplicabilitySchema = z.enum(["unknown", "not_required", "required"]);
+
 /** Aggregate turnover in the preceding financial year, as Notification No. 78/2020-CT bands it. */
 export const HsnTurnoverBandSchema = z.enum(["unknown", "up_to_5_crore", "above_5_crore"]);
 
@@ -2104,6 +2124,7 @@ export const UpdateInvoiceComplianceRequestSchema = z.object({
   expectedRevision: z.number().int().positive(),
   rule46sDeclarationApplicability: Rule46sDeclarationApplicabilitySchema,
   einvoiceApplicability: EinvoiceApplicabilitySchema,
+  dynamicQrApplicability: DynamicQrApplicabilitySchema,
   hsnTurnoverBand: HsnTurnoverBandSchema,
   hsnTurnoverFinancialYear: z.string().nullable(),
   reason: z.string().nullable().optional()
@@ -2138,6 +2159,8 @@ export const StoreProfileSchema = z.object({
   /** Phase 1L-A3 facts only the pharmacy can know. Never computed from local Sales. */
   rule46sDeclarationApplicability: Rule46sDeclarationApplicabilitySchema,
   einvoiceApplicability: EinvoiceApplicabilitySchema,
+  /** Phase 1L-A4: Notification No. 14/2020-CT applicability. */
+  dynamicQrApplicability: DynamicQrApplicabilitySchema,
   hsnTurnoverBand: HsnTurnoverBandSchema,
   /** The financial year of invoices the band governs. Null exactly when the band is unknown. */
   hsnTurnoverFinancialYear: z.string().nullable()
@@ -2293,7 +2316,9 @@ export const InvoiceSchema = z.object({
     .object({
       method: z.string(),
       amountPaise: z.number().int(),
-      referenceText: z.string().nullable()
+      referenceText: z.string().nullable(),
+      /** Phase 1L-A4: when this payment was recorded — the tender's own frozen timestamp. */
+      recordedAtUtc: z.string()
     })
     .array(),
   regulatory: z.object({
@@ -2317,7 +2342,15 @@ export const InvoiceSchema = z.object({
     hsnTurnoverBand: HsnTurnoverBandSchema.nullable(),
     hsnTurnoverFinancialYear: z.string().nullable(),
     /** 0 not required, 4 or 6 required, null not determined or not a GST document. */
-    hsnRequiredDigits: z.number().int().nullable()
+    hsnRequiredDigits: z.number().int().nullable(),
+    /** 0: posted before Phase 1L-A4, so Dynamic QR applicability is unknown. 1: frozen at posting. */
+    dynamicQrSnapshotVersion: z.number().int(),
+    /**
+     * Notification No. 14/2020-CT on a version-1 B2C tax invoice, and on an invoice-cum-bill of
+     * supply (included conservatively: no primary source settles whether the notification reaches it).
+     * Null where it cannot apply. Under "required" the tender is the payment cross-reference.
+     */
+    dynamicQrApplicability: z.enum(["not_required", "required"]).nullable()
   })
 });
 
@@ -2344,6 +2377,7 @@ export type StoreAddress = z.infer<typeof StoreAddressSchema>;
 export type StoreLicence = z.infer<typeof StoreLicenceSchema>;
 export type Rule46sDeclarationApplicability = z.infer<typeof Rule46sDeclarationApplicabilitySchema>;
 export type EinvoiceApplicability = z.infer<typeof EinvoiceApplicabilitySchema>;
+export type DynamicQrApplicability = z.infer<typeof DynamicQrApplicabilitySchema>;
 export type HsnTurnoverBand = z.infer<typeof HsnTurnoverBandSchema>;
 export type UpdateInvoiceComplianceRequest = z.infer<typeof UpdateInvoiceComplianceRequestSchema>;
 export type MissingSellerFact = z.infer<typeof MissingSellerFactSchema>;

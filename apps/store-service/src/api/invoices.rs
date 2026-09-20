@@ -127,6 +127,9 @@ pub fn routes() -> Router<ReferenceState> {
 /// exempt basket to a REGISTERED recipient falls outside Rule 46A, which is written for unregistered
 /// recipients, and this project does not guess through a tax question. The Sale still reads; what is
 /// withheld is the claim about which statutory document it is.
+///
+/// Since Phase 1L-A4 such a Sale is refused before it posts, so only a Sale posted earlier can carry
+/// this answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentType {
@@ -305,6 +308,11 @@ struct TenderRow {
     method: String,
     amount_paise: i64,
     reference_text: Option<String>,
+    /// When this payment was recorded — the tender's own timestamp, written once as the Sale was
+    /// posted and immutable since. Never the document's posting time standing in for it, and never
+    /// the time a document is rendered. With method, amount and reference it is the payment
+    /// cross-reference Circular No. 146/02/2021-GST describes.
+    recorded_at_utc: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,6 +348,16 @@ struct RegulatorySection {
     /// 0 = HSN not required on this document, 4 or 6 = required and present at that precision,
     /// null = not determined (band unknown, every line carried six digits) or not a GST document.
     hsn_required_digits: Option<i64>,
+    /// 0: posted before Phase 1L-A4, so Notification No. 14/2020-CT applicability is UNKNOWN for
+    /// this document. 1: resolved at posting.
+    dynamic_qr_snapshot_version: i64,
+    /// Notification No. 14/2020-CT: 'not_required' or 'required' on a version-1 B2C tax invoice, and on
+    /// an invoice-cum-bill of supply, which is included conservatively because no primary source
+    /// settles whether the notification reaches it; null where it cannot apply, or on a version-0
+    /// Sale. Distinct from
+    /// the Rule 46(r) IRN QR and from Rule 46(s). No QR is ever generated: under 'required' the
+    /// document carries the payment cross-reference in `tender`.
+    dynamic_qr_applicability: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -421,6 +439,8 @@ struct HeaderRow {
     hsn_turnover_band_snapshot: Option<String>,
     hsn_turnover_financial_year_snapshot: Option<String>,
     hsn_required_digits: Option<i64>,
+    dynamic_qr_snapshot_version: i64,
+    dynamic_qr_applicability_snapshot: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -479,7 +499,8 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
          delivery_address_line1,delivery_address_line2,delivery_city,delivery_postal_code,\
          delivery_state_name,delivery_state_code,seller_retail_licence_text,\
          compliance_snapshot_version,rule46s_declaration_snapshot,einvoice_applicability_snapshot,\
-         hsn_turnover_band_snapshot,hsn_turnover_financial_year_snapshot,hsn_required_digits \
+         hsn_turnover_band_snapshot,hsn_turnover_financial_year_snapshot,hsn_required_digits,\
+         dynamic_qr_snapshot_version,dynamic_qr_applicability_snapshot \
          FROM sale_documents WHERE id=?",
     )
     .bind(id)
@@ -504,8 +525,9 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
     .await
     .map_err(|_| InvoiceError::Internal)?;
 
-    let tender = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT method,amount_paise,reference_text FROM sale_tenders WHERE sale_document_id=? \
+    let tender = sqlx::query_as::<_, (String, i64, Option<String>, String)>(
+        "SELECT method,amount_paise,reference_text,created_at_utc FROM sale_tenders \
+         WHERE sale_document_id=? \
          ORDER BY created_at_utc,id",
     )
     .bind(id)
@@ -583,11 +605,14 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
         },
         tender: tender
             .into_iter()
-            .map(|(method, amount_paise, reference_text)| TenderRow {
-                method,
-                amount_paise,
-                reference_text,
-            })
+            .map(
+                |(method, amount_paise, reference_text, recorded_at_utc)| TenderRow {
+                    method,
+                    amount_paise,
+                    reference_text,
+                    recorded_at_utc,
+                },
+            )
             .collect(),
         regulatory: RegulatorySection {
             legacy_document: legacy,
@@ -602,6 +627,8 @@ pub(crate) async fn build(pool: &SqlitePool, id: &str) -> Result<InvoiceResponse
             hsn_turnover_band: header.hsn_turnover_band_snapshot.clone(),
             hsn_turnover_financial_year: header.hsn_turnover_financial_year_snapshot.clone(),
             hsn_required_digits: header.hsn_required_digits,
+            dynamic_qr_snapshot_version: header.dynamic_qr_snapshot_version,
+            dynamic_qr_applicability: header.dynamic_qr_applicability_snapshot.clone(),
         },
     })
 }
@@ -831,7 +858,7 @@ fn check_invariants(
     header: &HeaderRow,
     lines: &[InvoiceLine],
     summary: &[TaxSummaryRow],
-    tender: &[(String, i64, Option<String>)],
+    tender: &[(String, i64, Option<String>, String)],
 ) -> Result<(), InvoiceError> {
     fn sum(mut values: impl Iterator<Item = i64>) -> Option<i64> {
         values.try_fold(0_i64, |total, value| total.checked_add(value))

@@ -1,5 +1,6 @@
 import {
   StoreProfileSchema,
+  type DynamicQrApplicability,
   type EinvoiceApplicability,
   type HsnTurnoverBand,
   type Rule46sDeclarationApplicability,
@@ -57,6 +58,7 @@ export interface InvoiceComplianceInput {
   expectedRevision: number;
   rule46sDeclarationApplicability: Rule46sDeclarationApplicability;
   einvoiceApplicability: EinvoiceApplicability;
+  dynamicQrApplicability: DynamicQrApplicability;
   hsnTurnoverBand: HsnTurnoverBand;
   hsnTurnoverFinancialYear: string | null;
   reason?: string;

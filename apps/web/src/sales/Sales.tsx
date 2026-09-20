@@ -353,6 +353,13 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
   // as lines are added and removed, because the ₹50,000 line is judged on the bill as it stands.
   const requirement = quote.data?.recipientParticulars;
   const particularsMissing = Boolean(requirement && requirement.missing.length > 0);
+  // Phase 1L-A4. Notification No. 14/2020-CT as the Store Service judged it for this bill: null when
+  // it cannot apply. Under "required" the invoice records the payment cross-reference, so a card or
+  // UPI payment needs its transaction reference. The Store Service decides; this only says so first.
+  const dynamicQr = quote.data?.dynamicQrApplicability ?? null;
+  const dynamicQrUnknown = dynamicQr === "unknown";
+  const referenceRequired = dynamicQr === "required" && tenderMethod !== "cash";
+  const mixedSupply = quote.data?.registeredRecipientMixedSupply === true;
 
   const openCustomerDetails = () => {
     setCustomerOpen(true);
@@ -375,6 +382,11 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
     if (particularsMissing) {
       setNotice("Add the customer's details to this invoice before posting.");
       openCustomerDetails();
+      return;
+    }
+    if (referenceRequired && !tenderReference.trim()) {
+      setNotice("Enter the card or UPI transaction reference before posting.");
+      document.getElementById("pos-tender-reference")?.focus();
       return;
     }
     inFlight.current = true;
@@ -528,6 +540,16 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           <button className="button button--secondary" type="button" onClick={openCustomerDetails}>Add customer details</button>
         </div>}
 
+        {dynamicQrUnknown && <div className="panel-callout panel-callout--blocking" role="status">
+          <strong>Dynamic QR requirement not recorded</strong>
+          <small>This pharmacy has not recorded in Store Profile whether the Dynamic QR requirement for GST invoices to unregistered customers applies to it. This sale cannot be posted until the owner records it.</small>
+        </div>}
+
+        {mixedSupply && <div className="panel-callout panel-callout--blocking" role="status">
+          <strong>Taxable and untaxed items for a GST-registered customer</strong>
+          <small>AUSHADHARTH cannot issue one document for this mix to a GST-registered customer. Bill the taxable and untaxed items separately.</small>
+        </div>}
+
         <div className="field">
           <label htmlFor="pos-tender-method">Paid by</label>
           <select id="pos-tender-method" value={tenderMethod} onChange={(event) => setTenderMethod(event.target.value as TenderMethod)}>
@@ -535,11 +557,12 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           </select>
         </div>
         {tenderMethod !== "cash" && <div className="field">
-          <label htmlFor="pos-tender-reference">Reference</label>
-          <input id="pos-tender-reference" value={tenderReference} onChange={(event) => setTenderReference(event.target.value)} placeholder="Approval or UPI reference" />
+          <label htmlFor="pos-tender-reference">{referenceRequired ? "Transaction reference" : "Reference"}{referenceRequired && <span aria-hidden="true"> *</span>}</label>
+          <input id="pos-tender-reference" value={tenderReference} onChange={(event) => setTenderReference(event.target.value)} placeholder="Approval or UPI reference" aria-required={referenceRequired} aria-describedby={referenceRequired ? "pos-tender-reference-help" : undefined} />
+          {referenceRequired && <small id="pos-tender-reference-help">Required. It is recorded on the invoice with the amount, mode and time as the payment details.</small>}
         </div>}
 
-        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing}>
+        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing || dynamicQrUnknown || mixedSupply}>
           {post.isPending ? "Posting…" : quote.data ? `Take ${paiseToAmountText(quote.data.grandTotalPaise)} and post` : "Post"}
         </button>
         <p className="pos-summary__note">{quote.data?.sellerGstRegistrationStatus === "unregistered"
