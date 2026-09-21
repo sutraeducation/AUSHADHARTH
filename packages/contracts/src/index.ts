@@ -1298,6 +1298,29 @@ export const SellableBatchSchema = z.object({
  * amount before taking money — and so a price the posting would refuse is discovered while the
  * customer is still standing there.
  */
+/* ------------------------------------------------------------------------------------------------
+ * Phase 1M-A — what the Drugs Rules say about a product
+ *
+ * Independent schemes, never one enum: Rule 97(1)(b)-(f) labels Schedule H, H within NDPS purview,
+ * Schedule X, Schedule H1 and H1 within NDPS purview as separate cases, so NDPS purview crosses the
+ * schedules rather than sitting beside them. Each scheme answers `applies`, `does_not_apply` or
+ * `unknown`, and `unknown` is the absence of a finding — never a quiet "does not apply".
+ * ---------------------------------------------------------------------------------------------- */
+
+export const RegulatorySchemeSchema = z.enum([
+  "schedule_h",
+  "schedule_h1",
+  "schedule_x",
+  "schedule_c",
+  "schedule_c1",
+  "ndps_purview"
+]);
+
+export const RegulatoryAnswerSchema = z.enum(["applies", "does_not_apply", "unknown"]);
+
+/** What a Sale of this product would do today: sell, refuse as unresolved, or refuse as pending. */
+export const RegulatoryGateSchema = z.enum(["clear", "unresolved", "workflow_unavailable"]);
+
 export const SaleQuoteLineSchema = z.object({
   id: z.string(),
   lineNumber: z.number().int().positive(),
@@ -1306,7 +1329,15 @@ export const SaleQuoteLineSchema = z.object({
   sgstPaise: z.number().int(),
   igstPaise: z.number().int(),
   cessPaise: z.number().int(),
-  lineTotalPaise: z.number().int()
+  lineTotalPaise: z.number().int(),
+  /**
+   * Phase 1M-A. What the Drugs Rules say about this line on the Sale's business date: `clear`,
+   * `unresolved` (a medicine nobody has classified) or `workflow_unavailable` (lawfully
+   * sellable only with a statutory record this version does not keep). The quote explains;
+   * posting decides, and re-resolves for itself.
+   */
+  regulatoryGate: RegulatoryGateSchema,
+  regulatoryGateScheme: RegulatorySchemeSchema.nullable()
 });
 
 export const SaleQuoteSchema = z.object({
@@ -1378,6 +1409,10 @@ export const SaleErrorCodeSchema = z.enum([
   "payment_reference_required",
   // Phase 1L-A4: a registered customer's bill cannot mix taxable and untaxed items.
   "registered_recipient_mixed_supply_unsupported",
+  // Phase 1M-A: a medicine with no recorded schedule position cannot be sold.
+  "regulatory_classification_unresolved",
+  // Phase 1M-A: the line needs a prescription or register this version does not implement yet.
+  "regulated_sale_workflow_not_available",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -2387,3 +2422,135 @@ export type InvoiceSellerSnapshot = z.infer<typeof InvoiceSellerSnapshotSchema>;
 export type InvoiceLine = z.infer<typeof InvoiceLineSchema>;
 export type Invoice = z.infer<typeof InvoiceSchema>;
 export type StoreProfileErrorCode = z.infer<typeof StoreProfileErrorCodeSchema>;
+
+/* ------------------------------------------------------------------------------------------------
+ * Phase 1M-A — regulatory classification and the professional foundations
+ * ---------------------------------------------------------------------------------------------- */
+
+/** One finding: a product is inside or outside one scheme for one period, on a named authority. */
+export const RegulatoryClassificationSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  scheme: RegulatorySchemeSchema,
+  applies: z.boolean(),
+  effectiveFrom: z.string(),
+  /** Half-open: the finding governs dates before this one. Null means still in force. */
+  effectiveTo: z.string().nullable(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable(),
+  determinedByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string()
+});
+
+export const ProductRegulatorySchema = z.object({
+  productId: z.string(),
+  productKind: z.string(),
+  classifications: z.array(RegulatoryClassificationSchema),
+  resolved: z.array(z.object({ scheme: RegulatorySchemeSchema, answer: RegulatoryAnswerSchema })),
+  resolvedOn: z.string(),
+  saleGate: RegulatoryGateSchema,
+  saleGateScheme: RegulatorySchemeSchema.nullable(),
+  /** Hundredths of one per cent v/v. A label fact; it classifies nothing by itself. */
+  alcoholPercentVvHundredths: z.number().int().nullable(),
+  attributesRevision: z.number().int().nullable()
+});
+
+export const CreateRegulatoryClassificationRequestSchema = z.object({
+  scheme: RegulatorySchemeSchema,
+  applies: z.boolean(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable().optional(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable().optional()
+});
+
+export const ProfessionalCapacitySchema = z.enum(["registered_pharmacist", "competent_person"]);
+
+/**
+ * A person the Drugs Rules name — not a login. `users.role = "pharmacist"` is a permission this
+ * software grants and is no evidence of registration under the Pharmacy Act, 1948.
+ */
+export const StoreProfessionalSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  fullName: z.string(),
+  capacity: ProfessionalCapacitySchema,
+  /** Withheld from anyone who is not an owner. */
+  registrationNumber: z.string().nullable(),
+  registeringAuthority: z.string().nullable(),
+  validFrom: z.string().nullable(),
+  validUpto: z.string().nullable(),
+  linkedUserId: z.string().nullable()
+});
+
+/** Rule 61: the licence forms, as a typed assertion — never parsed from display text. */
+export const LicenceFormSchema = z.enum([
+  "form_20",
+  "form_20a",
+  "form_20b",
+  "form_20f",
+  "form_20g",
+  "form_21",
+  "form_21a",
+  "form_21b"
+]);
+
+export const ComplianceLicenceSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  licenceForm: LicenceFormSchema,
+  licenceNumber: z.string(),
+  issuingAuthority: z.string().nullable(),
+  validFrom: z.string().nullable(),
+  validUpto: z.string().nullable(),
+  displayLicenceId: z.string().nullable()
+});
+
+/** Rule 65(3)(2) and rule 65(4)(2): two separate elections, each made once, in writing. */
+export const RecordElectionKindSchema = z.enum([
+  "rule_65_3_prescription_supply",
+  "rule_65_4_non_prescription_schedule_c"
+]);
+
+export const RecordElectionMethodSchema = z.enum([
+  "prescription_register",
+  "register",
+  "cash_or_credit_memo_book"
+]);
+
+export const RecordElectionSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  election: RecordElectionKindSchema,
+  method: RecordElectionMethodSchema,
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  evidenceReference: z.string().nullable(),
+  reason: z.string().nullable()
+});
+
+export const DrugComplianceSchema = z.object({
+  complianceLicences: z.array(ComplianceLicenceSchema),
+  recordElections: z.array(RecordElectionSchema),
+  professionals: z.array(StoreProfessionalSchema)
+});
+
+export type RegulatoryScheme = z.infer<typeof RegulatorySchemeSchema>;
+export type RegulatoryAnswer = z.infer<typeof RegulatoryAnswerSchema>;
+export type RegulatoryGate = z.infer<typeof RegulatoryGateSchema>;
+export type RegulatoryClassification = z.infer<typeof RegulatoryClassificationSchema>;
+export type ProductRegulatory = z.infer<typeof ProductRegulatorySchema>;
+export type CreateRegulatoryClassificationRequest = z.infer<typeof CreateRegulatoryClassificationRequestSchema>;
+export type ProfessionalCapacity = z.infer<typeof ProfessionalCapacitySchema>;
+export type StoreProfessional = z.infer<typeof StoreProfessionalSchema>;
+export type LicenceForm = z.infer<typeof LicenceFormSchema>;
+export type ComplianceLicence = z.infer<typeof ComplianceLicenceSchema>;
+export type RecordElectionKind = z.infer<typeof RecordElectionKindSchema>;
+export type RecordElectionMethod = z.infer<typeof RecordElectionMethodSchema>;
+export type RecordElection = z.infer<typeof RecordElectionSchema>;
+export type DrugCompliance = z.infer<typeof DrugComplianceSchema>;

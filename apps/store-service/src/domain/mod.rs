@@ -6,6 +6,7 @@ pub mod parties;
 pub mod price_control;
 pub mod recipient;
 pub mod references;
+pub mod regulatory;
 pub mod returns;
 pub mod sales;
 pub mod stock_operations;

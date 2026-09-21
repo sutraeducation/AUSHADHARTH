@@ -17,7 +17,9 @@ import type {
   SellableBatch,
   TenderMethod
 } from "@aushadharth/contracts";
+import type { RegulatoryGate, RegulatoryScheme } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
+import { SCHEME_LABELS } from "../regulatory/regulatoryApi";
 import { businessToday } from "../platform/businessDate";
 import { LocalServiceError } from "../platform/localService";
 import { listParties } from "../parties/partyApi";
@@ -221,6 +223,7 @@ const EMPTY_ENTRY: EntryState = {
  */
 function PointOfSale({ sale }: { sale: SaleDetail }) {
   const queryClient = useQueryClient();
+  const auth = useAuth();
   const [entry, setEntry] = useState<EntryState>(EMPTY_ENTRY);
   const [notice, setNotice] = useState<string | null>(null);
   const [tenderMethod, setTenderMethod] = useState<TenderMethod>("cash");
@@ -360,6 +363,11 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
   const dynamicQrUnknown = dynamicQr === "unknown";
   const referenceRequired = dynamicQr === "required" && tenderMethod !== "cash";
   const mixedSupply = quote.data?.registeredRecipientMixedSupply === true;
+  // Phase 1M-A: the quote says, line by line, what the Drugs Rules gate will do at posting. The
+  // counter is told before tendering; posting re-resolves and refuses independently.
+  const regulatoryByLine = new Map((quote.data?.lines ?? []).map((line) => [line.id, line]));
+  const regulatoryBlocked = (quote.data?.lines ?? []).some((line) => line.regulatoryGate !== "clear");
+  const canClassify = auth.status?.user?.role === "owner_admin";
 
   const openCustomerDetails = () => {
     setCustomerOpen(true);
@@ -503,7 +511,7 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
               <thead><tr><th scope="col">#</th><th scope="col">Item</th><th scope="col">Batch</th><th scope="col" className="numeric">Quantity</th><th scope="col" className="numeric">Rate</th><th scope="col" className="numeric">Value</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>{sale.lines.map((line) => <tr key={line.id}>
                 <td data-label="#">{line.lineNumber}</td>
-                <td data-label="Item">{line.productDisplayName ?? line.currentProductDisplayName ?? line.productId}</td>
+                <td data-label="Item">{line.productDisplayName ?? line.currentProductDisplayName ?? line.productId}<RegulatoryLineState gate={regulatoryByLine.get(line.id)?.regulatoryGate} scheme={regulatoryByLine.get(line.id)?.regulatoryGateScheme ?? null} productId={line.productId} canClassify={canClassify} /></td>
                 <td data-label="Batch">{line.batchNumber ?? line.currentBatchNumber ?? <span className="row-subtext">Not found</span>}</td>
                 <td data-label="Quantity" className="numeric">{quantityText(line)}</td>
                 <td data-label="Rate" className="numeric">{paiseToAmountText(line.sellingRatePaise)}</td>
@@ -545,6 +553,11 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           <small>This pharmacy has not recorded in Store Profile whether the Dynamic QR requirement for GST invoices to unregistered customers applies to it. This sale cannot be posted until the owner records it.</small>
         </div>}
 
+        {regulatoryBlocked && <div className="panel-callout panel-callout--blocking" role="status" data-testid="regulatory-blocked">
+          <strong>A line cannot be sold yet</strong>
+          <small>A medicine on this bill has no recorded schedule position, or is classified within a schedule whose prescription or register requirements this version does not provide. Remove the line to post the rest.</small>
+        </div>}
+
         {mixedSupply && <div className="panel-callout panel-callout--blocking" role="status">
           <strong>Taxable and untaxed items for a GST-registered customer</strong>
           <small>AUSHADHARTH cannot issue one document for this mix to a GST-registered customer. Bill the taxable and untaxed items separately.</small>
@@ -562,7 +575,7 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           {referenceRequired && <small id="pos-tender-reference-help">Required. It is recorded on the invoice with the amount, mode and time as the payment details.</small>}
         </div>}
 
-        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing || dynamicQrUnknown || mixedSupply}>
+        <button className="button button--primary button--full" type="button" onClick={submitPost} disabled={post.isPending || sale.lines.length === 0 || !quote.data || particularsMissing || dynamicQrUnknown || mixedSupply || regulatoryBlocked}>
           {post.isPending ? "Posting…" : quote.data ? `Take ${paiseToAmountText(quote.data.grandTotalPaise)} and post` : "Post"}
         </button>
         <p className="pos-summary__note">{quote.data?.sellerGstRegistrationStatus === "unregistered"
@@ -962,6 +975,26 @@ function postingProblem(caught: unknown): string {
 
 function isStale(error: unknown): boolean {
   return error instanceof LocalServiceError && error.code === "revision_conflict";
+}
+
+/**
+ * Phase 1M-A — what the Drugs Rules gate says about one line, in words, only when it is not clear.
+ * An ordinary line shows nothing extra: the counter is not slowed for toothpaste.
+ */
+function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
+  gate: RegulatoryGate | undefined;
+  scheme: RegulatoryScheme | null;
+  productId: string;
+  canClassify: boolean;
+}) {
+  if (!gate || gate === "clear") return null;
+  const text = gate === "unresolved"
+    ? "Classification unresolved — not sellable until recorded"
+    : `${scheme ? SCHEME_LABELS[scheme] : "Regulated"} — prescription workflow not yet available`;
+  return <small className={`regulatory-line regulatory-line--${gate}`} role="note">
+    {text}
+    {gate === "unresolved" && canClassify && <> · <Link to={`/app/products/${productId}`}>Classify</Link></>}
+  </small>;
 }
 
 function Loading({ label }: { label: string }) { return <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>{label}</b></div>; }

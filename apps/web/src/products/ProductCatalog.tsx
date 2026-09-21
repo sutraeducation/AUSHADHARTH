@@ -26,6 +26,7 @@ import { listReferences } from "../reference/referenceApi";
 import { CatalogDialog } from "./CatalogDialog";
 import { PriceControlSection } from "./PriceControl";
 import { TaxClassificationSection } from "./TaxClassification";
+import { RegulatoryClassificationSection } from "../regulatory/ProductRegulatory";
 import {
   atomsToQuantity,
   changeBarcodeLifecycle,
@@ -276,6 +277,7 @@ export function ProductDetailPage() {
     <section className="catalog-overview" aria-label="Product overview"><Info label="Status"><Status value={record.status} /></Info><Info label="Brand">{referenceName(references.data?.brands, record.brandId, refState)}</Info><Info label="Dosage Form">{referenceName(references.data?.dosageForms, record.dosageFormId, refState)}</Info><Info label="Quantity precision">{record.quantityScale === 0 ? "Whole units" : `${record.quantityScale} decimal places`}</Info><Info label="Formulation">{record.formulationDescriptor || "—"}</Info><Info label="Route / release">{[record.routeDescriptor, record.releaseDescriptor].filter(Boolean).join(" · ") || "—"}</Info></section>
     <TaxClassificationSection product={record} canMutate={canMutate} />
     {record.productKind === "medicine" && <PriceControlSection product={record} canMutate={canMutate} />}
+    <RegulatoryClassificationSection product={record} canMutate={canMutate} />
     <CatalogSection title="Company Roles" description="A Product may have multiple manufacturers, marketers, brand owners, and importers." action={canMutate && record.status === "active" ? <button className="button button--secondary" type="button" onClick={() => setDialog({ kind: "role" })}>Add Company Role</button> : undefined}>
       <RoleTable roles={record.companyRoles} companies={references.data?.companies} referenceState={refState} canMutate={canMutate} onEdit={(role) => setDialog({ kind: "role", roleId: role.id })} onLifecycle={(role) => setDialog({ kind: "role-lifecycle", roleId: role.id })} />
     </CatalogSection>

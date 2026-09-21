@@ -36,6 +36,7 @@ use crate::domain::{
     recipient::{
         self, AddressFacts, MissingRecipientFact, PartyBilling, PartyRecipient, RecipientSource,
     },
+    regulatory,
     sales::{self, QuantityBasis, SaleMoneyError, SaleQuantity},
     store_profile::{self, MissingSellerFact},
     taxation,
@@ -84,6 +85,17 @@ pub(crate) enum SaleError {
     /// No document AUSHADHARTH issues covers it (Rule 46A is for unregistered recipients), so it is
     /// refused before anything is posted rather than left without a document afterwards.
     RegisteredRecipientMixedSupply,
+    /// Phase 1M-A: a medicine nobody has placed inside or outside the schedules. Not knowing
+    /// whether a drug is Schedule H is not a reason to hand it over.
+    RegulatoryClassificationUnresolved {
+        line_number: i64,
+    },
+    /// Phase 1M-A: lawfully sellable, but only with a statutory record this software does not yet
+    /// keep. Refused rather than sold without one.
+    RegulatedSaleWorkflowNotAvailable {
+        line_number: i64,
+        scheme: &'static str,
+    },
     ClassificationIncomplete,
     TaxRateNotFound,
     PackMismatch,
@@ -265,6 +277,41 @@ impl IntoResponse for SaleError {
                     "registered_recipient_mixed_supply_unsupported",
                     "A GST-registered customer's bill cannot mix taxable and untaxed items. Bill them separately.",
                 ),
+            ),
+            Self::RegulatoryClassificationUnresolved { line_number } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "regulatory_classification_unresolved",
+                    message: "This medicine has no recorded schedule position, so it cannot be sold yet.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message:
+                            "Record whether this medicine is within Schedule H, H1, X, C or C(1) before selling it."
+                                .to_owned(),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::RegulatedSaleWorkflowNotAvailable {
+                line_number,
+                scheme,
+            } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "regulated_sale_workflow_not_available",
+                    message: "This sale needs a statutory record this version cannot keep yet.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message: format!(
+                            "This line is classified within {scheme}, whose prescription or register requirements are not implemented yet."
+                        ),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
             ),
             Self::SaleComplianceIncomplete(issues) => (
                 StatusCode::CONFLICT,
@@ -1448,6 +1495,11 @@ struct QuoteLineResponse {
     igst_paise: i64,
     cess_paise: i64,
     line_total_paise: i64,
+    /// Phase 1M-A. What the Drugs Rules say about this line on this Sale's business date, so the
+    /// counter learns before tendering what posting would refuse afterwards. The quote explains;
+    /// posting decides, and re-resolves for itself.
+    regulatory_gate: &'static str,
+    regulatory_gate_scheme: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1571,6 +1623,8 @@ async fn quote_sale(
     let mut quoted = Vec::with_capacity(lines.len());
     let mut amounts = Vec::with_capacity(lines.len());
     let mut taxable_supply = Vec::with_capacity(lines.len());
+    let regulatory =
+        resolve_regulatory_for_lines(&mut connection, &lines, &header.business_date).await?;
     for (index, line) in lines.iter().enumerate() {
         let entry = resolve_and_compute(
             &mut connection,
@@ -1589,6 +1643,17 @@ async fn quote_sale(
             igst_paise: entry.amounts.igst_paise,
             cess_paise: entry.amounts.cess_paise,
             line_total_paise: entry.amounts.line_total_paise,
+            // The same combined gate posting applies, so the counter is never told "clear" for a
+            // line posting would refuse.
+            regulatory_gate: match regulatory[index].gate {
+                regulatory::SaleGate::Clear => "clear",
+                regulatory::SaleGate::Unresolved => "unresolved",
+                regulatory::SaleGate::WorkflowUnavailable { .. } => "workflow_unavailable",
+            },
+            regulatory_gate_scheme: match regulatory[index].gate {
+                regulatory::SaleGate::WorkflowUnavailable { scheme } => Some(scheme),
+                _ => None,
+            },
         });
         taxable_supply.push((
             entry.tax_treatment_kind.clone(),
@@ -1902,6 +1967,36 @@ async fn post_within_transaction(
         return Err(SaleError::RegisteredRecipientMixedSupply);
     }
 
+    // Phase 1M-A — the Drugs Rules gate.
+    //
+    // Resolved HERE, on the same connection and inside the same `BEGIN IMMEDIATE` transaction that
+    // will write the lines, so a classification committed by another connection between the quote
+    // and this moment cannot produce a Sale judged half by the old finding and half by the new one.
+    // The frozen answer is the position on the Sale's BUSINESS DATE; the gate is the stricter of
+    // that and the position on the store's actual posting day, so a backdated draft cannot carry a
+    // drug scheduled since past the prescription rule.
+    //
+    // And it refuses here: before `allocate_document_number` below, before any inventory movement,
+    // before any tender row and before the document becomes posted. A refused Sale leaves a draft
+    // with its stock untouched and its series ungapped.
+    let regulatory = resolve_regulatory_for_lines(connection, &lines, &business_date).await?;
+    for (line, resolved) in lines.iter().zip(regulatory.iter()) {
+        match resolved.gate {
+            regulatory::SaleGate::Clear => {}
+            regulatory::SaleGate::Unresolved => {
+                return Err(SaleError::RegulatoryClassificationUnresolved {
+                    line_number: line.line_number,
+                });
+            }
+            regulatory::SaleGate::WorkflowUnavailable { scheme } => {
+                return Err(SaleError::RegulatedSaleWorkflowNotAvailable {
+                    line_number: line.line_number,
+                    scheme,
+                });
+            }
+        }
+    }
+
     // The recipient's statutory particulars are resolved HERE, once the taxable value that decides
     // Rule 46(e) is final, and on the same connection that already read the customer inside this
     // `BEGIN IMMEDIATE` transaction. Nothing is taken from the browser at this point: a named
@@ -2051,7 +2146,16 @@ async fn post_within_transaction(
     // everything else and the series has no gaps.
     let number = allocate_document_number(connection, &store_id, &business_date, &now).await?;
 
-    for (line, entry) in lines.iter().zip(computed.iter()) {
+    for ((line, entry), drugs) in lines.iter().zip(computed.iter()).zip(regulatory.iter()) {
+        // The regulatory answer is frozen in the same statement that freezes the money, so a line
+        // can never carry one without the other. `regulatory_snapshot_version = 1` means every
+        // scheme below was resolved from the classifications in force on this Sale's business date;
+        // the manufacturer is the one in force on that date, or NULL where none was recorded, which
+        // is the truth rather than today's marketer standing in for the maker.
+        let (manufacturer_company_id, manufacturer_name) = match &drugs.manufacturer {
+            Some((company_id, name)) => (Some(company_id.as_str()), Some(name.as_str())),
+            None => (None, None),
+        };
         sqlx::query(
             "UPDATE sale_lines SET product_display_name=?,pack_display_label=?,base_unit_label=?,\
              batch_number=?,batch_expires_on=?,batch_mrp_paise=?,hsn_code_id=?,hsn_code=?,\
@@ -2060,7 +2164,9 @@ async fn post_within_transaction(
              sgst_basis_points=?,igst_basis_points=?,cess_basis_points=?,price_control_status=?,\
              controlled_formulation_id=?,price_control_version_id=?,ceiling_price_paise=?,\
              ceiling_basis=?,taxable_value_paise=?,cgst_paise=?,sgst_paise=?,igst_paise=?,\
-             cess_paise=?,line_total_paise=?,updated_at_utc=? WHERE id=?",
+             cess_paise=?,line_total_paise=?,regulatory_snapshot_version=1,\
+             manufacturer_company_id=?,manufacturer_name=?,regulatory_schemes_snapshot=?,\
+             updated_at_utc=? WHERE id=?",
         )
         .bind(&entry.product_display_name)
         .bind(&entry.pack_display_label)
@@ -2089,6 +2195,9 @@ async fn post_within_transaction(
         .bind(entry.amounts.igst_paise)
         .bind(entry.amounts.cess_paise)
         .bind(entry.amounts.line_total_paise)
+        .bind(manufacturer_company_id)
+        .bind(manufacturer_name)
+        .bind(drugs.schemes.to_snapshot_json())
         .bind(&now)
         .bind(&line.id)
         .execute(&mut **connection)
@@ -2997,6 +3106,115 @@ async fn load_customer(
         normalized_gstin: party.normalized_gstin,
         state_code,
     })
+}
+
+/// Phase 1M-A — what a line resolved to under the Drugs Rules, and what its Sale will freeze.
+struct LineRegulatory {
+    /// The position on the Sale's business date. This, and only this, is frozen on the line: it is
+    /// the law of the day the document says the goods were sold.
+    schemes: regulatory::ResolvedRegulatory,
+    manufacturer: Option<(String, String)>,
+    /// The gate: the STRICTER of the business-date position and the position on the day the Sale is
+    /// actually being posted. See `resolve_regulatory_for_lines`.
+    gate: regulatory::SaleGate,
+}
+
+/// The calendar day(s) the posting instant can be in the store's own time.
+///
+/// Every store this software creates records `Asia/Kolkata`, which observes no daylight saving and
+/// sits at a fixed UTC+05:30, so its day is exact. Any other recorded zone cannot be resolved here
+/// without a time-zone database, so the answer widens to every day the instant could fall on
+/// anywhere — yesterday, today and tomorrow in UTC — and the gate takes the strictest of them. That
+/// can refuse a sale up to a day early around a commencement; it can never let one through late.
+async fn posting_days(connection: &mut PoolConnection<Sqlite>) -> Result<Vec<String>, SaleError> {
+    let zone: Option<String> =
+        sqlx::query_scalar("SELECT business_time_zone FROM store_identity LIMIT 1")
+            .fetch_optional(&mut **connection)
+            .await
+            .map_err(map_database_error)?;
+    if zone.as_deref() == Some("Asia/Kolkata") {
+        let today: String =
+            sqlx::query_scalar("SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes')")
+                .fetch_one(&mut **connection)
+                .await
+                .map_err(map_database_error)?;
+        return Ok(vec![today]);
+    }
+    let window: (String, String, String) = sqlx::query_as(
+        "SELECT strftime('%Y-%m-%d','now','-1 day'),strftime('%Y-%m-%d','now'),\
+         strftime('%Y-%m-%d','now','+1 day')",
+    )
+    .fetch_one(&mut **connection)
+    .await
+    .map_err(map_database_error)?;
+    Ok(vec![window.0, window.1, window.2])
+}
+
+/// Which of two gates refuses harder: a missing workflow outranks a missing classification, which
+/// outranks nothing.
+fn stricter(first: regulatory::SaleGate, second: regulatory::SaleGate) -> regulatory::SaleGate {
+    fn rank(gate: &regulatory::SaleGate) -> u8 {
+        match gate {
+            regulatory::SaleGate::Clear => 0,
+            regulatory::SaleGate::Unresolved => 1,
+            regulatory::SaleGate::WorkflowUnavailable { .. } => 2,
+        }
+    }
+    if rank(&second) > rank(&first) {
+        second
+    } else {
+        first
+    }
+}
+
+/// One pass over the draft's lines.
+///
+/// The frozen answer is the position on the Sale's BUSINESS DATE, because that is the law of the
+/// day the document records. The gate, though, is the stricter of that answer and the position on
+/// the day the Sale is actually being posted. Otherwise a draft dated to the day before a schedule
+/// amendment commenced would resolve as unrestricted and post after commencement — a Schedule H1
+/// drug handed over today, on paper yesterday, without the prescription rule 65(9)(a) requires.
+/// A genuine late entry of an unrestricted sale is unaffected; the only sale this refuses that the
+/// business date alone would allow is a drug scheduled since, which is the safe direction.
+///
+/// Reading the product's kind here rather than threading it through the tax computation keeps the
+/// money path exactly as Phase 1H froze it.
+async fn resolve_regulatory_for_lines(
+    connection: &mut PoolConnection<Sqlite>,
+    lines: &[DraftLine],
+    business_date: &str,
+) -> Result<Vec<LineRegulatory>, SaleError> {
+    let days = posting_days(connection).await?;
+    let mut resolved = Vec::with_capacity(lines.len());
+    for line in lines {
+        let product_kind: String =
+            sqlx::query_scalar("SELECT product_kind FROM products WHERE id=?")
+                .bind(&line.product_id)
+                .fetch_optional(&mut **connection)
+                .await
+                .map_err(map_database_error)?
+                .ok_or(SaleError::NotFound)?;
+        let schemes = regulatory::resolve_for_product(connection, &line.product_id, business_date)
+            .await
+            .map_err(map_database_error)?;
+        let mut gate = regulatory::gate(&product_kind, &schemes);
+        for day in &days {
+            let on_day = regulatory::resolve_for_product(connection, &line.product_id, day)
+                .await
+                .map_err(map_database_error)?;
+            gate = stricter(gate, regulatory::gate(&product_kind, &on_day));
+        }
+        let manufacturer =
+            regulatory::resolve_manufacturer(connection, &line.product_id, business_date)
+                .await
+                .map_err(map_database_error)?;
+        resolved.push(LineRegulatory {
+            schemes,
+            manufacturer,
+            gate,
+        });
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, FromRow)]
@@ -5497,9 +5715,13 @@ mod tests {
         sqlx::query(
             "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
              batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
-             tax_treatment_kind,taxable_value_paise,line_total_paise,created_at_utc,updated_at_utc) \
+             tax_treatment_kind,taxable_value_paise,line_total_paise,regulatory_snapshot_version,\
+             regulatory_schemes_snapshot,manufacturer_company_id,manufacturer_name,created_at_utc,\
+             updated_at_utc) \
              SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,'exempt',0,0,\
-             created_at_utc,updated_at_utc FROM sale_lines WHERE sale_document_id=? LIMIT 1",
+             regulatory_snapshot_version,regulatory_schemes_snapshot,manufacturer_company_id,\
+             manufacturer_name,created_at_utc,updated_at_utc \
+             FROM sale_lines WHERE sale_document_id=? LIMIT 1",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(&id)
@@ -7364,6 +7586,32 @@ mod tests {
             .unwrap();
     }
 
+    /// A medicine established to be outside every schedule that gates a sale.
+    ///
+    /// Since Phase 1M-A an unclassified medicine cannot be posted, so a test whose subject is
+    /// something else — the retail-memo licence, the HSN policy — needs a medicine the Drugs Rules
+    /// let it sell, or the regulatory gate answers first and the test proves nothing about its
+    /// own rule. Recorded as findings with a source, exactly as an owner would record them.
+    async fn make_lawful_medicine(f: &Fixture, product_id: &str) {
+        make_medicine(f, product_id).await;
+        for scheme in crate::domain::regulatory::SALE_GATING_SCHEMES {
+            sqlx::query(
+                "INSERT INTO product_regulatory_classifications (id,product_id,scheme,applies,\
+                 effective_from,source_citation,determined_by_user_id,revision,status,\
+                 created_at_utc,updated_at_utc) VALUES (?,?,?,0,'2020-01-01',\
+                 'Drugs Rules, 1945, Schedules as amended',?,1,'active',\
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(product_id)
+            .bind(scheme)
+            .bind(&f.owner_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        }
+    }
+
     async fn add_store_licence(f: &Fixture, licence_type: &str, number: &str, designated: bool) {
         sqlx::query(
             "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
@@ -7708,7 +7956,7 @@ mod tests {
     #[tokio::test]
     async fn a_medicine_sale_freezes_only_the_designated_licences() {
         let f = fixture().await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         add_store_licence(&f, "Form 20B", "MH-20B-9999", false).await;
         add_store_licence(&f, "Form 21", "MH-21-4321", true).await;
         let (id, status, posted) = post_line(&f, None, 8000).await;
@@ -7739,7 +7987,7 @@ mod tests {
     #[tokio::test]
     async fn a_medicine_sale_without_a_designated_licence_is_refused() {
         let f = fixture().await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         undesignate_all(&f).await;
         add_store_licence(&f, "Retail Drug Licence Form 20", "MH-RETAIL-1", false).await;
         let (_, status, body) = post_line(&f, None, 8000).await;
@@ -7778,7 +8026,7 @@ mod tests {
         assert_eq!(text, None);
 
         // Turn the same product into a medicine and the requirement is back.
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         let (_, status, body) = post_line(&f, None, 8000).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(
@@ -7802,7 +8050,7 @@ mod tests {
     #[tokio::test]
     async fn licence_changes_after_posting_never_reach_the_document() {
         let f = fixture().await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         let (id, status, _) = post_line(&f, None, 8000).await;
         assert_eq!(status, StatusCode::OK);
         let (_, before) = invoice(&f, &id).await;
@@ -7827,7 +8075,7 @@ mod tests {
     #[tokio::test]
     async fn unicode_licence_text_is_frozen_verbatim() {
         let f = fixture().await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         undesignate_all(&f).await;
         add_store_licence(&f, "फॉर्म २० <b>", "MH/२०-१२३४", true).await;
         let (id, status, posted) = post_line(&f, None, 8000).await;
@@ -8132,7 +8380,7 @@ mod tests {
     #[tokio::test]
     async fn the_compliance_snapshot_cannot_be_mutated_by_direct_sql() {
         let f = fixture().await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         let (id, status, _) = post_line(&f, None, 8000).await;
         assert_eq!(status, StatusCode::OK);
         for assignment in [
@@ -8264,7 +8512,7 @@ mod tests {
     async fn a_sale_posted_while_the_designation_moves_freezes_one_state() {
         for attempt in 0..12 {
             let f = fixture().await;
-            make_medicine(&f, &f.product_id).await;
+            make_lawful_medicine(&f, &f.product_id).await;
             add_store_licence(&f, "Form 21", "MH-21-4321", false).await;
             let id = open_sale(&f, json!({})).await;
             add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
@@ -8485,7 +8733,7 @@ mod tests {
     async fn corrective_the_drugs_memo_still_binds_an_unregistered_seller_above_fifty_thousand() {
         let f = fixture().await;
         set_seller_status(&f, "unregistered").await;
-        make_medicine(&f, &f.product_id).await;
+        make_lawful_medicine(&f, &f.product_id).await;
         undesignate_all(&f).await;
         let lot = unpriced_lot(&f).await;
         let (_, status, body) = post_unpriced(&f, &lot, json!({}), 5_000_000).await;
@@ -9320,11 +9568,15 @@ mod tests {
         add_line(&f, &id, &f.product_id, &f.pack_id, &f.batch_id, 1, 8000).await;
         add_line(&f, &id, &product, &pack, &batch, 1, 5000).await;
         // Freeze the two treatments on the draft lines, as posting would, then try the header.
+        // Since Phase 1M-A posting also freezes a regulatory answer per line; without one the
+        // regulatory gate would refuse first and this test would prove nothing about its own guard.
         sqlx::query(
             "UPDATE sale_lines SET tax_treatment_kind=CASE WHEN product_id=? THEN 'exempt' \
-             ELSE 'taxable' END WHERE sale_document_id=?",
+             ELSE 'taxable' END,regulatory_snapshot_version=1,regulatory_schemes_snapshot=? \
+             WHERE sale_document_id=?",
         )
         .bind(&product)
+        .bind(crate::domain::regulatory::ResolvedRegulatory::unknown().to_snapshot_json())
         .bind(&id)
         .execute(&f.pool)
         .await
@@ -9528,5 +9780,1466 @@ mod tests {
                 other => panic!("attempt {attempt}: {other} {}", posted.1),
             }
         }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Phase 1M-A — the Drugs Rules gate
+    //
+    // The attack these proofs defend against is a scheduled drug leaving the counter on an
+    // ordinary bill: because nobody classified it, because somebody classified it and the
+    // software sold it anyway, because a name looked harmless, or because the caller skipped the
+    // browser entirely. Rule 65(9)(a) does not care which.
+    // -------------------------------------------------------------------------------------
+
+    /// Records one finding, exactly as an owner would through the API.
+    async fn classify_scheme(
+        f: &Fixture,
+        scheme: &str,
+        applies: bool,
+        from: &str,
+        to: Option<&str>,
+    ) -> (StatusCode, Value) {
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications",
+                f.product_id
+            ),
+            json!({
+                "scheme": scheme,
+                "applies": applies,
+                "effectiveFrom": from,
+                "effectiveTo": to,
+                "sourceCitation": "G.S.R. 588(E) dated 30 August 2013",
+            }),
+        )
+        .await
+    }
+
+    /// Ends the open finding for one scheme on the given date, as an owner records a change in law.
+    async fn close_scheme(f: &Fixture, scheme: &str, effective_to: &str) {
+        let (id, revision): (String, i64) = sqlx::query_as(
+            "SELECT id,revision FROM product_regulatory_classifications \
+             WHERE product_id=? AND scheme=? AND status='active' AND effective_to IS NULL",
+        )
+        .bind(&f.product_id)
+        .bind(scheme)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications/{id}/close",
+                f.product_id
+            ),
+            json!({
+                "expectedRevision": revision,
+                "effectiveTo": effective_to,
+                "reason": "Schedule amended with effect from this date",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["effectiveTo"], effective_to);
+    }
+
+    /// Puts the product outside every gating schedule from the given date, so a sale may proceed.
+    async fn clear_every_schedule(f: &Fixture, from: &str) {
+        for scheme in crate::domain::regulatory::SALE_GATING_SCHEMES {
+            let (status, body) = classify_scheme(f, scheme, false, from, None).await;
+            assert_eq!(status, StatusCode::CREATED, "{scheme}: {body}");
+        }
+    }
+
+    async fn line_snapshot(f: &Fixture, sale_id: &str) -> (i64, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,manufacturer_name \
+             FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(sale_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    // --- 1-5. Nothing about a product's identity classifies it --------------------------------
+
+    /// 1. A medicine nobody has classified cannot be sold. Not knowing is not a licence to guess.
+    #[tokio::test]
+    async fn an_unclassified_medicine_cannot_be_posted() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, body) = post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "regulatory_classification_unresolved");
+    }
+
+    /// 2-5. A name that says "H1", an HSN code, a dosage form and a manufacturer are all
+    /// irrelevant: none of them is a finding, and the sale is refused exactly as before.
+    #[tokio::test]
+    async fn neither_name_nor_hsn_nor_dosage_form_nor_manufacturer_classifies_a_medicine() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        sqlx::query(
+            "UPDATE products SET display_name='Schedule H1 Alprazolam Tramadol',\
+             normalized_search_name='schedule h1 alprazolam tramadol' WHERE id=?",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        // An HSN code and a manufacturer, both recorded, neither of them a schedule finding.
+        assign_hsn(&f.pool, &f.product_id, "30049099").await;
+        let company = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO pharmaceutical_companies (id,display_name,normalized_search_name,\
+             created_at_utc,updated_at_utc) VALUES (?,'Abbott India','abbott india',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_company_roles (id,product_id,company_id,role,created_at_utc,\
+             updated_at_utc) VALUES (?,?,?,'manufacturer',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&f.product_id)
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{}/regulatory", f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for answer in body["resolved"].as_array().unwrap() {
+            assert_eq!(answer["answer"], "unknown", "{answer} was inferred");
+        }
+        assert_eq!(body["saleGate"], "unresolved");
+
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{posted}");
+        assert_eq!(posted["code"], "regulatory_classification_unresolved");
+    }
+
+    // --- 6-8. Effective dating --------------------------------------------------------------
+
+    /// 6-7. A finding that starts after this Sale's business date does not reach it; the same
+    /// finding reaches a Sale dated on or after the day it commences. This is the Pregabalin and
+    /// high-alcohol case: enacted, not yet commenced, and a Sale today is judged by today's law.
+    #[tokio::test]
+    async fn a_future_finding_governs_only_sales_dated_on_or_after_its_commencement() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        // The future finding closes the "outside Schedule H1" period and opens an "inside" one,
+        // through the API an owner would use. The date is this test's, not a claim about any
+        // notification's commencement.
+        close_scheme(&f, "schedule_h1", "2027-01-09").await;
+        let (status, body) = classify_scheme(&f, "schedule_h1", true, "2027-01-09", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // TODAY is 2026-06-15: before commencement, so the sale proceeds.
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, snapshot, _) = line_snapshot(&f, &id).await;
+        assert_eq!(version, 1);
+        assert!(
+            snapshot
+                .as_deref()
+                .unwrap()
+                .contains("\"schedule_h1\":\"does_not_apply\""),
+            "{snapshot:?}"
+        );
+
+        // A Sale dated on the day it commences sees the new finding and is refused.
+        let (status, later) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            json!({ "customerPartyId": Value::Null, "businessDate": "2027-01-09" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{later}");
+        let later_id = later["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{later_id}/lines"),
+            line_body(1, &f, "pack", 1, 8000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+        let (status, refused) =
+            post_sale_request(&f, &later_id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulated_sale_workflow_not_available");
+    }
+
+    /// 8. A finding whose period has closed no longer governs, and the product falls back to
+    /// unknown rather than to its old answer.
+    #[tokio::test]
+    async fn an_expired_finding_stops_governing_and_leaves_unknown_behind() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (status, body) =
+            classify_scheme(&f, "schedule_h", false, "2020-01-01", Some("2026-01-01")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, resolved) = request(
+            f.pool.clone(),
+            "GET",
+            &format!(
+                "/api/v1/products/{}/regulatory?asOf=2026-06-15",
+                f.product_id
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resolved}");
+        let schedule_h = resolved["resolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|answer| answer["scheme"] == "schedule_h")
+            .unwrap();
+        assert_eq!(schedule_h["answer"], "unknown");
+
+        // And on a date inside the closed period it still answers what it answered then.
+        let (_, historical) = request(
+            f.pool.clone(),
+            "GET",
+            &format!(
+                "/api/v1/products/{}/regulatory?asOf=2025-06-15",
+                f.product_id
+            ),
+            Value::Null,
+        )
+        .await;
+        let then = historical["resolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|answer| answer["scheme"] == "schedule_h")
+            .unwrap();
+        assert_eq!(then["answer"], "does_not_apply");
+    }
+
+    /// 9. Two findings cannot both govern the same product, scheme and day.
+    #[tokio::test]
+    async fn contradictory_overlapping_findings_are_refused() {
+        let f = fixture().await;
+        let (status, first) = classify_scheme(&f, "schedule_h", true, "2026-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, second) = classify_scheme(&f, "schedule_h", false, "2026-06-01", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{second}");
+        assert_eq!(second["code"], "regulatory_period_overlaps");
+        // A period that ends before the other begins is accepted, because it answers a different day.
+        let (status, adjacent) =
+            classify_scheme(&f, "schedule_h", false, "2025-01-01", Some("2026-01-01")).await;
+        assert_eq!(status, StatusCode::CREATED, "{adjacent}");
+    }
+
+    // --- 10-12. Professionals are not application roles ---------------------------------------
+
+    /// 10-11. An app role named "pharmacist" creates no professional record, and a professional
+    /// record needs no login to be real.
+    #[tokio::test]
+    async fn an_application_role_is_not_a_professional_registration() {
+        let f = fixture().await;
+        insert_session(&f.pool, "pharmacist", "app-role-pharmacist-token").await;
+        let (status, listed) = request(
+            f.pool.clone(),
+            "GET",
+            "/api/v1/store/professionals",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(
+            listed.as_array().unwrap().len(),
+            0,
+            "an application role produced a professional record"
+        );
+
+        let (status, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/professionals",
+            json!({
+                "fullName": "Meera Iyer",
+                "capacity": "registered_pharmacist",
+                "registrationNumber": "MH-PH-44821",
+                "registeringAuthority": "Maharashtra State Pharmacy Council",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["linkedUserId"], Value::Null);
+        assert_eq!(created["registrationNumber"], "MH-PH-44821");
+    }
+
+    /// 12. A claim of registration without a registration number is refused.
+    #[tokio::test]
+    async fn a_registered_pharmacist_without_a_registration_number_is_refused() {
+        let f = fixture().await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/professionals",
+            json!({ "fullName": "Anon", "capacity": "registered_pharmacist" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "registrationNumber");
+        // A competent person needs none, and is accepted.
+        let (status, competent) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/professionals",
+            json!({ "fullName": "Store Manager", "capacity": "competent_person" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{competent}");
+    }
+
+    // --- 13-16. Licences and elections ---------------------------------------------------------
+
+    /// 13. Free text that happens to read "20F" does not become a typed Form 20F assertion.
+    #[tokio::test]
+    async fn a_free_text_licence_never_becomes_a_typed_form() {
+        let f = fixture().await;
+        sqlx::query(
+            "INSERT INTO store_licences (id,store_id,licence_type,licence_number,\
+             normalized_licence_number,created_at_utc,updated_at_utc) \
+             VALUES (?,?,'Form 20F','MH-20F-99','MH20F99',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&f.store_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, body) = request(
+            f.pool.clone(),
+            "GET",
+            "/api/v1/store/drug-compliance",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["complianceLicences"].as_array().unwrap().len(),
+            0,
+            "a display licence was read as a statutory assertion"
+        );
+    }
+
+    /// 14-15. A cashier may not assert a licence form or record an election.
+    #[tokio::test]
+    async fn a_cashier_cannot_assert_a_licence_form_or_an_election() {
+        let f = fixture().await;
+        let (status, licence) = request_as(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/compliance-licences",
+            json!({ "licenceForm": "form_20f", "licenceNumber": "MH-20F-1" }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{licence}");
+        let (status, election) = request_as(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/record-elections",
+            json!({
+                "election": "rule_65_3_prescription_supply",
+                "method": "prescription_register",
+                "effectiveFrom": "2026-01-01",
+            }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{election}");
+    }
+
+    /// 16. The two elections are separate: recording one leaves the other unrecorded, and each
+    /// accepts only the alternatives its own sub-rule offers.
+    #[tokio::test]
+    async fn the_two_rule_65_elections_stay_separate() {
+        let f = fixture().await;
+        let (status, first) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/record-elections",
+            json!({
+                "election": "rule_65_3_prescription_supply",
+                "method": "prescription_register",
+                "effectiveFrom": "2026-01-01",
+                "evidenceReference": "Election filed with Licensing Authority, 12 Jan 2026",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+
+        let (status, body) = request(
+            f.pool.clone(),
+            "GET",
+            "/api/v1/store/drug-compliance",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let elections = body["recordElections"].as_array().unwrap();
+        assert_eq!(elections.len(), 1, "the other election was invented");
+        assert_eq!(elections[0]["election"], "rule_65_3_prescription_supply");
+
+        // Rule 65(4)(1) calls its register a register, not a prescription register.
+        let (status, wrong) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/record-elections",
+            json!({
+                "election": "rule_65_4_non_prescription_schedule_c",
+                "method": "prescription_register",
+                "effectiveFrom": "2026-01-01",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{wrong}");
+        let (status, right) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/store/record-elections",
+            json!({
+                "election": "rule_65_4_non_prescription_schedule_c",
+                "method": "register",
+                "effectiveFrom": "2026-01-01",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{right}");
+    }
+
+    // --- 17-20. A posted Sale is history ------------------------------------------------------
+
+    /// 17-18. Changing today's manufacturer or today's classification cannot rewrite what a
+    /// posted Sale froze.
+    #[tokio::test]
+    async fn todays_masters_cannot_rewrite_a_posted_sales_regulatory_facts() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        let company = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO pharmaceutical_companies (id,display_name,normalized_search_name,\
+             created_at_utc,updated_at_utc) VALUES (?,'Micro Labs','micro labs',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let role_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO product_company_roles (id,product_id,company_id,role,created_at_utc,\
+             updated_at_utc) VALUES (?,?,?,'manufacturer',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&role_id)
+        .bind(&f.product_id)
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, snapshot, manufacturer) = line_snapshot(&f, &id).await;
+        assert_eq!(version, 1);
+        assert_eq!(manufacturer.as_deref(), Some("Micro Labs"));
+        let frozen = snapshot.clone().unwrap();
+
+        // The pharmacy changes its mind about both, after the fact.
+        sqlx::query("UPDATE pharmaceutical_companies SET display_name='Renamed Labs' WHERE id=?")
+            .bind(&company)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_company_roles SET status='archived',archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='changed' WHERE id=?")
+            .bind(&role_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        // The law changes later: close the old finding where the new one begins, then record it.
+        close_scheme(&f, "schedule_h", "2026-06-20").await;
+        let (status, reclassified) =
+            classify_scheme(&f, "schedule_h", true, "2026-06-20", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{reclassified}");
+
+        let (version, after, manufacturer_after) = line_snapshot(&f, &id).await;
+        assert_eq!(version, 1);
+        assert_eq!(after.unwrap(), frozen, "the frozen answer moved");
+        assert_eq!(
+            manufacturer_after.as_deref(),
+            Some("Micro Labs"),
+            "the frozen manufacturer moved"
+        );
+    }
+
+    /// 19. A version-0 line is history, and history cannot be made after the fact.
+    ///
+    /// Migration 0021's populated test proves every line posted before this phase stays at version
+    /// 0 with no snapshot. This proves the other half: after it, no route creates one. Posting
+    /// always writes version 1; a document flipped to posted by hand is refused while any line is
+    /// at 0; and a version-0 line written into an already-posted document is refused too. So a
+    /// version-0 line can only ever mean "posted before regulatory facts were recorded".
+    #[tokio::test]
+    async fn no_route_after_this_phase_can_create_a_version_zero_posted_line() {
+        let f = fixture().await;
+        // Posting through the service writes version 1, even for an unclassified general item.
+        let posted_id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &posted_id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(line_snapshot(&f, &posted_id).await.0, 1);
+
+        // A draft whose line was never snapshotted cannot be flipped to posted by hand.
+        let draft_id = draft_with_line(&f, "pack", 1, 8000).await;
+        let flipped = sqlx::query(
+            "UPDATE sale_documents SET status='posted',document_number='INV/2627/000077',\
+             sequence_value=77,series_code='INV',financial_year='2026-27',\
+             tax_treatment='intra_state',posted_by_user_id=created_by_user_id,\
+             posted_at_utc=updated_at_utc,posting_idempotency_key=? WHERE id=?",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&draft_id)
+        .execute(&f.pool)
+        .await;
+        assert!(
+            flipped.err().is_some_and(|error| error
+                .to_string()
+                .contains("regulatory_gate_refuses_posting")),
+            "a version-0 line was posted by hand"
+        );
+
+        // Nor can a version-0 line be written into a document that is already posted.
+        let smuggled = sqlx::query(
+            "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
+             batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
+             created_at_utc,updated_at_utc) \
+             SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,created_at_utc,\
+             updated_at_utc FROM sale_lines WHERE sale_document_id=? LIMIT 1",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&posted_id)
+        .bind(&posted_id)
+        .execute(&f.pool)
+        .await;
+        assert!(
+            smuggled.err().is_some_and(|error| error
+                .to_string()
+                .contains("regulatory_gate_refuses_posting")),
+            "a version-0 line was smuggled into a posted document"
+        );
+    }
+
+    /// 20. Direct SQL cannot mutate a posted line's snapshot.
+    #[tokio::test]
+    async fn direct_sql_cannot_mutate_a_posted_regulatory_snapshot() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let forged = sqlx::query(
+            "UPDATE sale_lines SET regulatory_schemes_snapshot='{\"schedule_h\":\"applies\"}' \
+             WHERE sale_document_id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await;
+        assert!(
+            forged
+                .err()
+                .is_some_and(|error| error.to_string().contains("sale_document_is_posted")),
+            "a posted snapshot was rewritable by direct SQL"
+        );
+    }
+
+    // --- 21-23. The gate cannot be walked around ----------------------------------------------
+
+    /// 21. A direct API caller gets the same refusal the browser would: there is no header, no
+    /// flag and no field that skips it.
+    #[tokio::test]
+    async fn a_direct_api_caller_cannot_bypass_the_unresolved_block() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/post"),
+            json!({
+                "expectedRevision": 2,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "tenders": [{ "method": "cash", "amountPaise": 8960 }],
+                "regulatoryOverride": true,
+                "skipCompliance": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "regulatory_classification_unresolved");
+    }
+
+    /// 22. Each of Schedule H, H1 and X refuses on its own, naming itself.
+    #[tokio::test]
+    async fn every_prescription_schedule_refuses_until_its_workflow_exists() {
+        for scheme in ["schedule_h", "schedule_h1", "schedule_x"] {
+            let f = fixture().await;
+            make_medicine(&f, &f.product_id).await;
+            clear_every_schedule(&f, "2020-01-01").await;
+            // Close the "outside" finding and replace it with an "inside" one.
+            sqlx::query(
+                "UPDATE product_regulatory_classifications SET status='archived',\
+                 archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='corrected' \
+                 WHERE product_id=? AND scheme=?",
+            )
+            .bind(&f.product_id)
+            .bind(scheme)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+            let (status, body) = classify_scheme(&f, scheme, true, "2020-01-01", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{scheme}: {body}");
+
+            let id = draft_with_line(&f, "pack", 1, 8000).await;
+            let (status, refused) =
+                post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{scheme}: {refused}");
+            assert_eq!(refused["code"], "regulated_sale_workflow_not_available");
+            assert!(
+                refused["issues"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(scheme),
+                "{scheme}: {refused}"
+            );
+        }
+    }
+
+    /// 23. Schedule C refuses too: its rule 65(4)(1) record is not implemented either, and a
+    /// correct classification must not become a knowingly incomplete sale.
+    #[tokio::test]
+    async fn schedule_c_refuses_until_its_record_exists() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        sqlx::query(
+            "UPDATE product_regulatory_classifications SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='corrected' \
+             WHERE product_id=? AND scheme='schedule_c'",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, body) = classify_scheme(&f, "schedule_c", true, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, refused) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulated_sale_workflow_not_available");
+    }
+
+    // --- 24-26. Scope: the ordinary counter keeps working --------------------------------------
+
+    /// 24-25. A general item sells with no classification at all, and a medicine established to be
+    /// outside every schedule sells and freezes that answer.
+    #[tokio::test]
+    async fn unclassified_general_items_and_cleared_medicines_both_sell() {
+        let f = fixture().await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, snapshot, _) = line_snapshot(&f, &id).await;
+        assert_eq!(version, 1);
+        // Its answers are honestly "unknown" — the general item was never classified — and that is
+        // recorded rather than dressed up as "does not apply".
+        assert!(
+            snapshot
+                .as_deref()
+                .unwrap()
+                .contains("\"schedule_h\":\"unknown\""),
+            "{snapshot:?}"
+        );
+
+        let g = fixture().await;
+        make_medicine(&g, &g.product_id).await;
+        clear_every_schedule(&g, "2020-01-01").await;
+        let cleared = draft_with_line(&g, "pack", 1, 8000).await;
+        let (status, body) =
+            post_sale_request(&g, &cleared, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, snapshot, _) = line_snapshot(&g, &cleared).await;
+        assert!(
+            snapshot
+                .as_deref()
+                .unwrap()
+                .contains("\"schedule_h\":\"does_not_apply\""),
+            "{snapshot:?}"
+        );
+    }
+
+    /// 26. A device is not assumed to be outside Schedule C: classified into it, it is refused
+    /// like any other line, because Schedule C lists sterile disposable single-use devices.
+    #[tokio::test]
+    async fn a_device_classified_into_schedule_c_is_refused() {
+        let f = fixture().await;
+        sqlx::query("UPDATE products SET product_kind='device' WHERE id=?")
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        // Unclassified, it still sells: an unknown does not block a device.
+        let first = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, sold) =
+            post_sale_request(&f, &first, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{sold}");
+
+        let (status, body) = classify_scheme(&f, "schedule_c", true, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let second = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, refused) =
+            post_sale_request(&f, &second, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulated_sale_workflow_not_available");
+    }
+
+    // --- 27-28. Racing ------------------------------------------------------------------------
+
+    /// 27. A classification committed while a posting is in flight yields one coherent snapshot:
+    /// either the Sale was judged by the old finding and froze it, or it was refused by the new
+    /// one. Never half of each.
+    #[tokio::test]
+    async fn a_classification_change_racing_a_posting_yields_one_coherent_answer() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+
+        let pool = f.pool.clone();
+        let product_id = f.product_id.clone();
+        let racer = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE product_regulatory_classifications SET applies=1 \
+                 WHERE product_id=? AND scheme='schedule_h' AND status='active'",
+            )
+            .bind(&product_id)
+            .execute(&pool)
+            .await
+        });
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        let _ = racer.await.unwrap();
+
+        let (version, snapshot, _) = line_snapshot(&f, &id).await;
+        match status {
+            StatusCode::OK => {
+                assert_eq!(version, 1);
+                let frozen = snapshot.unwrap();
+                assert!(
+                    frozen.contains("\"schedule_h\":\"does_not_apply\""),
+                    "a sale posted against a Schedule H finding: {frozen}"
+                );
+                assert_eq!(posted["status"], "posted");
+            }
+            StatusCode::CONFLICT => {
+                assert_eq!(posted["code"], "regulated_sale_workflow_not_available");
+                assert_eq!(
+                    (version, snapshot),
+                    (0, None),
+                    "a refused sale froze a snapshot"
+                );
+            }
+            other => panic!("{other}: {posted}"),
+        }
+    }
+
+    /// 28. The same for the manufacturer: the frozen name is one of the two real answers, never a
+    /// mixture, and never NULL beside a recorded company id.
+    #[tokio::test]
+    async fn a_manufacturer_change_racing_a_posting_yields_one_coherent_answer() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        let company = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO pharmaceutical_companies (id,display_name,normalized_search_name,\
+             created_at_utc,updated_at_utc) VALUES (?,'Cipla','cipla',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let role_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO product_company_roles (id,product_id,company_id,role,created_at_utc,\
+             updated_at_utc) VALUES (?,?,?,'manufacturer',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&role_id)
+        .bind(&f.product_id)
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+
+        let pool = f.pool.clone();
+        let racing_role = role_id.clone();
+        let racer = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE product_company_roles SET status='archived',\
+                 archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='changed' \
+                 WHERE id=?",
+            )
+            .bind(&racing_role)
+            .execute(&pool)
+            .await
+        });
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        let _ = racer.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{posted}");
+
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT manufacturer_company_id,manufacturer_name FROM sale_lines \
+             WHERE sale_document_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0.is_none(),
+            row.1.is_none(),
+            "half a manufacturer was frozen: {row:?}"
+        );
+        if let Some(name) = row.1 {
+            assert_eq!(name, "Cipla");
+        }
+    }
+
+    // --- 29-33. What a finding must carry -----------------------------------------------------
+
+    /// 29-30. A finding needs an authority behind it; a blank or throwaway citation is refused.
+    #[tokio::test]
+    async fn a_finding_without_a_real_source_is_refused() {
+        let f = fixture().await;
+        for citation in ["", "   ", "x"] {
+            let (status, body) = request(
+                f.pool.clone(),
+                "POST",
+                &format!(
+                    "/api/v1/products/{}/regulatory/classifications",
+                    f.product_id
+                ),
+                json!({
+                    "scheme": "schedule_h",
+                    "applies": true,
+                    "effectiveFrom": "2026-01-01",
+                    "sourceCitation": citation,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{citation:?} was accepted: {body}"
+            );
+            assert_eq!(body["issues"][0]["field"], "sourceCitation");
+        }
+    }
+
+    /// 31. A period that ends before it starts is refused.
+    #[tokio::test]
+    async fn an_impossible_effective_period_is_refused() {
+        let f = fixture().await;
+        let (status, body) =
+            classify_scheme(&f, "schedule_h", true, "2026-06-01", Some("2026-01-01")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["issues"][0]["field"], "effectiveTo");
+        let (status, same_day) =
+            classify_scheme(&f, "schedule_h", true, "2026-06-01", Some("2026-06-01")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{same_day}");
+    }
+
+    /// 32. A scheme this software does not know is refused rather than stored as free text.
+    #[tokio::test]
+    async fn an_unknown_scheme_is_refused() {
+        let f = fixture().await;
+        for scheme in ["schedule_z", "SCHEDULE_H ", "narcotics", ""] {
+            let (status, body) = classify_scheme(&f, scheme, true, "2026-01-01", None).await;
+            if scheme.trim().eq_ignore_ascii_case("schedule_h") {
+                assert_eq!(status, StatusCode::CREATED, "{scheme:?}: {body}");
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{scheme:?}: {body}"
+                );
+            }
+        }
+    }
+
+    /// 33. "Unknown" is never reported as a finding of non-application, and the two are
+    /// distinguishable everywhere they appear.
+    #[tokio::test]
+    async fn unknown_never_masquerades_as_a_finding_that_it_does_not_apply() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (status, before) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{}/regulatory", f.product_id),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        assert!(
+            before["resolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|answer| answer["answer"] == "unknown")
+        );
+        assert_eq!(before["classifications"].as_array().unwrap().len(), 0);
+        assert_eq!(before["saleGate"], "unresolved");
+
+        let (status, created) = classify_scheme(&f, "schedule_h", false, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (_, after) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{}/regulatory", f.product_id),
+            Value::Null,
+        )
+        .await;
+        let schedule_h = after["resolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|answer| answer["scheme"] == "schedule_h")
+            .unwrap();
+        assert_eq!(schedule_h["answer"], "does_not_apply");
+        // Saying "outside Schedule H" cost a row with a source; the others remain unknown.
+        assert_eq!(after["classifications"].as_array().unwrap().len(), 1);
+        assert_eq!(after["saleGate"], "unresolved");
+    }
+
+    // --- 34-35. Resolution by date ------------------------------------------------------------
+
+    /// 34-35. The resolver answers for the date asked, in the past and in the future, without
+    /// consulting the clock.
+    #[tokio::test]
+    async fn resolution_follows_the_business_date_backwards_and_forwards() {
+        let f = fixture().await;
+        let (status, body) =
+            classify_scheme(&f, "schedule_h", true, "2026-04-01", Some("2026-07-01")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for (as_of, expected) in [
+            ("2026-03-31", "unknown"),
+            ("2026-04-01", "applies"),
+            ("2026-06-30", "applies"),
+            ("2026-07-01", "unknown"),
+            ("2030-01-01", "unknown"),
+        ] {
+            let (status, resolved) = request(
+                f.pool.clone(),
+                "GET",
+                &format!("/api/v1/products/{}/regulatory?asOf={as_of}", f.product_id),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{as_of}: {resolved}");
+            let answer = resolved["resolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|answer| answer["scheme"] == "schedule_h")
+                .unwrap();
+            assert_eq!(answer["answer"], expected, "on {as_of}");
+        }
+    }
+
+    // --- 36-39. A refusal costs nothing -------------------------------------------------------
+
+    /// 36-39. A refused Sale allocates no number, moves no stock, writes no tender and stays a
+    /// draft the counter can fix.
+    #[tokio::test]
+    async fn a_refused_sale_leaves_the_series_stock_tenders_and_status_untouched() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let before_numbers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_documents WHERE document_number IS NOT NULL",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let before_sequence: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(next_value) FROM document_number_series")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+
+        let (status, body) = post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        assert_eq!(
+            balance(&f, &f.batch_id).await,
+            100,
+            "a refused sale moved stock"
+        );
+        let tenders: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?")
+                .bind(&id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(tenders, 0, "a refused sale wrote a tender");
+        let after_numbers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_documents WHERE document_number IS NOT NULL",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            before_numbers, after_numbers,
+            "a refused sale took a number"
+        );
+        let after_sequence: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(next_value) FROM document_number_series")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(before_sequence, after_sequence, "the series advanced");
+        let status_now: String = sqlx::query_scalar("SELECT status FROM sale_documents WHERE id=?")
+            .bind(&id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(status_now, "draft");
+    }
+
+    /// 40. Every authorised change to a classification is on the audit log, with its actor.
+    #[tokio::test]
+    async fn an_authorised_classification_change_is_audited() {
+        let f = fixture().await;
+        let (status, created) = classify_scheme(&f, "schedule_h1", true, "2026-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let classification_id = created["id"].as_str().unwrap().to_owned();
+        let (status, archived) = request(
+            f.pool.clone(),
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications/{classification_id}/archive",
+                f.product_id
+            ),
+            json!({ "expectedRevision": 1, "reason": "Superseded by a later notification" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{archived}");
+
+        let events: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT action,entity_id,actor_id,reason FROM master_change_events \
+             WHERE entity_type='product_regulatory_classification' ORDER BY occurred_at_utc",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].0, "created");
+        assert_eq!(events[1].0, "archived");
+        for event in &events {
+            assert_eq!(event.1, classification_id);
+            assert_eq!(event.2.as_deref(), Some(f.owner_id.as_str()));
+        }
+        assert_eq!(
+            events[1].3.as_deref(),
+            Some("Superseded by a later notification")
+        );
+    }
+
+    /// 41. The quote says what posting will do, before any money is taken.
+    #[tokio::test]
+    async fn the_quote_reports_the_same_gate_posting_will_apply() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, quote) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{quote}");
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "unresolved");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], Value::Null);
+
+        clear_every_schedule(&f, "2020-01-01").await;
+        sqlx::query(
+            "UPDATE product_regulatory_classifications SET applies=1 \
+             WHERE product_id=? AND scheme='schedule_x' AND status='active'",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, quote) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_x");
+    }
+
+    /// 42. A criterion attribute is a label fact, not a classification: recording 40% alcohol
+    /// classifies nothing and unblocks nothing.
+    #[tokio::test]
+    async fn recording_an_alcohol_percentage_classifies_nothing() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/products/{}/regulatory/attributes", f.product_id),
+            json!({ "alcoholPercentVvHundredths": 4000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["alcoholPercentVvHundredths"], 4000);
+        assert_eq!(body["saleGate"], "unresolved");
+        for answer in body["resolved"].as_array().unwrap() {
+            assert_eq!(
+                answer["answer"], "unknown",
+                "{answer} was derived from a label fact"
+            );
+        }
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, refused) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulatory_classification_unresolved");
+    }
+
+    /// 43. A cashier cannot classify a product, and the refusal changes nothing.
+    #[tokio::test]
+    async fn a_cashier_cannot_classify_a_product() {
+        let f = fixture().await;
+        let (status, body) = request_as(
+            f.pool.clone(),
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications",
+                f.product_id
+            ),
+            json!({
+                "scheme": "schedule_h",
+                "applies": false,
+                "effectiveFrom": "2020-01-01",
+                "sourceCitation": "I say so",
+            }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_regulatory_classifications")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// 44. A returned line still points at the original Sale line, whose frozen regulatory facts
+    /// are unchanged by the return.
+    #[tokio::test]
+    async fn a_return_leaves_the_original_lines_regulatory_facts_alone() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        let id = draft_with_line(&f, "pack", 2, 8000).await;
+        let (status, posted) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 17920).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let before = line_snapshot(&f, &id).await;
+
+        let sale_line_id: String =
+            sqlx::query_scalar("SELECT id FROM sale_lines WHERE sale_document_id=?")
+                .bind(&id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        let (status, draft) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/returns",
+            json!({ "returnKind": "sales_return", "originalDocumentId": id, "businessDate": TODAY }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{draft}");
+        let return_id = draft["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/lines"),
+            json!({
+                "expectedRevision": 1,
+                "originalLineId": sale_line_id,
+                "quantity": 1,
+                "disposition": "quarantined",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+
+        assert_eq!(
+            line_snapshot(&f, &id).await,
+            before,
+            "a return rewrote the original line's regulatory facts"
+        );
+    }
+
+    /// 45. A change in law is recorded by closing the old finding, and the close leaves every date
+    /// it covered answering exactly as before. A close can only shorten a finding, never extend it.
+    #[tokio::test]
+    async fn closing_a_finding_keeps_its_past_answers_and_cannot_extend_it() {
+        let f = fixture().await;
+        let (status, body) = classify_scheme(&f, "schedule_h", false, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        close_scheme(&f, "schedule_h", "2026-07-01").await;
+
+        let answer_on = |as_of: &'static str| {
+            let pool = f.pool.clone();
+            let product = f.product_id.clone();
+            async move {
+                let (_, resolved) = request(
+                    pool,
+                    "GET",
+                    &format!("/api/v1/products/{product}/regulatory?asOf={as_of}"),
+                    Value::Null,
+                )
+                .await;
+                resolved["resolved"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|answer| answer["scheme"] == "schedule_h")
+                    .unwrap()["answer"]
+                    .clone()
+            }
+        };
+        assert_eq!(
+            answer_on("2025-06-15").await,
+            "does_not_apply",
+            "the past changed"
+        );
+        assert_eq!(answer_on("2026-06-30").await, "does_not_apply");
+        assert_eq!(answer_on("2026-07-01").await, "unknown");
+
+        let (id, revision): (String, i64) = sqlx::query_as(
+            "SELECT id,revision FROM product_regulatory_classifications WHERE product_id=?",
+        )
+        .bind(&f.product_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let (status, extended) = request(
+            f.pool.clone(),
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications/{id}/close",
+                f.product_id
+            ),
+            json!({ "expectedRevision": revision, "effectiveTo": "2027-01-01", "reason": "extend" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{extended}");
+        assert_eq!(
+            answer_on("2026-12-01").await,
+            "unknown",
+            "a close extended a finding"
+        );
+    }
+
+    /// 46. A pack's volume is half of the Schedule H1 entry 52 test, so recording it is audited —
+    /// and, like the alcohol percentage, it classifies nothing by itself.
+    #[tokio::test]
+    async fn recording_a_pack_volume_is_audited_and_classifies_nothing() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (status, body) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/packs/{}/regulatory/attributes", f.pack_id),
+            json!({ "netVolumeMillilitresHundredths": 10_000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT entity_type,action,actor_id FROM master_change_events \
+             WHERE entity_type='product_pack_regulatory_attributes' AND entity_id=?",
+        )
+        .bind(&f.pack_id)
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].1, "created");
+        assert_eq!(events[0].2.as_deref(), Some(f.owner_id.as_str()));
+
+        let (status, cashier) = request_as(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/packs/{}/regulatory/attributes", f.pack_id),
+            json!({ "expectedRevision": 1, "netVolumeMillilitresHundredths": 1 }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{cashier}");
+
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, refused) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulatory_classification_unresolved");
+    }
+
+    /// 47. Backdating cannot carry a drug scheduled since past the gate.
+    ///
+    /// A Schedule H1 finding commenced ten days ago. A draft dated twenty days ago resolves, on its
+    /// own business date, to "does not apply" — and the frozen snapshot must still say so, because
+    /// that is the law of the day the document records. But the goods are being handed over today,
+    /// when the drug IS Schedule H1, so the sale is refused. A genuine late entry of an unrestricted
+    /// medicine, dated the same day, still posts.
+    #[tokio::test]
+    async fn a_backdated_sale_cannot_carry_a_drug_scheduled_since() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        let (commenced, backdated): (String, String) = sqlx::query_as(
+            "SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes','-10 days'),\
+             strftime('%Y-%m-%d','now','+5 hours','+30 minutes','-20 days')",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        clear_every_schedule(&f, "2020-01-01").await;
+        close_scheme(&f, "schedule_h1", &commenced).await;
+        let (status, body) = classify_scheme(&f, "schedule_h1", true, &commenced, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            json!({ "customerPartyId": Value::Null, "businessDate": backdated }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/lines"),
+            line_body(1, &f, "pack", 1, 8000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+
+        // The quote tells the counter before any money is taken.
+        let (_, quote) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_h1");
+
+        let (status, refused) =
+            post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "regulated_sale_workflow_not_available");
+        assert_eq!(
+            balance(&f, &f.batch_id).await,
+            100,
+            "a backdated sale moved stock"
+        );
+        assert_eq!(detail(&f, &id).await["status"], "draft");
+
+        // A late entry of a medicine unrestricted on both days still posts, dated the same day,
+        // and freezes the business-date answer.
+        let g = fixture().await;
+        make_medicine(&g, &g.product_id).await;
+        clear_every_schedule(&g, "2020-01-01").await;
+        let (_, late) = request(
+            g.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            json!({ "customerPartyId": Value::Null, "businessDate": backdated }),
+        )
+        .await;
+        let late_id = late["id"].as_str().unwrap().to_owned();
+        let (status, _) = request(
+            g.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{late_id}/lines"),
+            line_body(1, &g, "pack", 1, 8000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, posted) =
+            post_sale_request(&g, &late_id, 2, &Uuid::now_v7().to_string(), 8960).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, snapshot, _) = line_snapshot(&g, &late_id).await;
+        assert_eq!(version, 1);
+        assert!(
+            snapshot
+                .as_deref()
+                .unwrap()
+                .contains("\"schedule_h1\":\"does_not_apply\""),
+            "{snapshot:?}"
+        );
     }
 }

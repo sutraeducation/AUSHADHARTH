@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Barcode, Batch, CompositionComponent, ProductDetail, ProductPack, ReferenceKind, ReferenceMasterResponse, StorePackPolicy, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
+import { unclassifiedRegulatory } from "./regulatoryDouble";
 import { atomsToQuantity, paiseToRupees, quantityToAtoms, rupeesToPaise } from "../products/productApi";
 
 const IDs = {
@@ -189,6 +190,8 @@ function catalogService(options: Options = {}) {
       return response(created, 201);
     }
 
+    // Phase 1M-A: every product page reads its Drugs Rules position.
+    if (/^\/api\/v1\/products\/[^/]+\/regulatory$/.test(url.pathname)) return response(unclassifiedRegulatory(url.pathname.split("/")[4], "general_pharmacy_item"));
     const productMatch = /^\/api\/v1\/products\/([^/]+)(?:\/(archive|restore|company-roles|packs|composition))?$/.exec(url.pathname);
     if (productMatch) {
       const record = findProduct(productMatch[1]);

@@ -494,3 +494,20 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .panel-callout--blocking ul { display: block; margin: 8px 0 0; padding-left: 18px; color: var(--ink-700); font-size: .68rem; font-weight: 500; line-height: 1.7; list-style: disc; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 560px) { .field-row { grid-template-columns: 1fr; } }
+
+/* Phase 1M-A — Drugs Rules classification. "Unknown" is drawn as a gap to be filled, never as a
+   quiet negative, so it cannot be misread as "does not apply". */
+.regulatory-gate { display: grid; gap: 4px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-md); }
+.regulatory-gate small { color: var(--ink-700); font-size: .72rem; line-height: 1.5; }
+.regulatory-gate--unresolved, .regulatory-gate--workflow_unavailable { border-color: var(--danger-100); background: #fff3f2; }
+.regulatory-gate--unresolved strong, .regulatory-gate--workflow_unavailable strong { color: var(--danger-700); }
+.regulatory-answer { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .72rem; font-weight: 600; }
+.regulatory-answer--applies { background: var(--danger-100); color: var(--danger-700); }
+.regulatory-answer--does_not_apply { background: #e3f1ea; color: #1f6b47; }
+.regulatory-answer--unknown { border: 1px dashed var(--warning-700); color: var(--warning-700); background: #fbf4e6; }
+.regulatory-source { display: block; overflow-wrap: anywhere; }
+.regulatory-line { display: block; margin-top: 3px; font-size: .7rem; font-weight: 600; color: var(--danger-700); overflow-wrap: anywhere; }
+fieldset.field { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; }
+.choice { display: flex; align-items: flex-start; gap: 8px; margin: 4px 0; font-weight: 500; }
+.choice input { margin-top: 3px; }

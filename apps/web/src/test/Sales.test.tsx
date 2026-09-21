@@ -129,6 +129,9 @@ type Options = {
   dynamicQr?: "unknown" | "not_required" | "required" | null;
   /** The quote's flag for a registered customer's mixed taxable/untaxed bill. */
   mixedSupply?: boolean;
+  /** Phase 1M-A: what the Drugs Rules gate reports for every line. */
+  regulatoryGate?: "clear" | "unresolved" | "workflow_unavailable";
+  regulatoryGateScheme?: "schedule_h" | "schedule_h1" | "schedule_x" | "schedule_c" | "schedule_c1" | null;
 };
 
 /**
@@ -189,7 +192,9 @@ function saleService(options: Options = {}) {
         cgstPaise: Math.round((each.taxableValuePaise * 600) / 10_000),
         sgstPaise: Math.round((each.taxableValuePaise * 600) / 10_000),
         igstPaise: 0, cessPaise: 0,
-        lineTotalPaise: each.taxableValuePaise + Math.round((each.taxableValuePaise * 600) / 10_000) * 2
+        lineTotalPaise: each.taxableValuePaise + Math.round((each.taxableValuePaise * 600) / 10_000) * 2,
+        regulatoryGate: options.regulatoryGate ?? "clear",
+        regulatoryGateScheme: options.regulatoryGateScheme ?? null
       }))
     };
   };
@@ -599,6 +604,40 @@ describe("Point of sale", () => {
    * attribute. A duplicated event or a stuck button really does deliver clicks this way, and a
    * second invoice at a counter is worse than a duplicate purchase: the goods are already gone.
    */
+  /** Phase 1M-A: an ordinary line shows nothing extra — the counter is not slowed for toothpaste. */
+  it("adds no regulatory noise to a line the Drugs Rules gate clears", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({ documents: [sale({ lines: [line()] })] }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByRole("button", { name: "Take 179.20 and post" })).toBeEnabled();
+    expect(screen.queryByTestId("regulatory-blocked")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Classification unresolved/)).not.toBeInTheDocument();
+  });
+
+  /** Phase 1M-A: an unclassified medicine is named on its line and posting is withheld. */
+  it("withholds posting and names the line when a medicine is unclassified", async () => {
+    const service = saleService({ documents: [sale({ lines: [line()] })], regulatoryGate: "unresolved" });
+    renderApp(`/app/sales/${IDs.sale}`, service);
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByText(/Classification unresolved — not sellable until recorded/)).toBeInTheDocument();
+    expect(screen.getByTestId("regulatory-blocked")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
+    expect(writes(service).some((write) => write.path.endsWith("/post"))).toBe(false);
+  });
+
+  /** Phase 1M-A: a classified Schedule H1 line waits for the prescription workflow; no fake form. */
+  it("withholds posting for a Schedule H1 line without offering a prescription form", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({ lines: [line()] })],
+      regulatoryGate: "workflow_unavailable",
+      regulatoryGateScheme: "schedule_h1"
+    }));
+    await screen.findByRole("heading", { name: "Counter sale", level: 1 });
+    expect(await screen.findByText(/Schedule H1 — prescription workflow not yet available/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
+    expect(screen.queryByLabelText(/prescri/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/patient/i)).not.toBeInTheDocument();
+  });
+
   it("sends one posting even when three clicks land before React can re-render", async () => {
     const service = saleService({ documents: [sale({ lines: [line()] })] });
     renderApp(`/app/sales/${IDs.sale}`, service);

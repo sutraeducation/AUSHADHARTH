@@ -4900,3 +4900,160 @@ async fn real_service_requires_the_payment_cross_reference_under_dynamic_qr_over
             .is_some_and(|value| value.ends_with('Z'))
     );
 }
+
+/// Phase 1M-A over real HTTP: an owner records a Schedule H finding with its authority, the real
+/// service refuses the sale with a typed error before any number, movement or tender exists, and
+/// the refusal is withdrawn only by ending the finding — which leaves its past answers intact.
+#[tokio::test]
+async fn real_service_refuses_a_scheduled_sale_until_its_workflow_exists_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    let finding = call(
+        &service,
+        "POST",
+        &format!(
+            "/api/v1/products/{}/regulatory/classifications",
+            world.product
+        ),
+        Some(json!({
+            "scheme": "schedule_h",
+            "applies": true,
+            "effectiveFrom": "2020-01-01",
+            "sourceCitation": "Drugs Rules, 1945, Schedule H",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(finding.status, 201, "{:?}", finding.body);
+    let finding_id = finding.body["id"].as_str().expect("finding id").to_owned();
+
+    let sale_id = sale_draft(&service, &world, None).await;
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+
+    let quote = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    assert_eq!(
+        quote.body["lines"][0]["regulatoryGate"],
+        "workflow_unavailable"
+    );
+    assert_eq!(quote.body["lines"][0]["regulatoryGateScheme"], "schedule_h");
+
+    let refused = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000001a1",
+        8_960,
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["code"],
+        "regulated_sale_workflow_not_available"
+    );
+
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+    assert_eq!(
+        detail.body["tenders"].as_array().map(Vec::len).unwrap_or(0),
+        0
+    );
+    let movements = call(
+        &service,
+        "GET",
+        "/api/v1/inventory/movements",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        movements
+            .body
+            .as_array()
+            .expect("movements")
+            .iter()
+            .all(|row| row["movementType"] != "sale"),
+        "a refused sale moved stock"
+    );
+
+    // The law changes: the finding ends, and a Sale dated after the end is no longer governed.
+    let closed = call(
+        &service,
+        "POST",
+        &format!(
+            "/api/v1/products/{}/regulatory/classifications/{finding_id}/close",
+            world.product
+        ),
+        Some(json!({ "expectedRevision": 1, "effectiveTo": "2026-01-01", "reason": "Omitted from Schedule H" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{:?}", closed.body);
+    let before = call(
+        &service,
+        "GET",
+        &format!(
+            "/api/v1/products/{}/regulatory?asOf=2025-06-01",
+            world.product
+        ),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    let schedule_h = before.body["resolved"]
+        .as_array()
+        .expect("resolved")
+        .iter()
+        .find(|answer| answer["scheme"] == "schedule_h")
+        .expect("schedule_h")
+        .clone();
+    assert_eq!(
+        schedule_h["answer"], "applies",
+        "ending a finding rewrote its past"
+    );
+
+    let posted = post_sale(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000001a2",
+        8_960,
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    // A cashier-level caller can do none of this.
+    let cashier = call(
+        &service,
+        "POST",
+        "/api/v1/store/record-elections",
+        Some(json!({
+            "election": "rule_65_3_prescription_supply",
+            "method": "prescription_register",
+            "effectiveFrom": "2026-01-01",
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(cashier.status, 401, "{:?}", cashier.body);
+}

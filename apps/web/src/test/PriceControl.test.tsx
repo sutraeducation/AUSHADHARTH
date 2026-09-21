@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProductDetail, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
+import { unclassifiedRegulatory } from "./regulatoryDouble";
 
 const IDs = {
   product: "01997b00-0000-7000-8000-000000000001",
@@ -110,6 +111,8 @@ function priceService(options: Options = {}) {
       return response({ productId: IDs.product, revision: 1, hsnCodeId: null, taxCategoryId: null, complete: false, asOf: "2026-09-14", applicableRate: null });
     }
     if (url.pathname === "/api/v1/products") return response([product(options.productKind ? { productKind: options.productKind } : {})]);
+    // Phase 1M-A: every product page reads its Drugs Rules position.
+    if (/^\/api\/v1\/products\/[^/]+\/regulatory$/.test(url.pathname)) return response(unclassifiedRegulatory(IDs.product, options.productKind ?? "medicine"));
     if (/^\/api\/v1\/products\/[^/]+$/.test(url.pathname)) return response(product(options.productKind ? { productKind: options.productKind } : {}));
     if (/\/packs\/[^/]+\/(batches|barcodes)$/.test(url.pathname)) return response([]);
     if (/\/packs\/[^/]+\/policy$/.test(url.pathname)) return response(null, 204);

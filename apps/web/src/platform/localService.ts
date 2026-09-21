@@ -212,6 +212,9 @@ export function safeErrorMessage(code?: string): string {
     case "payment_reference_required": return "Enter the card or UPI transaction reference before posting.";
     // Phase 1L-A4: no document AUSHADHARTH issues covers this mix for a GST-registered customer.
     case "registered_recipient_mixed_supply_unsupported": return "A GST-registered customer's bill cannot mix taxable and untaxed items. Bill them separately.";
+    // Phase 1M-A: the Drugs Rules gate.
+    case "regulatory_classification_unresolved": return "A medicine on this bill has no recorded schedule position, so it cannot be sold yet. An owner can record it on the product.";
+    case "regulated_sale_workflow_not_available": return "A line on this bill needs a prescription or register this version cannot keep yet. Remove it to post the rest.";
     case "einvoice_required_unsupported": return "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices. Bill this customer outside AUSHADHARTH.";
     case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
     case "store_licence_archived": return "This licence is archived. Restore it before editing it.";

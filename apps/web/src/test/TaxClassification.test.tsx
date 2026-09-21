@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProductDetail, UserRole } from "@aushadharth/contracts";
 import { App } from "../app/App";
+import { unclassifiedRegulatory } from "./regulatoryDouble";
 import { basisPointsToPercentText } from "../products/productApi";
 
 const IDs = {
@@ -108,6 +109,8 @@ function taxService(options: Options = {}) {
       return response(state.current);
     }
     if (url.pathname === "/api/v1/products") return response([product()]);
+    // Phase 1M-A: every product page reads its Drugs Rules position.
+    if (/^\/api\/v1\/products\/[^/]+\/regulatory$/.test(url.pathname)) return response(unclassifiedRegulatory(IDs.product, "general_pharmacy_item"));
     if (/^\/api\/v1\/products\/[^/]+$/.test(url.pathname)) {
       return response(product({ hsnCodeId: state.current.hsnCodeId as string | null, taxCategoryId: state.current.taxCategoryId as string | null }));
     }

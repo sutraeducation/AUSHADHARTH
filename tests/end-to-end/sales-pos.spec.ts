@@ -207,7 +207,10 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
           id: (each as { id: string }).id, lineNumber: (each as { lineNumber: number }).lineNumber,
           taxableValuePaise: (each as { taxableValuePaise: number }).taxableValuePaise,
           cgstPaise: (each as { cgstPaise: number }).cgstPaise, sgstPaise: (each as { sgstPaise: number }).sgstPaise,
-          igstPaise: 0, cessPaise: 0, lineTotalPaise: (each as { lineTotalPaise: number }).lineTotalPaise
+          igstPaise: 0, cessPaise: 0, lineTotalPaise: (each as { lineTotalPaise: number }).lineTotalPaise,
+          // Phase 1M-A: the service reports the Drugs Rules gate on every quoted line. These bills
+          // sell general items, which the gate clears.
+          regulatoryGate: "clear", regulatoryGateScheme: null
         }))
       } });
     }
