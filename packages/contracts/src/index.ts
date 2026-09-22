@@ -1198,7 +1198,12 @@ export const SaleLineSchema = z.object({
   currentProductDisplayName: z.string().nullable(),
   currentPackDisplayLabel: z.string().nullable(),
   currentBaseUnitLabel: z.string().nullable(),
-  currentBatchNumber: z.string().nullable()
+  currentBatchNumber: z.string().nullable(),
+  /**
+   * Phase 1M-B. The prescription item this line is dispensed against, or null. Settable only while
+   * the Sale is a draft; posting records the dispensing and the link can then never change.
+   */
+  prescriptionItemId: z.string().nullable().default(null)
 });
 
 /** Operational evidence of payment. No cash ledger, no settlement, no receivable. */
@@ -1210,9 +1215,45 @@ export const SaleTenderSchema = z.object({
   referenceText: z.string().nullable()
 });
 
+/**
+ * Phase 1M-B. Who supervised a Schedule H supply, and whether someone confirmed the prescription
+ * was endorsed on paper. The software records a person's confirmation; it never endorses anything.
+ */
+export const SaleSupplySchema = z.object({
+  supervisingProfessionalId: z.string().nullable(),
+  prescriptionEndorsementConfirmed: z.boolean(),
+  /** Rule 65(3)(1), first proviso: attested for the memo book only. */
+  prescriptionOriginalContainerConfirmed: z.boolean().default(false)
+});
+
+/** The two books rule 65(3)(2) lets a Store elect between. */
+export const PrescriptionRecordMethodSchema = z.enum(["prescription_register", "cash_or_credit_memo_book"]);
+
+/**
+ * Phase 1M-B corrective B-R2. A rule 65(3)(1) entry is `prepared` (serial allocated, nothing sold),
+ * `confirmed` (a pharmacist confirmed the registered pharmacist signed the physical entry by hand
+ * and its serial is on the prescription), `finalized` (its Sale posted in the same transaction),
+ * or `void` (cancelled before posting; its serial is kept and never reused).
+ */
+export const PrescriptionRecordStatusSchema = z.enum(["prepared", "confirmed", "finalized", "void"]);
+
+/**
+ * Phase 1M-B. A rule 65(3)(1) entry as a Sale shows it: its serial and state. The particulars,
+ * which name the patient, are read from the entry by the dispensing roles only.
+ */
+export const SaleRecordSummarySchema = z.object({
+  id: z.string(),
+  serialNumber: z.string(),
+  recordMethod: PrescriptionRecordMethodSchema,
+  status: PrescriptionRecordStatusSchema,
+  prescriptionReference: z.string()
+});
+
 export const SaleDetailSchema = SaleSchema.extend({
   lines: z.array(SaleLineSchema).default([]),
-  tenders: z.array(SaleTenderSchema).default([])
+  tenders: z.array(SaleTenderSchema).default([]),
+  supply: SaleSupplySchema.default({ supervisingProfessionalId: null, prescriptionEndorsementConfirmed: false, prescriptionOriginalContainerConfirmed: false }),
+  prescriptionRecords: z.array(SaleRecordSummarySchema).default([])
 });
 
 /**
@@ -1318,8 +1359,63 @@ export const RegulatorySchemeSchema = z.enum([
 
 export const RegulatoryAnswerSchema = z.enum(["applies", "does_not_apply", "unknown"]);
 
-/** What a Sale of this product would do today: sell, refuse as unresolved, or refuse as pending. */
-export const RegulatoryGateSchema = z.enum(["clear", "unresolved", "workflow_unavailable"]);
+/**
+ * What a Sale of this product would do today: sell; sell only on a prescription (Schedule H, since
+ * Phase 1M-B); refuse as unresolved; or refuse because the statutory record it needs does not exist
+ * in this version yet (Schedule H1, X, C, C(1)).
+ */
+export const RegulatoryGateSchema = z.enum(["clear", "prescription_required", "unresolved", "workflow_unavailable"]);
+
+/**
+ * Phase 1M-B — why a line's prescription is not yet enough, as the Store Service judged it. The
+ * quote carries codes and quantities, never a patient's particulars.
+ */
+export const PrescriptionIssueCodeSchema = z.enum([
+  "prescription_missing",
+  "prescription_not_found",
+  "prescription_archived",
+  "prescription_link_not_required",
+  "prescription_substitution_not_permitted",
+  "prescription_quantity_exceeded",
+  "prescription_repeat_not_authorised",
+  "prescription_repeat_too_soon",
+  "prescription_dated_after_supply",
+  "prescription_date_invalid",
+  // Rule 65(3)(1)(f): the entry must name the manufacturer.
+  "manufacturer_not_recorded"
+]);
+
+export const SupplyIssueCodeSchema = z.enum([
+  "supervising_pharmacist_required",
+  "supervising_pharmacist_invalid",
+  "endorsement_not_confirmed",
+  "prescription_record_election_unresolved",
+  "prescription_memo_path_ineligible",
+  // B-R2: the entry must be prepared, and then confirmed, before the Sale may post.
+  "prescription_record_not_prepared",
+  "prescription_record_not_confirmed",
+  // B-R2: the prepared entry no longer matches the Sale, the election or the pharmacist.
+  "prescription_record_stale"
+]);
+
+export const LinePrescriptionSummarySchema = z.object({
+  required: z.boolean(),
+  prescriptionItemId: z.string().nullable(),
+  prescriptionReference: z.string().nullable(),
+  /** What the linked item has left before this Sale, in base-unit atoms. */
+  remainingAtoms: z.number().int().nullable(),
+  issue: PrescriptionIssueCodeSchema.nullable()
+});
+
+export const SupplySummarySchema = z.object({
+  supervisionRequired: z.boolean(),
+  supervisingProfessionalId: z.string().nullable(),
+  endorsementConfirmed: z.boolean(),
+  /** Rule 65(3)(2): the book the election in force names, or null where none is recorded. */
+  recordMethod: z.enum(["prescription_register", "cash_or_credit_memo_book"]).nullable(),
+  originalContainerConfirmed: z.boolean(),
+  issues: z.array(SupplyIssueCodeSchema)
+});
 
 export const SaleQuoteLineSchema = z.object({
   id: z.string(),
@@ -1337,7 +1433,9 @@ export const SaleQuoteLineSchema = z.object({
    * posting decides, and re-resolves for itself.
    */
   regulatoryGate: RegulatoryGateSchema,
-  regulatoryGateScheme: RegulatorySchemeSchema.nullable()
+  regulatoryGateScheme: RegulatorySchemeSchema.nullable(),
+  /** Phase 1M-B. Whether this line needs a prescription and whether the linked one is enough. */
+  prescription: LinePrescriptionSummarySchema
 });
 
 export const SaleQuoteSchema = z.object({
@@ -1361,7 +1459,9 @@ export const SaleQuoteSchema = z.object({
    */
   dynamicQrApplicability: z.enum(["unknown", "not_required", "required"]).nullable(),
   /** A registered customer's bill mixing taxable and untaxed items, which posting refuses. */
-  registeredRecipientMixedSupply: z.boolean()
+  registeredRecipientMixedSupply: z.boolean(),
+  /** Phase 1M-B. What the whole supply still needs: a supervising pharmacist and the endorsement. */
+  supply: SupplySummarySchema
 });
 
 /** Why an invoice must show recipient particulars: Rule 46(d), 46(e) and 46(f) respectively. */
@@ -1411,8 +1511,18 @@ export const SaleErrorCodeSchema = z.enum([
   "registered_recipient_mixed_supply_unsupported",
   // Phase 1M-A: a medicine with no recorded schedule position cannot be sold.
   "regulatory_classification_unresolved",
-  // Phase 1M-A: the line needs a prescription or register this version does not implement yet.
+  // Phase 1M-A: the line needs a register this version does not implement yet (Schedule C, C(1)).
   "regulated_sale_workflow_not_available",
+  // Phase 1M-B: a Schedule H1 line; its register (rule 65(3)(1)(h)) is a later phase.
+  "schedule_h1_register_not_available",
+  // Phase 1M-B: a Schedule X line; its workflow and rule 65(21) record are a later phase.
+  "schedule_x_workflow_not_available",
+  // Phase 1M-B: a Schedule H supply without everything rule 65 asks; the issues name each one.
+  "prescription_requirements_incomplete",
+  // Phase 1M-B: no rule 65(3)(2) election is in force, so the supply has no book to be entered in.
+  "prescription_record_election_unresolved",
+  // Phase 1M-B B-R2: the Sale's rule 65(3)(1) entry is prepared, so the Sale is held until it is voided.
+  "prescription_record_prepared",
   "product_tax_classification_incomplete",
   "tax_rate_not_found",
   "product_pack_mismatch",
@@ -1456,6 +1566,11 @@ export type SaleAddressInput = z.infer<typeof SaleAddressInputSchema>;
 export type RecipientRequirement = z.infer<typeof RecipientRequirementSchema>;
 export type RecipientRequirementReason = z.infer<typeof RecipientRequirementReasonSchema>;
 export type SaleErrorCode = z.infer<typeof SaleErrorCodeSchema>;
+export type SaleSupply = z.infer<typeof SaleSupplySchema>;
+export type LinePrescriptionSummary = z.infer<typeof LinePrescriptionSummarySchema>;
+export type SupplySummary = z.infer<typeof SupplySummarySchema>;
+export type PrescriptionIssueCode = z.infer<typeof PrescriptionIssueCodeSchema>;
+export type SupplyIssueCode = z.infer<typeof SupplyIssueCodeSchema>;
 
 /**
  * Phase 1I returns.
@@ -2554,3 +2669,194 @@ export type RecordElectionKind = z.infer<typeof RecordElectionKindSchema>;
 export type RecordElectionMethod = z.infer<typeof RecordElectionMethodSchema>;
 export type RecordElection = z.infer<typeof RecordElectionSchema>;
 export type DrugCompliance = z.infer<typeof DrugComplianceSchema>;
+
+/* ------------------------------------------------------------------------------------------------
+ * Phase 1M-B — prescribers and prescriptions
+ *
+ * A prescription is the structured record of the paper the customer brought: the date, who wrote
+ * it, who it is for (or the owner of the animal), and each item with its total quantity and dose,
+ * as rule 65(10) asks. The paper stays with the pharmacy; nothing here stores an image of it, and
+ * nothing here claims a prescriber or a pharmacist was verified — only that their details were
+ * recorded.
+ * ---------------------------------------------------------------------------------------------- */
+
+export const PrescriberSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  fullName: z.string(),
+  addressText: z.string(),
+  registrationNumber: z.string().nullable(),
+  registeringAuthority: z.string().nullable()
+});
+
+export const PrescriberInputSchema = z.object({
+  expectedRevision: z.number().int().positive().optional(),
+  fullName: z.string(),
+  addressText: z.string(),
+  registrationNumber: z.string().nullable().optional(),
+  registeringAuthority: z.string().nullable().optional()
+});
+
+export const PrescriptionSubjectKindSchema = z.enum(["human", "animal"]);
+
+/**
+ * Rule 65(11). "once" is the rule's default and the only answer a blank can give. "stated_times"
+ * counts every occasion, the first included.
+ */
+export const RepeatAuthoritySchema = z.enum(["once", "stated_times", "stated_without_count"]);
+
+export const PrescriptionItemInputSchema = z.object({
+  productId: z.string(),
+  writtenDescription: z.string(),
+  prescribedQuantityAtoms: z.number().int().positive(),
+  doseText: z.string()
+});
+
+export const PrescriptionInputSchema = z.object({
+  expectedRevision: z.number().int().positive().optional(),
+  prescribedOn: z.string(),
+  prescriberId: z.string().nullable().optional(),
+  prescriberName: z.string(),
+  prescriberAddress: z.string(),
+  prescriberRegistrationNumber: z.string().nullable().optional(),
+  prescriberRegisteringAuthority: z.string().nullable().optional(),
+  subjectKind: PrescriptionSubjectKindSchema,
+  subjectName: z.string(),
+  subjectAddress: z.string(),
+  directionsText: z.string().nullable().optional(),
+  repeatAuthority: RepeatAuthoritySchema,
+  repeatTimes: z.number().int().nullable().optional(),
+  repeatIntervalDays: z.number().int().nullable().optional(),
+  writtenSignedDatedAttested: z.boolean(),
+  items: z.array(PrescriptionItemInputSchema).min(1)
+});
+
+/** A list row: the reference, date and prescriber. Never the patient. */
+export const PrescriptionSummarySchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  prescribedOn: z.string(),
+  prescriberName: z.string(),
+  status: z.enum(["active", "archived"]),
+  itemCount: z.number().int()
+});
+
+export const PrescriptionItemSchema = z.object({
+  id: z.string(),
+  lineNumber: z.number().int().positive(),
+  productId: z.string(),
+  productDisplayName: z.string().nullable(),
+  writtenDescription: z.string(),
+  prescribedQuantityAtoms: z.number().int().positive(),
+  doseText: z.string(),
+  dispensedAtoms: z.number().int(),
+  reinstatedAtoms: z.number().int()
+});
+
+export const PrescriptionDispensingSchema = z.object({
+  id: z.string(),
+  prescriptionItemId: z.string(),
+  saleDocumentId: z.string(),
+  documentNumber: z.string().nullable(),
+  quantityAtoms: z.number().int(),
+  dispensedOn: z.string(),
+  supervisingProfessionalName: z.string(),
+  reversedAtoms: z.number().int()
+});
+
+export const PrescriptionDetailSchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  prescribedOn: z.string(),
+  prescriberId: z.string().nullable(),
+  prescriberName: z.string(),
+  prescriberAddress: z.string(),
+  prescriberRegistrationNumber: z.string().nullable(),
+  prescriberRegisteringAuthority: z.string().nullable(),
+  subjectKind: PrescriptionSubjectKindSchema,
+  subjectName: z.string(),
+  subjectAddress: z.string(),
+  directionsText: z.string().nullable(),
+  repeatAuthority: RepeatAuthoritySchema,
+  repeatTimes: z.number().int().nullable(),
+  repeatIntervalDays: z.number().int().nullable(),
+  archiveReason: z.string().nullable(),
+  createdAtUtc: z.string(),
+  items: z.array(PrescriptionItemSchema),
+  dispensings: z.array(PrescriptionDispensingSchema),
+  /** Distinct Sales that dispensed from it. A return does not give an occasion back. */
+  occasionsUsed: z.number().int(),
+  /** Null where the prescriber stated repeats without a number. */
+  occasionsAuthorised: z.number().int().nullable(),
+  /** The rule 65(3)(1) entries recording its supplies, oldest first. */
+  records: z.array(z.object({
+    id: z.string(),
+    serialNumber: z.string(),
+    recordMethod: z.enum(["prescription_register", "cash_or_credit_memo_book"]),
+    dateOfSupply: z.string(),
+    status: PrescriptionRecordStatusSchema
+  })).default([])
+});
+
+/**
+ * Phase 1M-B. A rule 65(3)(1) entry with every particular, for the dispensing roles. The software
+ * never signs it: `manualSignatureConfirmed` records that a person (`confirmedByDisplayName`)
+ * confirmed the registered pharmacist signed the rendered entry by hand, before the supply.
+ */
+export const PrescriptionSupplyRecordSchema = z.object({
+  id: z.string(),
+  serialNumber: z.string(),
+  recordMethod: z.enum(["prescription_register", "cash_or_credit_memo_book"]),
+  status: PrescriptionRecordStatusSchema,
+  dateOfSupply: z.string(),
+  prescriberName: z.string(),
+  prescriberAddress: z.string(),
+  subjectKind: z.enum(["human", "animal"]),
+  subjectName: z.string(),
+  subjectAddress: z.string(),
+  supervisingProfessionalName: z.string(),
+  supervisingRegistrationNumber: z.string(),
+  originalContainerConfirmed: z.boolean(),
+  manualSignatureConfirmed: z.boolean(),
+  serialWrittenOnPrescription: z.boolean(),
+  preparedByDisplayName: z.string().nullable(),
+  preparedAtUtc: z.string(),
+  confirmedByDisplayName: z.string().nullable(),
+  confirmedAtUtc: z.string().nullable(),
+  finalizedAtUtc: z.string().nullable(),
+  voidedByDisplayName: z.string().nullable(),
+  voidedAtUtc: z.string().nullable(),
+  voidReason: z.string().nullable(),
+  previousSerialNumber: z.string().nullable(),
+  prescriptionId: z.string(),
+  prescriptionReference: z.string(),
+  saleDocumentId: z.string(),
+  documentNumber: z.string().nullable(),
+  lines: z.array(z.object({
+    drugName: z.string(),
+    quantityAtoms: z.number().int(),
+    quantityUnitLabel: z.string().nullable(),
+    manufacturerName: z.string(),
+    batchNumber: z.string(),
+    batchExpiresOn: z.string().nullable(),
+    returnedAtoms: z.number().int()
+  }))
+});
+
+export type Prescriber = z.infer<typeof PrescriberSchema>;
+export type PrescriberInput = z.infer<typeof PrescriberInputSchema>;
+export type PrescriptionSubjectKind = z.infer<typeof PrescriptionSubjectKindSchema>;
+export type RepeatAuthority = z.infer<typeof RepeatAuthoritySchema>;
+export type PrescriptionItemInput = z.infer<typeof PrescriptionItemInputSchema>;
+export type PrescriptionInput = z.infer<typeof PrescriptionInputSchema>;
+export type PrescriptionSummary = z.infer<typeof PrescriptionSummarySchema>;
+export type PrescriptionItem = z.infer<typeof PrescriptionItemSchema>;
+export type PrescriptionDispensing = z.infer<typeof PrescriptionDispensingSchema>;
+export type PrescriptionDetail = z.infer<typeof PrescriptionDetailSchema>;
+export type PrescriptionSupplyRecord = z.infer<typeof PrescriptionSupplyRecordSchema>;
+export type PrescriptionRecordMethod = z.infer<typeof PrescriptionRecordMethodSchema>;
+export type PrescriptionRecordStatus = z.infer<typeof PrescriptionRecordStatusSchema>;
+export type SaleRecordSummary = z.infer<typeof SaleRecordSummarySchema>;

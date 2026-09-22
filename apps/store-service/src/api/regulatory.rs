@@ -400,6 +400,10 @@ async fn get_product_regulatory(
     let (sale_gate, sale_gate_scheme) = match gate {
         crate::domain::regulatory::SaleGate::Clear => ("clear".to_owned(), None),
         crate::domain::regulatory::SaleGate::Unresolved => ("unresolved".to_owned(), None),
+        crate::domain::regulatory::SaleGate::PrescriptionRequired => (
+            "prescription_required".to_owned(),
+            Some("schedule_h".to_owned()),
+        ),
         crate::domain::regulatory::SaleGate::WorkflowUnavailable { scheme } => {
             ("workflow_unavailable".to_owned(), Some(scheme.to_owned()))
         }

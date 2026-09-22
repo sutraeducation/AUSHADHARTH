@@ -214,7 +214,16 @@ export function safeErrorMessage(code?: string): string {
     case "registered_recipient_mixed_supply_unsupported": return "A GST-registered customer's bill cannot mix taxable and untaxed items. Bill them separately.";
     // Phase 1M-A: the Drugs Rules gate.
     case "regulatory_classification_unresolved": return "A medicine on this bill has no recorded schedule position, so it cannot be sold yet. An owner can record it on the product.";
-    case "regulated_sale_workflow_not_available": return "A line on this bill needs a prescription or register this version cannot keep yet. Remove it to post the rest.";
+    case "regulated_sale_workflow_not_available": return "A line on this bill needs a statutory register this version cannot keep yet. Remove it to post the rest.";
+    // Phase 1M-B: Schedule H sells on a prescription; H1 and X stay refused until their own records exist.
+    case "schedule_h1_register_not_available": return "Schedule H1 dispensing requires the H1 register workflow, which is not yet available.";
+    case "schedule_x_workflow_not_available": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
+    case "prescription_requirements_incomplete": return "This Schedule H sale is missing prescription requirements.";
+    case "prescription_record_election_unresolved": return "The pharmacy's rule 65(3)(2) prescription-supply record election is not recorded. The owner records it in Drug Compliance.";
+    case "prescription_record_prepared": return "This sale's prescription-supply entry is prepared, so the sale cannot be changed. Void the entry to change it; its serial is not reused.";
+    case "prescription_record_state_conflict": return "This prescription-supply entry can no longer be changed that way.";
+    case "prescription_is_dispensed": return "This prescription has been dispensed and can no longer be corrected. Archive it and enter a new one.";
+    case "record_archived": return "This record is archived.";
     case "einvoice_required_unsupported": return "This pharmacy must e-invoice GST-registered customers, and AUSHADHARTH cannot issue e-invoices. Bill this customer outside AUSHADHARTH.";
     case "store_licence_conflict": return "That licence number is already recorded for this pharmacy.";
     case "store_licence_archived": return "This licence is archived. Restore it before editing it.";

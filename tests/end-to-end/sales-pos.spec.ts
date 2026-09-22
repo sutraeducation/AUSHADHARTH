@@ -210,8 +210,11 @@ async function mockStoreService(page: Page, options: { role?: "owner_admin" | "c
           igstPaise: 0, cessPaise: 0, lineTotalPaise: (each as { lineTotalPaise: number }).lineTotalPaise,
           // Phase 1M-A: the service reports the Drugs Rules gate on every quoted line. These bills
           // sell general items, which the gate clears.
-          regulatoryGate: "clear", regulatoryGateScheme: null
-        }))
+          regulatoryGate: "clear", regulatoryGateScheme: null,
+          // Phase 1M-B: every quoted line says whether it needs a prescription. None of these do.
+          prescription: { required: false, prescriptionItemId: null, prescriptionReference: null, remainingAtoms: null, issue: null }
+        })),
+        supply: { supervisionRequired: false, supervisingProfessionalId: null, endorsementConfirmed: false, recordMethod: null, originalContainerConfirmed: false, issues: [] }
       } });
     }
 

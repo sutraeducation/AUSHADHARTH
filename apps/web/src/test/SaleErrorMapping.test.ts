@@ -58,8 +58,9 @@ function responseCodes(): string[] {
   const block = source.slice(start, end);
 
   const codes = new Set<string>();
-  for (const [, code] of block.matchAll(/simple\(\s*"([a-z_]+)"/g)) codes.add(code);
-  for (const [, code] of block.matchAll(/\bcode:\s*"([a-z_]+)"/g)) codes.add(code);
+  // Digits included: Phase 1M-B's schedule_h1_register_not_available was invisible to [a-z_].
+  for (const [, code] of block.matchAll(/simple\(\s*"([a-z0-9_]+)"/g)) codes.add(code);
+  for (const [, code] of block.matchAll(/\bcode:\s*"([a-z0-9_]+)"/g)) codes.add(code);
   return [...codes].sort();
 }
 
@@ -82,6 +83,7 @@ describe("sale error mapping", () => {
     expect(CODES).toContain("sale_not_found");
     expect(CODES).toContain("selling_rate_above_mrp");
     expect(CODES).toContain("internal_error");
+    expect(CODES).toContain("schedule_h1_register_not_available");
   });
 
   /**

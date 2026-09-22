@@ -12,6 +12,7 @@ pub mod backups;
 pub mod inventory;
 pub mod invoices;
 pub mod parties;
+pub mod prescriptions;
 pub mod product_catalog;
 pub mod purchases;
 pub mod reference_masters;
@@ -74,6 +75,7 @@ pub fn router_with_backups(
         .merge(parties::routes())
         .merge(store_profile::routes())
         .merge(regulatory::routes())
+        .merge(prescriptions::routes())
         .merge(purchases::routes())
         .merge(sales::routes())
         .merge(invoices::routes())

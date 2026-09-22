@@ -385,11 +385,12 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
    order — entry, the bill, and the amount payable — because a queue does not wait while somebody
    opens a dialog. The bill and the total sit side by side on a wide screen and stack on a narrow
    one, so the same screen works on the shop's monitor and on a phone at the delivery counter. */
-.pos { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); grid-template-areas: "entry entry" "lines summary" "customer summary"; align-items: start; }
+.pos { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); grid-template-areas: "entry entry" "lines summary" "prescription summary" "customer summary"; align-items: start; }
 .pos-entry { grid-area: entry; }
 .pos-lines { grid-area: lines; min-width: 0; }
 .pos-summary { grid-area: summary; }
 .pos-customer { grid-area: customer; }
+.pos-prescription { grid-area: prescription; }
 .pos > .inline-notice { grid-area: entry; grid-row: 1; align-self: end; }
 
 /* The entry row. The search box is given the width because it is where every line begins, and the
@@ -446,12 +447,57 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
   .pos-address { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* Phase 1M-B. The Schedule H supply panel appears only when a line needs it. Each line states its
+   prescription in words; the supervising pharmacist and the endorsement are one short form. */
+.pos-prescription { display: grid; gap: 12px; min-width: 0; padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.pos-prescription h3 { margin: 0; font-size: .78rem; }
+.pos-prescription .panel-note { margin: 0; }
+.pos-prescription__line, .pos-prescription__supply, .pos-prescription__record { display: grid; gap: 6px; min-width: 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.pos-prescription__record .button { justify-self: start; }
+.pos-prescription__records { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.pos-prescription__steps { margin: 0; padding-left: 18px; font-size: .72rem; line-height: 1.55; color: var(--ink-700); }
+.pos-prescription__heading, .pos-prescription__state { margin: 0; font-size: .74rem; color: var(--ink-700); overflow-wrap: anywhere; }
+.pos-prescription__issues { margin: 0; padding-left: 18px; color: var(--danger-700); font-size: .7rem; font-weight: 700; line-height: 1.55; }
+.pos-prescription__controls { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: end; min-width: 0; }
+.pos-prescription__controls .field { margin: 0; min-width: min(220px, 100%); flex: 1 1 220px; }
+.pos-prescription__controls .field input, .pos-prescription__controls .field select { width: 100%; }
+.pos-prescription__controls .check-field { flex: 1 1 100%; }
+.pos-prescription .pos-warning { margin: 0; font-size: .72rem; }
+.panel-callout ul { margin: 4px 0; padding-left: 18px; overflow-wrap: anywhere; }
+
+/* Phase 1M-B: the rule 65(3)(1) entry, laid out as the leaf the pharmacist signs and keeps. */
+.record-page { display: grid; gap: 16px; }
+.record-leaf { display: grid; gap: 12px; }
+.record-leaf h2 { margin: 0; font-size: .86rem; }
+.record-leaf__particulars { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px 16px; margin: 0; }
+.record-leaf__particulars dt { color: var(--ink-500); font-size: .66rem; font-weight: 800; letter-spacing: .03em; }
+.record-leaf__particulars dd { margin: 2px 0 0; font-size: .76rem; overflow-wrap: anywhere; }
+.record-leaf__signature { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding-top: 18px; font-size: .74rem; }
+.record-leaf__signature-line { flex: 1 1 200px; min-width: 0; height: 36px; border-bottom: 1px solid var(--ink-700); }
+.record-leaf__status { margin: 0; font-size: .72rem; font-weight: 700; }
+.record-complete { display: grid; gap: 10px; }
+.record-complete h2 { margin: 0; font-size: .82rem; }
+
+/* The prescription entry page: the paper, in reading order. */
+.prescription-form { display: grid; gap: 16px; }
+.prescription-form__group { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px 14px; min-width: 0; margin: 0; padding: 12px 0 0; border: 0; border-top: 1px solid var(--line); }
+.prescription-form__group > legend { padding: 0; font-size: .78rem; font-weight: 800; }
+.prescription-form__group > .choice-row, .prescription-form__group > .check-field, .prescription-form__items > .button { grid-column: 1 / -1; }
+.prescription-form__items { grid-template-columns: minmax(0, 1fr); }
+.prescription-form .field { margin: 0; min-width: 0; }
+.prescription-form .field input, .prescription-form .field select { width: 100%; }
+.prescription-item { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 10px 14px; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.prescription-item__product { position: relative; grid-column: 1 / -1; }
+.prescription-item__chosen { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; overflow-wrap: anywhere; }
+.prescription-item > .button { justify-self: start; }
+.prescription-form__attest { font-weight: 700; }
+
 /* An expired lot or an empty one is stated in the operator's own colour vocabulary rather than
    quietly hidden: a lot that vanishes teaches nothing, and the operator goes looking for it. */
 .pos-warning { color: var(--danger-700); font-weight: 700; }
 
 @media (max-width: 900px) {
-  .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "customer"; }
+  .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "prescription" "customer"; }
   .pos-summary { position: static; }
 }
 

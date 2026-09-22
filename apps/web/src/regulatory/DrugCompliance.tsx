@@ -13,6 +13,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { LocalServiceError } from "../platform/localService";
 import { CatalogDialog } from "../products/CatalogDialog";
+import { PrescribersPanel } from "../prescriptions/Prescriptions";
 import {
   CAPACITY_LABELS,
   ELECTION_LABELS,
@@ -82,6 +83,8 @@ export function DrugCompliancePage() {
                 </tr>)}</tbody>
               </table></div>}
         </section>
+
+        <PrescribersPanel />
 
         <section className="master-panel" aria-labelledby="licence-forms-title">
           <div className="panel-header">

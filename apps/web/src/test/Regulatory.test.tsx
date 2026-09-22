@@ -76,6 +76,8 @@ function service(options: Options = {}) {
       writes.push({ path: url.pathname, body });
       return response({ id: IDs.finding, revision: 1, status: "active", ...body, effectiveTo: null, evidenceReference: body.evidenceReference ?? null, reason: null }, 201);
     }
+    // Phase 1M-B: Drug Compliance also lists the prescribers, for the dispensing roles only.
+    if (url.pathname === "/api/v1/prescribers") return role === "cashier" ? failure("authorization_denied", 403) : response([]);
     throw new Error(`Unexpected request: ${method} ${url.pathname}`);
   });
   return { fetchMock, writes };

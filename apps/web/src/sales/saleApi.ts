@@ -122,6 +122,50 @@ export async function postSale(
 }
 
 /**
+ * Phase 1M-B. Points a draft line at the prescription item it is dispensed against, or clears it.
+ * Any change withdraws the endorsement confirmation, because what is dispensed has changed.
+ */
+export async function setLinePrescription(
+  lineId: string,
+  expectedRevision: number,
+  prescriptionItemId: string | null
+): Promise<SaleDetail> {
+  return SaleDetailSchema.parse(await localServiceRequest(`/api/v1/sale-lines/${lineId}/prescription`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision, prescriptionItemId })
+  }));
+}
+
+/**
+ * Phase 1M-B. The registered pharmacist supervising a Schedule H supply, and a person's
+ * confirmation that the prescription was endorsed on paper. The software never endorses anything.
+ */
+export async function setSaleSupply(
+  saleId: string,
+  expectedRevision: number,
+  supervisingProfessionalId: string | null,
+  prescriptionEndorsementConfirmed: boolean,
+  prescriptionOriginalContainerConfirmed = false
+): Promise<SaleDetail> {
+  return SaleDetailSchema.parse(await localServiceRequest(`/api/v1/sales/${saleId}/supply`, {
+    method: "PUT",
+    body: JSON.stringify({ expectedRevision, supervisingProfessionalId, prescriptionEndorsementConfirmed, prescriptionOriginalContainerConfirmed })
+  }));
+}
+
+/**
+ * Phase 1M-B B-R2. Prepares the Sale's rule 65(3)(1) entry: the serial is allocated in the elected
+ * book and nothing is sold. The registered pharmacist then signs the printed entry by hand, its
+ * serial is written on the prescription, and a pharmacist confirms both before the Sale may post.
+ */
+export async function prepareSaleRecords(saleId: string, expectedRevision: number): Promise<SaleDetail> {
+  return SaleDetailSchema.parse(await localServiceRequest(`/api/v1/sales/${saleId}/prescription-records`, {
+    method: "POST",
+    body: JSON.stringify({ expectedRevision })
+  }));
+}
+
+/**
  * A selling rate in rupees to exact integer paise, using string arithmetic so `12.5` never becomes
  * a binary float and a third decimal is rejected rather than silently rounded.
  *

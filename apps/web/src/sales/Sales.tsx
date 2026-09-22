@@ -17,9 +17,10 @@ import type {
   SellableBatch,
   TenderMethod
 } from "@aushadharth/contracts";
-import type { RegulatoryGate, RegulatoryScheme } from "@aushadharth/contracts";
+import type { RegulatoryGate, RegulatoryScheme, SaleQuote, SaleQuoteLine } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
-import { SCHEME_LABELS } from "../regulatory/regulatoryApi";
+import { SCHEME_LABELS, listProfessionals } from "../regulatory/regulatoryApi";
+import { PRESCRIPTION_ISSUE_TEXT, RECORD_METHOD_LABELS, RECORD_STATUS_LABELS, SUPPLY_ISSUE_TEXT, getPrescription, listPrescriptions } from "../prescriptions/prescriptionApi";
 import { businessToday } from "../platform/businessDate";
 import { LocalServiceError } from "../platform/localService";
 import { listParties } from "../parties/partyApi";
@@ -40,6 +41,9 @@ import {
   quoteSale,
   removeSaleLine,
   sellingRateToPaise,
+  setLinePrescription,
+  prepareSaleRecords,
+  setSaleSupply,
   updateSaleDraft,
   type SaleStatusFilter
 } from "./saleApi";
@@ -366,8 +370,19 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
   // Phase 1M-A: the quote says, line by line, what the Drugs Rules gate will do at posting. The
   // counter is told before tendering; posting re-resolves and refuses independently.
   const regulatoryByLine = new Map((quote.data?.lines ?? []).map((line) => [line.id, line]));
-  const regulatoryBlocked = (quote.data?.lines ?? []).some((line) => line.regulatoryGate !== "clear");
-  const canClassify = auth.status?.user?.role === "owner_admin";
+  const quoteLines = quote.data?.lines ?? [];
+  // Refused whatever is done at the counter: an unclassified medicine, or a schedule whose statutory
+  // record this version does not keep (H1, X, C, C(1)).
+  const hardBlocked = quoteLines.filter((line) => line.regulatoryGate === "unresolved" || line.regulatoryGate === "workflow_unavailable");
+  // Phase 1M-B: Schedule H sells once its prescription, pharmacist and endorsement are in place.
+  const prescriptionIncomplete = quoteLines.some((line) => line.prescription.issue !== null)
+    || (quote.data?.supply.issues.length ?? 0) > 0;
+  const regulatoryBlocked = hardBlocked.length > 0 || prescriptionIncomplete;
+  const showPrescriptionPanel = Boolean(quote.data && (quote.data.supply.supervisionRequired
+    || quoteLines.some((line) => line.prescription.issue !== null || line.prescription.prescriptionItemId !== null)));
+  const role = auth.status?.user?.role;
+  const canClassify = role === "owner_admin";
+  const canDispense = role === "owner_admin" || role === "pharmacist";
 
   const openCustomerDetails = () => {
     setCustomerOpen(true);
@@ -553,9 +568,15 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           <small>This pharmacy has not recorded in Store Profile whether the Dynamic QR requirement for GST invoices to unregistered customers applies to it. This sale cannot be posted until the owner records it.</small>
         </div>}
 
-        {regulatoryBlocked && <div className="panel-callout panel-callout--blocking" role="status" data-testid="regulatory-blocked">
-          <strong>A line cannot be sold yet</strong>
-          <small>A medicine on this bill has no recorded schedule position, or is classified within a schedule whose prescription or register requirements this version does not provide. Remove the line to post the rest.</small>
+        {hardBlocked.length > 0 && <div className="panel-callout panel-callout--blocking" role="status" data-testid="regulatory-blocked">
+          <strong>{hardBlocked.length === 1 ? `Line ${hardBlocked[0].lineNumber} cannot be sold yet` : `Lines ${hardBlocked.map((line) => line.lineNumber).join(", ")} cannot be sold yet`}</strong>
+          <ul>{hardBlocked.map((line) => <li key={line.id}>Line {line.lineNumber}: {blockedLineText(line)}</li>)}</ul>
+          <small>Remove {hardBlocked.length === 1 ? "that line" : "those lines"} to post the rest.</small>
+        </div>}
+
+        {hardBlocked.length === 0 && prescriptionIncomplete && <div className="panel-callout panel-callout--blocking" role="status" data-testid="prescription-incomplete">
+          <strong>Prescription requirements not yet complete</strong>
+          <small>Complete the Schedule H supply details below before posting.</small>
         </div>}
 
         {mixedSupply && <div className="panel-callout panel-callout--blocking" role="status">
@@ -582,6 +603,13 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
           ? "Posting issues the cash memo number and takes the stock out. This pharmacy is recorded as not GST-registered, so no GST is charged. It cannot be undone."
           : "Posting issues the invoice number, charges the GST and takes the stock out. It cannot be undone."}</p>
       </aside>
+
+      {showPrescriptionPanel && quote.data && <PrescriptionSupplyPanel
+        sale={sale}
+        quote={quote.data}
+        canDispense={canDispense}
+        onChanged={refresh}
+      />}
 
       <CustomerPanel
         key={sale.id}
@@ -887,6 +915,8 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
             <div className="totals-grand"><dt>Invoice total</dt><dd className="numeric">{paiseToAmountText(sale.grandTotalPaise)}</dd></div>
           </dl>}
 
+      {sale.prescriptionRecords.length > 0 && <PrescriptionRecordsSection records={sale.prescriptionRecords} />}
+
       {sale.tenders.length > 0 && <p className="pos-summary__note">Paid by {TENDER_LABELS[sale.tenders[0].method]} · {paiseToAmountText(sale.tenders[0].amountPaise)}{sale.tenders[0].referenceText ? ` · ${sale.tenders[0].referenceText}` : ""}</p>}
 
       {sale.lines.some((line) => line.priceControlStatus === "controlled") && <p className="pos-summary__note">
@@ -962,6 +992,7 @@ function messageFor(caught: unknown, fallback: string): string {
  * plain sentence.
  */
 const ITEMISED_REFUSALS = new Set([
+  "prescription_requirements_incomplete",
   "store_legal_profile_incomplete",
   "recipient_particulars_incomplete",
   "sale_compliance_incomplete"
@@ -990,11 +1021,270 @@ function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
   if (!gate || gate === "clear") return null;
   const text = gate === "unresolved"
     ? "Classification unresolved — not sellable until recorded"
-    : `${scheme ? SCHEME_LABELS[scheme] : "Regulated"} — prescription workflow not yet available`;
+    : gate === "prescription_required"
+      ? "Schedule H — sold only on a prescription"
+      : workflowText(scheme);
   return <small className={`regulatory-line regulatory-line--${gate}`} role="note">
     {text}
     {gate === "unresolved" && canClassify && <> · <Link to={`/app/products/${productId}`}>Classify</Link></>}
   </small>;
+}
+
+/**
+ * Phase 1M-B — why a schedule still refuses a line, in the operator's words. Schedule H1 and X say
+ * exactly which workflow is missing; a prescription does not make either of them sellable.
+ */
+function workflowText(scheme: RegulatoryScheme | null): string {
+  switch (scheme) {
+    case "schedule_h1": return "Schedule H1 dispensing requires the H1 register workflow, which is not yet available.";
+    case "schedule_x": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
+    case "schedule_c":
+    case "schedule_c1": return `${SCHEME_LABELS[scheme]} — its statutory record is not yet available, so it cannot be sold.`;
+    default: return "Regulated — the statutory record it needs is not yet available.";
+  }
+}
+
+function blockedLineText(line: SaleQuoteLine): string {
+  return line.regulatoryGate === "unresolved"
+    ? "a medicine with no recorded schedule position. An owner can record it on the product."
+    : workflowText(line.regulatoryGateScheme);
+}
+
+/**
+ * Phase 1M-B — what a Schedule H supply still needs, beside the bill.
+ *
+ * Shown only when a line needs it, so an ordinary sale looks exactly as before. Everything here is
+ * the Store Service's judgement read back from the quote; posting re-checks all of it under its own
+ * lock. The counter sees a prescription's reference and quantities, never the patient: those stay
+ * on the prescription, which only a pharmacist or the owner can open.
+ */
+function PrescriptionSupplyPanel({ sale, quote, canDispense, onChanged }: {
+  sale: SaleDetail;
+  quote: SaleQuote;
+  canDispense: boolean;
+  onChanged: () => void;
+}) {
+  const lines = sale.lines.filter((line) => {
+    const summary = quote.lines.find((each) => each.id === line.id)?.prescription;
+    return summary && (summary.required || summary.prescriptionItemId !== null || summary.issue !== null);
+  });
+  return <section className="pos-prescription" aria-labelledby="pos-prescription-title" data-testid="prescription-panel">
+    <h3 id="pos-prescription-title">Prescription supply</h3>
+    <p className="panel-note">A Schedule H medicine is sold only on a prescription, under the personal supervision of a registered pharmacist, with the prescription endorsed at the time of supply.</p>
+    {lines.map((line) => <LinePrescription
+      key={line.id}
+      sale={sale}
+      line={line}
+      summary={quote.lines.find((each) => each.id === line.id)!.prescription}
+      canDispense={canDispense}
+      onChanged={onChanged}
+    />)}
+    {quote.supply.supervisionRequired && <SupervisionFields sale={sale} quote={quote} canDispense={canDispense} onChanged={onChanged} />}
+    {quote.supply.supervisionRequired && <StatutoryRecordStep sale={sale} quote={quote} canDispense={canDispense} onChanged={onChanged} />}
+    {!canDispense && <p className="panel-note" role="note">A pharmacist or the owner links the prescription and records the supervising pharmacist. The sale can then be posted from this counter.</p>}
+  </section>;
+}
+
+function LinePrescription({ sale, line, summary, canDispense, onChanged }: {
+  sale: SaleDetail;
+  line: SaleLine;
+  summary: SaleQuoteLine["prescription"];
+  canDispense: boolean;
+  onChanged: () => void;
+}) {
+  const [reference, setReference] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const unit = line.baseUnitLabel ?? line.currentBaseUnitLabel ?? "units";
+  const name = line.productDisplayName ?? line.currentProductDisplayName ?? "This line";
+  const inputId = `pos-rx-reference-${line.lineNumber}`;
+
+  const link = async (event: FormEvent) => {
+    event.preventDefault();
+    setNotice(null);
+    const wanted = reference.trim().toUpperCase();
+    if (!wanted) { setNotice("Enter the prescription reference, such as RX-000001."); document.getElementById(inputId)?.focus(); return; }
+    setBusy(true);
+    try {
+      const found = (await listPrescriptions(wanted)).find((each) => each.reference === wanted);
+      if (!found) { setNotice(`No prescription has the reference ${wanted}.`); return; }
+      const detail = await getPrescription(found.id);
+      const items = detail.items.filter((item) => item.productId === line.productId);
+      if (items.length === 0) { setNotice(`${wanted} does not name this product. Another preparation cannot be supplied in its place.`); return; }
+      // Of several items naming this product, the first with anything left.
+      const item = items.find((each) => each.prescribedQuantityAtoms - each.dispensedAtoms + each.reinstatedAtoms > 0) ?? items[0];
+      await setLinePrescription(line.id, sale.revision, item.id);
+      setReference("");
+      onChanged();
+    } catch (caught) {
+      setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : postingProblem(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unlink = async () => {
+    setNotice(null);
+    setBusy(true);
+    try { await setLinePrescription(line.id, sale.revision, null); onChanged(); }
+    catch (caught) { setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : messageFor(caught, "The link could not be removed.")); }
+    finally { setBusy(false); }
+  };
+
+  return <div className="pos-prescription__line" role="group" aria-label={`Line ${line.lineNumber} prescription`}>
+    <p className="pos-prescription__heading"><strong>Line {line.lineNumber}</strong> · {name}</p>
+    {summary.prescriptionReference
+      ? <p className="pos-prescription__state" data-testid={`prescription-state-${line.lineNumber}`}>
+          Prescription {summary.prescriptionReference} linked
+          {summary.remainingAtoms !== null && <> · {summary.remainingAtoms} {unit} left before this sale</>}
+        </p>
+      : summary.required && <p className="pos-prescription__state">No prescription linked.</p>}
+    {summary.issue && <p className="pos-warning" role="alert" data-testid={`prescription-issue-${line.lineNumber}`}>{PRESCRIPTION_ISSUE_TEXT[summary.issue]}</p>}
+    {canDispense && <form className="pos-prescription__controls" onSubmit={(event) => void link(event)}>
+      <div className="field">
+        <label htmlFor={inputId}>Prescription reference</label>
+        <input id={inputId} value={reference} autoComplete="off" placeholder="RX-000001" onChange={(event) => setReference(event.target.value)} />
+      </div>
+      <button className="button button--secondary" type="submit" disabled={busy}>{summary.prescriptionItemId ? "Link another" : "Link"}</button>
+      <Link className="button button--secondary" to={`/app/prescriptions/new?${new URLSearchParams({ saleId: sale.id, lineId: line.id, productId: line.productId })}`}>Enter new prescription</Link>
+      {summary.prescriptionItemId && <button className="button button--secondary" type="button" onClick={() => void unlink()} disabled={busy}>Remove link</button>}
+    </form>}
+    {notice && <div className="inline-notice inline-notice--error" role="alert">{notice}</div>}
+  </div>;
+}
+
+function SupervisionFields({ sale, quote, canDispense, onChanged }: {
+  sale: SaleDetail;
+  quote: SaleQuote;
+  canDispense: boolean;
+  onChanged: () => void;
+}) {
+  const professionals = useQuery({ queryKey: ["store", "professionals"], queryFn: listProfessionals, staleTime: 60_000, retry: false });
+  const pharmacists = (professionals.data ?? []).filter((person) => person.status === "active" && person.capacity === "registered_pharmacist");
+  const [professionalId, setProfessionalId] = useState(sale.supply.supervisingProfessionalId ?? "");
+  const [confirmed, setConfirmed] = useState(sale.supply.prescriptionEndorsementConfirmed);
+  const [originalContainer, setOriginalContainer] = useState(sale.supply.prescriptionOriginalContainerConfirmed);
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    setProfessionalId(sale.supply.supervisingProfessionalId ?? "");
+    setConfirmed(sale.supply.prescriptionEndorsementConfirmed);
+    setOriginalContainer(sale.supply.prescriptionOriginalContainerConfirmed);
+  }, [sale.supply.supervisingProfessionalId, sale.supply.prescriptionEndorsementConfirmed, sale.supply.prescriptionOriginalContainerConfirmed]);
+  // Rule 65(3)(2): the book is the Store's written election, read by the Store Service. Nobody at
+  // the counter chooses it; the memo book needs the one attestation its proviso asks for.
+  const method = quote.supply.recordMethod;
+  const memoBook = method === "cash_or_credit_memo_book";
+  const save = useMutation({
+    mutationFn: () => setSaleSupply(sale.id, sale.revision, professionalId || null, confirmed, memoBook && originalContainer),
+    onSuccess: () => { setNotice(null); onChanged(); },
+    onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : postingProblem(caught))
+  });
+  const chosen = (professionals.data ?? []).find((person) => person.id === sale.supply.supervisingProfessionalId);
+  const unchanged = professionalId === (sale.supply.supervisingProfessionalId ?? "")
+    && confirmed === sale.supply.prescriptionEndorsementConfirmed
+    && (memoBook && originalContainer) === sale.supply.prescriptionOriginalContainerConfirmed;
+  return <div className="pos-prescription__supply" role="group" aria-label="Supervision and endorsement">
+    <p className="pos-prescription__state" data-testid="record-method">
+      {method
+        ? <>Statutory record: {RECORD_METHOD_LABELS[method]} (rule 65(3)(2) election). The entry is prepared and signed by hand before the sale is posted.</>
+        : <>Statutory record: no rule 65(3)(2) election is recorded, so this supply cannot be entered or posted. The owner records it in Drug Compliance.</>}
+    </p>
+    <p className="pos-prescription__state">
+      {chosen ? <>Registered-pharmacist record selected: {chosen.fullName}</> : "No supervising pharmacist recorded."}
+      {sale.supply.prescriptionEndorsementConfirmed && <> · Endorsement confirmed by the counter</>}
+    </p>
+    {quote.supply.issues.length > 0 && <ul className="pos-prescription__issues" data-testid="supply-issues">
+      {quote.supply.issues.map((code) => <li key={code}>{SUPPLY_ISSUE_TEXT[code]}</li>)}
+    </ul>}
+    {canDispense && <form className="pos-prescription__controls" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
+      <div className="field">
+        <label htmlFor="pos-supervising-pharmacist">Supervising registered pharmacist</label>
+        <select id="pos-supervising-pharmacist" value={professionalId} onChange={(event) => setProfessionalId(event.target.value)} disabled={!professionals.data}>
+          <option value="">{professionals.data ? (pharmacists.length ? "Choose from the pharmacy's records" : "No registered pharmacist is recorded") : "Loading…"}</option>
+          {pharmacists.map((person) => <option key={person.id} value={person.id}>{person.fullName}</option>)}
+        </select>
+        <small>From Drug Compliance. A login's role is not a registration.</small>
+      </div>
+      <label className="check-field">
+        <input id="pos-endorsement-confirmed" type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+        <span>I have written the pharmacy's name and address and today's date on the prescription<small>Rule 65(11)(c) asks for this note above the prescriber's signature. AUSHADHARTH records your confirmation; it cannot write on the paper.</small></span>
+      </label>
+      {memoBook && <label className="check-field">
+        <input id="pos-original-container" type="checkbox" checked={originalContainer} onChange={(event) => setOriginalContainer(event.target.checked)} />
+        <span>Supplied from or in the manufacturer's original container, not compounded here<small>The memo book may stand in for the prescription register only for such a supply (rule 65(3)(1), first proviso).</small></span>
+      </label>}
+      <button className="button button--secondary" type="submit" disabled={save.isPending || unchanged}>{save.isPending ? "Saving…" : "Record supervision"}</button>
+    </form>}
+    {notice && <div className="inline-notice inline-notice--error" role="alert">{notice}</div>}
+  </div>;
+}
+
+/**
+ * Phase 1M-B B-R2 — the rule 65(3)(1) entry, before the supply. Rule 65(3)(1) asks that the supply
+ * be recorded at the time of supply, with the registered pharmacist's signature among its
+ * particulars, and nothing in the Drugs Rules provides for signing afterwards or electronically. So
+ * the order at the counter is: prepare the entry (its serial is allocated; nothing is sold), print
+ * it, the registered pharmacist signs the paper by hand, the serial is written on the prescription,
+ * a pharmacist confirms both on the entry — and only then can the sale be posted.
+ */
+function StatutoryRecordStep({ sale, quote, canDispense, onChanged }: {
+  sale: SaleDetail;
+  quote: SaleQuote;
+  canDispense: boolean;
+  onChanged: () => void;
+}) {
+  const [notice, setNotice] = useState<string | null>(null);
+  const prepare = useMutation({
+    mutationFn: () => prepareSaleRecords(sale.id, sale.revision),
+    onSuccess: () => { setNotice(null); onChanged(); },
+    onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : postingProblem(caught))
+  });
+  const live = sale.prescriptionRecords.filter((record) => record.status === "prepared" || record.status === "confirmed");
+  const ready = quote.supply.issues.length === 1 && quote.supply.issues[0] === "prescription_record_not_prepared"
+    && quote.lines.every((line) => line.prescription.issue === null);
+  if (live.length === 0 && !ready) return null;
+  return <div className="pos-prescription__record" role="group" aria-labelledby="pos-record-title" data-testid="statutory-record-step">
+    <p className="pos-prescription__heading" id="pos-record-title"><strong>Statutory record — rule 65(3)(1)</strong></p>
+    {live.length === 0
+      ? <>
+          <p className="pos-prescription__state">Everything else for this supply is in order. Prepare the entry next: it is given its serial number and printed for the registered pharmacist to sign by hand. Nothing is sold, and no stock leaves, until the entry is signed and confirmed and the sale is posted.</p>
+          {canDispense
+            ? <button className="button button--secondary" type="button" onClick={() => { setNotice(null); prepare.mutate(); }} disabled={prepare.isPending}>{prepare.isPending ? "Preparing…" : "Prepare statutory record"}</button>
+            : <p className="panel-note" role="note">A pharmacist or the owner prepares the entry.</p>}
+        </>
+      : <ul className="pos-prescription__records" data-testid="live-records">{live.map((record) => <li key={record.id}>
+          <p className="pos-prescription__state"><strong data-testid="live-record-serial">{record.serialNumber}</strong> · {RECORD_METHOD_LABELS[record.recordMethod]} · for {record.prescriptionReference} · <span data-testid="live-record-status">{RECORD_STATUS_LABELS[record.status]}</span></p>
+          {record.status === "prepared" && <ol className="pos-prescription__steps">
+            <li>Print the entry.</li>
+            <li>The registered pharmacist signs it by hand in the signature box. AUSHADHARTH does not sign it.</li>
+            <li>Write {record.serialNumber} on the prescription.</li>
+            <li>A pharmacist confirms both on the entry. The sale can then be posted.</li>
+          </ol>}
+          {record.status === "confirmed" && <p className="pos-prescription__state">A pharmacist has confirmed the handwritten signature and the serial on the prescription. The sale can now be posted.</p>}
+          {canDispense
+            ? <Link className="button button--secondary" to={`/app/prescription-records/${record.id}`}>{record.status === "prepared" ? "Open the entry to print and confirm" : "Open the entry"}</Link>
+            : record.status === "prepared" && <p className="panel-note" role="note">A pharmacist or the owner confirms the signature. A cashier cannot.</p>}
+        </li>)}
+        <li className="panel-note">While the entry is live this sale cannot be changed. To change it, void the entry from the entry page; its serial is kept and not reused.</li>
+      </ul>}
+    {notice && <div className="inline-notice inline-notice--error" role="alert">{notice}</div>}
+  </div>;
+}
+
+/**
+ * Phase 1M-B — the rule 65(3)(1) entries of this Sale, void ones included. A cashier sees the serial
+ * and state; the entry itself, which names the patient, opens for the dispensing roles only.
+ */
+function PrescriptionRecordsSection({ records }: { records: SaleDetail["prescriptionRecords"] }) {
+  const role = useAuth().status?.user?.role;
+  const canOpen = role === "owner_admin" || role === "pharmacist";
+  return <section className="panel-callout" aria-labelledby="sale-records-title" data-testid="sale-records">
+    <strong id="sale-records-title">Prescription-supply record (rule 65(3))</strong>
+    <ul>{records.map((record) => <li key={record.id}>
+      {record.serialNumber} · {RECORD_METHOD_LABELS[record.recordMethod]} · for {record.prescriptionReference} · {RECORD_STATUS_LABELS[record.status]}
+      {canOpen && <> · <Link to={`/app/prescription-records/${record.id}`}>Open the entry</Link></>}
+    </li>)}</ul>
+  </section>;
 }
 
 function Loading({ label }: { label: string }) { return <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>{label}</b></div>; }

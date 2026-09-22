@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod invoice_compliance;
 pub mod money;
 pub mod parties;
+pub mod prescriptions;
 pub mod price_control;
 pub mod recipient;
 pub mod references;

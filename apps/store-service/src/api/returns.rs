@@ -1832,6 +1832,56 @@ async fn post_within_transaction(
         .execute(&mut **connection)
         .await
         .map_err(map_database_error)?;
+
+        // Phase 1M-B — a return of a line supplied on a prescription gives the returned quantity
+        // back to that prescription, as a new linked reversal. The dispensing itself is never
+        // touched. The return's own eligibility check already caps what can come back at what was
+        // sold, and the reversal trigger caps it again at what was dispensed, so no route can
+        // create authority the prescriber never gave.
+        if is_sale && let Some(original_line) = line.original_sale_line_id.as_deref() {
+            let dispensing: Option<String> =
+                sqlx::query_scalar("SELECT id FROM prescription_dispensings WHERE sale_line_id=?")
+                    .bind(original_line)
+                    .fetch_optional(&mut **connection)
+                    .await
+                    .map_err(map_database_error)?;
+            if let Some(dispensing_id) = dispensing {
+                let reversal_id = Uuid::now_v7().to_string();
+                sqlx::query(
+                    "INSERT INTO prescription_dispensing_reversals (id,dispensing_id,\
+                     return_line_id,quantity_atoms,created_at_utc) VALUES (?,?,?,?,?)",
+                )
+                .bind(&reversal_id)
+                .bind(&dispensing_id)
+                .bind(&line.id)
+                .bind(line.quantity_atoms)
+                .bind(&now)
+                .execute(&mut **connection)
+                .await
+                .map_err(map_database_error)?;
+                sqlx::query(
+                    "INSERT INTO master_change_events (event_id,entity_type,entity_id,\
+                     entity_revision,action,occurred_at_utc,reason,payload_schema_version,\
+                     change_payload,actor_id) \
+                     VALUES (?,'prescription_dispensing_reversal',?,1,'created',?,NULL,1,?,?)",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&reversal_id)
+                .bind(&now)
+                .bind(
+                    serde_json::json!({
+                        "dispensingId": dispensing_id,
+                        "returnLineId": line.id,
+                        "quantityAtoms": line.quantity_atoms,
+                    })
+                    .to_string(),
+                )
+                .bind(actor_id)
+                .execute(&mut **connection)
+                .await
+                .map_err(map_database_error)?;
+            }
+        }
     }
 
     let next = header.revision + 1;

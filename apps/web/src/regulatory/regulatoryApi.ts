@@ -90,6 +90,14 @@ export interface ProfessionalInput {
   reason?: string;
 }
 
+/**
+ * Phase 1M-B. The professionals on record, for choosing who supervised a supply. A non-owner is
+ * given names and capacities only; registration numbers stay with the owner.
+ */
+export async function listProfessionals() {
+  return StoreProfessionalSchema.array().parse(await localServiceRequest("/api/v1/store/professionals"));
+}
+
 export async function createProfessional(input: ProfessionalInput) {
   return StoreProfessionalSchema.parse(
     await localServiceRequest("/api/v1/store/professionals", {
@@ -180,6 +188,7 @@ export const ANSWER_LABELS: Record<RegulatoryAnswer, string> = {
 
 export const GATE_LABELS: Record<RegulatoryGate, string> = {
   clear: "Sellable",
+  prescription_required: "Sellable on a prescription",
   unresolved: "Classification unresolved",
   workflow_unavailable: "Regulated sale — workflow not yet available"
 };

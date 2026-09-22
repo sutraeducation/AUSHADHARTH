@@ -1,0 +1,11 @@
+/*
+ * Phase 1M-B — the rule 65(3)(1) entry on paper.
+ *
+ * Presentation only, beside the document it lays out, as print.css is for the sale document. The
+ * registered pharmacist signs the printed entry by hand, so only the entry reaches the paper.
+ */
+@media print {
+  body:has(.record-page) .sidebar, body:has(.record-page) .topbar, .record-page .print-hide { display: none !important; }
+  body:has(.record-page) .app-layout, body:has(.record-page) .workspace, body:has(.record-page) .main-content { display: block !important; margin: 0 !important; padding: 0 !important; }
+  .record-leaf { border: 0; box-shadow: none; }
+}

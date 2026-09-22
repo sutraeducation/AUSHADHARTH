@@ -42,18 +42,15 @@ pub const SALE_GATING_SCHEMES: [&str; 5] = [
     "schedule_c1",
 ];
 
-/// The schemes whose statutory record this phase cannot yet produce.
+/// The schemes whose statutory record this software cannot yet produce.
 ///
-/// Schedule H, H1 and X need the rule 65(9) prescription; Schedule C and C(1) need the rule
-/// 65(4)(1) register or memo particulars. Both arrive in later phases, and until they do a sale
-/// that would need them is refused rather than posted without them.
-pub const WORKFLOW_PENDING_SCHEMES: [&str; 5] = [
-    "schedule_h",
-    "schedule_h1",
-    "schedule_x",
-    "schedule_c",
-    "schedule_c1",
-];
+/// Schedule H1 needs its own separate register under rule 65(3)(1)(h); Schedule X needs the
+/// duplicate prescription and the rule 65(21) register; Schedule C and C(1) need the rule 65(4)(1)
+/// register or memo particulars. None of them is satisfied by a prescription alone, so a sale that
+/// needs any of them is refused rather than posted without it. Schedule H is not here: since Phase
+/// 1M-B its prescription workflow exists, and a Schedule H line is gated on that instead.
+pub const WORKFLOW_PENDING_SCHEMES: [&str; 4] =
+    ["schedule_h1", "schedule_x", "schedule_c", "schedule_c1"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -135,6 +132,9 @@ pub enum SaleGate {
     Unresolved,
     /// Lawfully sellable, but only with a statutory record this phase does not implement.
     WorkflowUnavailable { scheme: &'static str },
+    /// Schedule H: sellable only on a prescription, under a registered pharmacist's supervision,
+    /// with every rule 65 fact present. Whether they are is the posting's question, not this one's.
+    PrescriptionRequired,
 }
 
 /// The gate, from the resolved position and the product's kind.
@@ -156,6 +156,12 @@ pub fn gate(product_kind: &str, resolved: &ResolvedRegulatory) -> SaleGate {
             .any(|scheme| resolved.answer(scheme) == Resolution::Unknown)
     {
         return SaleGate::Unresolved;
+    }
+    // Last, so an unsupported scheme or an unknown position always wins: a line that is both
+    // Schedule H and Schedule C is held to Schedule C as well, and a supported H requirement never
+    // cancels an unsupported one.
+    if resolved.answer("schedule_h") == Resolution::Applies {
+        return SaleGate::PrescriptionRequired;
     }
     SaleGate::Clear
 }
@@ -316,17 +322,44 @@ mod tests {
 
     /// An NDPS-purview Schedule H drug is refused for being Schedule H, not for being NDPS.
     #[test]
-    fn an_ndps_schedule_h_drug_is_refused_on_the_schedule() {
-        let resolved = with(&[
-            ("schedule_h", Resolution::Applies),
-            ("ndps_purview", Resolution::Applies),
-        ]);
-        assert_eq!(
-            gate("medicine", &resolved),
-            SaleGate::WorkflowUnavailable {
-                scheme: "schedule_h"
-            }
-        );
+    fn an_ndps_schedule_h_drug_is_gated_on_the_schedule_not_the_axis() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_h", Resolution::Applies);
+        resolved.set("ndps_purview", Resolution::Applies);
+        assert_eq!(gate("medicine", &resolved), SaleGate::PrescriptionRequired);
+    }
+
+    /// Phase 1M-B: Schedule H alone needs a prescription, not a missing workflow.
+    #[test]
+    fn schedule_h_alone_requires_a_prescription() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_h", Resolution::Applies);
+        assert_eq!(gate("medicine", &resolved), SaleGate::PrescriptionRequired);
+    }
+
+    /// A supported Schedule H requirement never cancels an unsupported one: H with C, H1 or X is
+    /// held to the unsupported scheme.
+    #[test]
+    fn schedule_h_with_an_unsupported_scheme_stays_blocked_on_that_scheme() {
+        for other in ["schedule_h1", "schedule_x", "schedule_c", "schedule_c1"] {
+            let mut resolved = all(Resolution::DoesNotApply);
+            resolved.set("schedule_h", Resolution::Applies);
+            resolved.set(other, Resolution::Applies);
+            assert_eq!(
+                gate("medicine", &resolved),
+                SaleGate::WorkflowUnavailable { scheme: other },
+                "{other}"
+            );
+        }
+    }
+
+    /// Schedule H with any other schedule still unknown is unresolved, not merely prescription-bound.
+    #[test]
+    fn schedule_h_with_an_unknown_schedule_is_unresolved() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_h", Resolution::Applies);
+        resolved.set("schedule_c", Resolution::Unknown);
+        assert_eq!(gate("medicine", &resolved), SaleGate::Unresolved);
     }
 
     /// The schemes are independent: being inside H1 says nothing about H, and the model must not

@@ -4908,6 +4908,9 @@ async fn real_service_requires_the_payment_cross_reference_under_dynamic_qr_over
 async fn real_service_refuses_a_scheduled_sale_until_its_workflow_exists_over_http() {
     let service = start().await;
     let world = seed_sale_world(&service, 1).await;
+    // Since Phase 1M-B a Schedule H supply also needs its rule 65(3) basis; with it in place, the
+    // refusal below is for the missing prescription, which is what this test is about.
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
 
     let finding = call(
         &service,
@@ -4942,9 +4945,11 @@ async fn real_service_refuses_a_scheduled_sale_until_its_workflow_exists_over_ht
     )
     .await;
     assert_eq!(quote.status, 200, "{:?}", quote.body);
+    // Since Phase 1M-B a Schedule H line is sellable on a prescription, so the quote names that
+    // requirement rather than an unavailable workflow.
     assert_eq!(
         quote.body["lines"][0]["regulatoryGate"],
-        "workflow_unavailable"
+        "prescription_required"
     );
     assert_eq!(quote.body["lines"][0]["regulatoryGateScheme"], "schedule_h");
 
@@ -4958,10 +4963,7 @@ async fn real_service_refuses_a_scheduled_sale_until_its_workflow_exists_over_ht
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(
-        refused.body["code"],
-        "regulated_sale_workflow_not_available"
-    );
+    assert_eq!(refused.body["code"], "prescription_requirements_incomplete");
 
     let detail = call(
         &service,
@@ -5056,4 +5058,871 @@ async fn real_service_refuses_a_scheduled_sale_until_its_workflow_exists_over_ht
     )
     .await;
     assert_eq!(cashier.status, 401, "{:?}", cashier.body);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-B — prescriptions and the Schedule H retail workflow, over a real socket.
+// ---------------------------------------------------------------------------------------------
+
+/// Records the product's position under every gating scheme: `inside` applies, the rest do not.
+async fn schedule_over_http(service: &Service, world: &SaleWorld, inside: &[&str]) {
+    for scheme in [
+        "schedule_h",
+        "schedule_h1",
+        "schedule_x",
+        "schedule_c",
+        "schedule_c1",
+    ] {
+        let finding = call(
+            service,
+            "POST",
+            &format!(
+                "/api/v1/products/{}/regulatory/classifications",
+                world.product
+            ),
+            Some(json!({
+                "scheme": scheme,
+                "applies": inside.contains(&scheme),
+                "effectiveFrom": "2020-01-01",
+                "sourceCitation": "Drugs Rules, 1945, Schedules as amended",
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(finding.status, 201, "{scheme}: {:?}", finding.body);
+    }
+}
+
+/// The rule 65(3)(1) basis of a lawful entry, recorded as an owner does: the product's manufacturer
+/// (particular (f)) and, unless `None`, the rule 65(3)(2) election.
+async fn record_basis_over_http(service: &Service, world: &SaleWorld, election: Option<&str>) {
+    let company = call(
+        service,
+        "POST",
+        "/api/v1/reference/companies",
+        Some(json!({ "attributes": { "displayName": "Alkem Laboratories", "countryCode": "IN" } })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(company.status, 201, "{:?}", company.body);
+    let role = call(
+        service,
+        "POST",
+        &format!("/api/v1/products/{}/company-roles", world.product),
+        Some(json!({ "companyId": company.body["id"], "role": "manufacturer" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(role.status, 201, "{:?}", role.body);
+    if let Some(method) = election {
+        let elected = call(
+            service,
+            "POST",
+            "/api/v1/store/record-elections",
+            Some(json!({
+                "election": "rule_65_3_prescription_supply",
+                "method": method,
+                "effectiveFrom": "2020-01-01",
+                "evidenceReference": "Election letter to the Licensing Authority",
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(elected.status, 201, "{:?}", elected.body);
+    }
+}
+
+/// Prepares a Sale's rule 65(3)(1) entry: the serial is allocated and nothing is sold.
+async fn prepare_entry_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    sale: &str,
+    revision: i64,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale}/prescription-records"),
+        Some(json!({ "expectedRevision": revision })),
+        Some(&world.cookie),
+    )
+    .await
+}
+
+/// Confirms the two manual acts on a prepared entry, as a pharmacist does once the registered
+/// pharmacist has signed the physical entry and its serial is on the prescription.
+async fn confirm_entry_over_http(service: &Service, cookie: &str, record: &str) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/prescription-supply-records/{record}/confirm"),
+        Some(json!({ "manualSignatureConfirmed": true, "serialWrittenOnPrescription": true })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// Prepares and confirms the Sale's entry; returns (entry id, the Sale's revision).
+async fn signed_entry_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    sale: &str,
+    revision: i64,
+) -> (String, i64) {
+    let prepared = prepare_entry_over_http(service, world, sale, revision).await;
+    assert_eq!(prepared.status, 200, "{:?}", prepared.body);
+    let record = prepared.body["prescriptionRecords"][0]["id"]
+        .as_str()
+        .expect("record id")
+        .to_owned();
+    let confirmed = confirm_entry_over_http(service, &world.cookie, &record).await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    (
+        record,
+        prepared.body["revision"].as_i64().expect("revision"),
+    )
+}
+
+async fn pharmacist_over_http(service: &Service, world: &SaleWorld) -> String {
+    let professional = call(
+        service,
+        "POST",
+        "/api/v1/store/professionals",
+        Some(json!({
+            "fullName": "Meera Iyer",
+            "capacity": "registered_pharmacist",
+            "registrationNumber": "MH-PH-44821",
+            "registeringAuthority": "Maharashtra State Pharmacy Council",
+            "validFrom": "2020-01-01",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(professional.status, 201, "{:?}", professional.body);
+    professional.body["id"]
+        .as_str()
+        .expect("professional id")
+        .to_owned()
+}
+
+/// Enters a prescription for the world's product and returns (prescription, item).
+async fn prescription_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    prescriber: Option<&str>,
+    atoms: i64,
+) -> (String, String) {
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/prescriptions",
+        Some(json!({
+            "prescribedOn": "2026-09-10",
+            "prescriberId": prescriber,
+            "prescriberName": "Dr. Anjali Rao",
+            "prescriberAddress": "Rao Clinic, FC Road, Pune 411005",
+            "subjectKind": "human",
+            "subjectName": "Sita Kulkarni",
+            "subjectAddress": "14 Lakshmi Road, Pune 411004",
+            "repeatAuthority": "once",
+            "writtenSignedDatedAttested": true,
+            "items": [{
+                "productId": world.product,
+                "writtenDescription": "Tab. as prescribed",
+                "prescribedQuantityAtoms": atoms,
+                "doseText": "1 tablet twice daily",
+            }],
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    assert!(
+        created.body["reference"]
+            .as_str()
+            .expect("reference")
+            .starts_with("RX-"),
+        "{:?}",
+        created.body
+    );
+    (
+        created.body["id"].as_str().expect("id").to_owned(),
+        created.body["items"][0]["id"]
+            .as_str()
+            .expect("item id")
+            .to_owned(),
+    )
+}
+
+/// A draft of `packs` strips, linked to `item`, supervised, endorsement confirmed. Returns the Sale
+/// id and its current revision.
+async fn prepared_sale_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    item: &str,
+    professional: &str,
+    packs: i64,
+) -> (String, i64) {
+    let sale_id = sale_draft(service, world, None).await;
+    let with_line = sale_line(service, world, &sale_id, 1, "pack", packs, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let line_id = with_line.body["lines"][0]["id"]
+        .as_str()
+        .expect("line id")
+        .to_owned();
+    let linked = call(
+        service,
+        "PUT",
+        &format!("/api/v1/sale-lines/{line_id}/prescription"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "prescriptionItemId": item,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(linked.status, 200, "{:?}", linked.body);
+    let supplied = call(
+        service,
+        "PUT",
+        &format!("/api/v1/sales/{sale_id}/supply"),
+        Some(json!({
+            "expectedRevision": linked.body["revision"],
+            "supervisingProfessionalId": professional,
+            "prescriptionEndorsementConfirmed": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(supplied.status, 200, "{:?}", supplied.body);
+    (
+        sale_id,
+        supplied.body["revision"].as_i64().expect("revision"),
+    )
+}
+
+async fn quote_over_http(service: &Service, world: &SaleWorld, sale_id: &str) -> Value {
+    let quote = call(
+        service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/quote"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(quote.status, 200, "{:?}", quote.body);
+    quote.body
+}
+
+async fn post_quoted_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    sale_id: &str,
+    revision: i64,
+    key: &str,
+) -> Reply {
+    let total = quote_over_http(service, world, sale_id).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    post_sale(service, world, sale_id, revision, key, total).await
+}
+
+async fn prescription_detail_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    prescription: &str,
+) -> Value {
+    let detail = call(
+        service,
+        "GET",
+        &format!("/api/v1/prescriptions/{prescription}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    detail.body
+}
+
+/// 1M-B gate 1-7 and 10-12: a Prescriber and a prescription are entered, the quote names the
+/// requirement, a bare posting is refused, the complete one posts and consumes the quantity, a
+/// second supply on a once-only prescription is refused, an ordinary Sale is untouched, a return
+/// reinstates the quantity, and a cashier can neither read nor enter prescriptions.
+#[tokio::test]
+async fn real_service_dispenses_schedule_h_on_a_prescription_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_h"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    // 1. A Prescriber, with no registration number: rule 65 does not require one.
+    let prescriber = call(
+        &service,
+        "POST",
+        "/api/v1/prescribers",
+        Some(json!({ "fullName": "Dr. Anjali Rao", "addressText": "Rao Clinic, Pune" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(prescriber.status, 201, "{:?}", prescriber.body);
+    let prescriber_id = prescriber.body["id"]
+        .as_str()
+        .expect("prescriber")
+        .to_owned();
+
+    // 2. A structured prescription for 20 tablets, once.
+    let (prescription, item) =
+        prescription_over_http(&service, &world, Some(&prescriber_id), 20).await;
+
+    // 3-4. The quote names the requirement, and the bare posting is refused with nothing written.
+    let bare = sale_draft(&service, &world, None).await;
+    let with_line = sale_line(&service, &world, &bare, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let quote = quote_over_http(&service, &world, &bare).await;
+    assert_eq!(quote["lines"][0]["regulatoryGate"], "prescription_required");
+    assert_eq!(quote["lines"][0]["prescription"]["required"], true);
+    assert_eq!(
+        quote["lines"][0]["prescription"]["issue"],
+        "prescription_missing"
+    );
+    assert_eq!(quote["supply"]["supervisionRequired"], true);
+    assert!(
+        !quote.to_string().contains("Sita Kulkarni"),
+        "the quote carries the patient"
+    );
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &bare,
+        2,
+        "01997a00-0000-7000-8000-0000000002b1",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "prescription_requirements_incomplete");
+
+    // 5-6. The complete supply, in the order the counter must follow. First the entry is prepared:
+    //      PR-000001 is allocated in the elected register while nothing at all is sold.
+    let (sale_id, revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let quote = quote_over_http(&service, &world, &sale_id).await;
+    assert_eq!(
+        quote["supply"]["issues"],
+        json!(["prescription_record_not_prepared"])
+    );
+    let prepared = prepare_entry_over_http(&service, &world, &sale_id, revision).await;
+    assert_eq!(prepared.status, 200, "{:?}", prepared.body);
+    assert_eq!(prepared.body["status"], "draft");
+    assert_eq!(prepared.body["documentNumber"], Value::Null);
+    assert_eq!(
+        prepared.body["prescriptionRecords"][0]["serialNumber"],
+        "PR-000001"
+    );
+    assert_eq!(
+        prepared.body["prescriptionRecords"][0]["recordMethod"],
+        "prescription_register"
+    );
+    assert_eq!(
+        prepared.body["prescriptionRecords"][0]["status"],
+        "prepared"
+    );
+    let revision = prepared.body["revision"].as_i64().expect("revision");
+    let record_id = prepared.body["prescriptionRecords"][0]["id"]
+        .as_str()
+        .expect("record id")
+        .to_owned();
+    let entry = call(
+        &service,
+        "GET",
+        &format!("/api/v1/prescription-supply-records/{record_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(entry.status, 200, "{:?}", entry.body);
+    assert_eq!(entry.body["status"], "prepared");
+    assert_eq!(entry.body["subjectName"], "Sita Kulkarni");
+    assert_eq!(
+        entry.body["lines"][0]["manufacturerName"],
+        "Alkem Laboratories"
+    );
+    assert_eq!(entry.body["lines"][0]["batchNumber"], "B-9001");
+    assert_eq!(entry.body["manualSignatureConfirmed"], false);
+    let detail = prescription_detail_over_http(&service, &world, &prescription).await;
+    assert_eq!(
+        detail["items"][0]["dispensedAtoms"], 0,
+        "the medicine left before the signature"
+    );
+
+    // The unsigned entry cannot be posted past, and a cashier cannot attest the signature.
+    let unsigned = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000002b5",
+    )
+    .await;
+    assert_eq!(unsigned.status, 409, "{:?}", unsigned.body);
+    assert_eq!(
+        unsigned.body["issues"][0]["field"],
+        "supply.prescription_record_not_confirmed"
+    );
+    let till = sign_in_as(
+        &service,
+        "cashier",
+        "rx-till",
+        "01997a00-0000-7000-8000-0000000002c2",
+    )
+    .await;
+    let attested = confirm_entry_over_http(&service, &till, &record_id).await;
+    assert_eq!(attested.status, 403, "{:?}", attested.body);
+
+    // The pharmacist signs the paper and writes the serial; a pharmacist confirms both; then the
+    // Sale posts, consumes exactly its quantity, and the entry is finalized with it.
+    let confirmed = confirm_entry_over_http(&service, &world.cookie, &record_id).await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    assert_eq!(confirmed.body["status"], "confirmed");
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000002b2",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["status"], "posted");
+    assert_eq!(posted.body["prescriptionRecords"][0]["status"], "finalized");
+    let detail = prescription_detail_over_http(&service, &world, &prescription).await;
+    assert_eq!(detail["items"][0]["dispensedAtoms"], 10);
+    assert_eq!(detail["occasionsUsed"], 1);
+    assert_eq!(
+        detail["dispensings"][0]["supervisingProfessionalName"],
+        "Meera Iyer"
+    );
+
+    // 7. The once-only prescription cannot be dispensed again, although 10 tablets remain.
+    let (again, again_revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let quote = quote_over_http(&service, &world, &again).await;
+    assert_eq!(quote["lines"][0]["prescription"]["remainingAtoms"], 10);
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &again,
+        again_revision,
+        "01997a00-0000-7000-8000-0000000002b3",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["issues"][0]["field"],
+        "lines.1.prescription_repeat_not_authorised"
+    );
+
+    // 11. A return reinstates the quantity as its own event and leaves the dispensing intact.
+    let sale_line_id = posted.body["lines"][0]["id"]
+        .as_str()
+        .expect("sale line")
+        .to_owned();
+    let return_draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "sales_return", "originalDocumentId": sale_id, "businessDate": SALE_DATE
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(return_draft.status, 201, "{:?}", return_draft.body);
+    let return_id = return_draft.body["id"]
+        .as_str()
+        .expect("return id")
+        .to_owned();
+    let return_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1, "originalLineId": sale_line_id, "quantity": 1,
+            "disposition": "quarantined"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(return_line.status, 201, "{:?}", return_line.body);
+    let return_posted = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/post"),
+        Some(json!({
+            "expectedRevision": 2,
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000002b4",
+            "taxAdjustmentStatus": "commercial_only"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(return_posted.status, 200, "{:?}", return_posted.body);
+    let detail = prescription_detail_over_http(&service, &world, &prescription).await;
+    assert_eq!(detail["items"][0]["dispensedAtoms"], 10);
+    assert_eq!(detail["items"][0]["reinstatedAtoms"], 10);
+    assert_eq!(detail["dispensings"][0]["reversedAtoms"], 10);
+    assert_eq!(
+        detail["occasionsUsed"], 1,
+        "a return does not give back the occasion"
+    );
+
+    // The owner's list names references, never the patient. (Gate 10 is its own test below.)
+    let listed = call(
+        &service,
+        "GET",
+        "/api/v1/prescriptions",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(listed.status, 200, "{:?}", listed.body);
+    assert!(
+        !listed.body.to_string().contains("Sita Kulkarni"),
+        "the list carries the patient"
+    );
+
+    // 12. A cashier cannot read or enter prescriptions, link a line, or name the pharmacist; and
+    //     an unauthenticated caller gets nothing.
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "rx-cashier",
+        "01997a00-0000-7000-8000-0000000002c1",
+    )
+    .await;
+    for (method, path, body) in [
+        ("GET", "/api/v1/prescriptions".to_owned(), None),
+        ("GET", format!("/api/v1/prescriptions/{prescription}"), None),
+        ("GET", "/api/v1/prescribers".to_owned(), None),
+        (
+            "POST",
+            "/api/v1/prescribers".to_owned(),
+            Some(json!({ "fullName": "Dr X", "addressText": "Pune" })),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/sales/{again}/supply"),
+            Some(json!({
+                "expectedRevision": again_revision,
+                "supervisingProfessionalId": professional,
+                "prescriptionEndorsementConfirmed": true,
+            })),
+        ),
+    ] {
+        let denied = call(&service, method, &path, body, Some(&cashier)).await;
+        assert_eq!(denied.status, 403, "{method} {path}: {:?}", denied.body);
+        assert!(!denied.body.to_string().contains("Sita Kulkarni"));
+    }
+    let anonymous = call(&service, "GET", "/api/v1/prescriptions", None, None).await;
+    assert_eq!(anonymous.status, 401, "{:?}", anonymous.body);
+}
+
+/// 1M-B gate 10: with prescriptions in the database, an ordinary Sale is exactly as before.
+#[tokio::test]
+async fn real_service_leaves_an_ordinary_sale_untouched_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let _ = prescription_over_http(&service, &world, None, 20).await;
+    let sale_id = sale_draft(&service, &world, None).await;
+    let with_line = sale_line(&service, &world, &sale_id, 1, "pack", 1, 8000).await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let quote = quote_over_http(&service, &world, &sale_id).await;
+    assert_eq!(quote["lines"][0]["regulatoryGate"], "clear");
+    assert_eq!(quote["lines"][0]["prescription"]["required"], false);
+    assert_eq!(quote["supply"]["supervisionRequired"], false);
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        2,
+        "01997a00-0000-7000-8000-0000000002d1",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(
+        posted.body["supply"]["supervisingProfessionalId"],
+        Value::Null
+    );
+}
+
+/// 1M-B gate 8-9: Schedule H1 and Schedule X stay refused however complete the prescription.
+#[tokio::test]
+async fn real_service_keeps_schedule_h1_and_x_refused_with_a_complete_prescription_over_http() {
+    for (inside, code) in [
+        (
+            &["schedule_h", "schedule_h1"][..],
+            "schedule_h1_register_not_available",
+        ),
+        (&["schedule_x"][..], "schedule_x_workflow_not_available"),
+    ] {
+        let service = start().await;
+        let world = seed_sale_world(&service, 1).await;
+        schedule_over_http(&service, &world, inside).await;
+        record_basis_over_http(&service, &world, Some("prescription_register")).await;
+        let professional = pharmacist_over_http(&service, &world).await;
+        let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+        let (sale_id, revision) =
+            prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+        // No entry can be prepared for it either: preparing is never a way round the gate.
+        let unprepared = prepare_entry_over_http(&service, &world, &sale_id, revision).await;
+        assert_eq!(unprepared.status, 409, "{code}: {:?}", unprepared.body);
+        assert_eq!(unprepared.body["code"], code);
+        let refused = post_quoted_over_http(
+            &service,
+            &world,
+            &sale_id,
+            revision,
+            "01997a00-0000-7000-8000-0000000002e1",
+        )
+        .await;
+        assert_eq!(refused.status, 409, "{code}: {:?}", refused.body);
+        assert_eq!(refused.body["code"], code);
+        assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+        let detail = call(
+            &service,
+            "GET",
+            &format!("/api/v1/sales/{sale_id}"),
+            None,
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(detail.body["status"], "draft");
+        assert_eq!(detail.body["documentNumber"], Value::Null);
+    }
+}
+
+/// 1M-B corrective: with no rule 65(3)(2) election, a Schedule H supply is refused; under a memo-book
+/// election it is entered as PM-000001 only with the original-container attestation.
+#[tokio::test]
+async fn real_service_enters_a_schedule_h_supply_only_under_its_election_over_http() {
+    for (election, attest, outcome) in [
+        (None, false, "prescription_record_election_unresolved"),
+        (
+            Some("cash_or_credit_memo_book"),
+            false,
+            "prescription_requirements_incomplete",
+        ),
+        (Some("cash_or_credit_memo_book"), true, "PM-000001"),
+    ] {
+        let service = start().await;
+        let world = seed_sale_world(&service, 1).await;
+        schedule_over_http(&service, &world, &["schedule_h"]).await;
+        record_basis_over_http(&service, &world, election).await;
+        let professional = pharmacist_over_http(&service, &world).await;
+        let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+        let (sale_id, revision) =
+            prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+        let supplied = call(
+            &service,
+            "PUT",
+            &format!("/api/v1/sales/{sale_id}/supply"),
+            Some(json!({
+                "expectedRevision": revision,
+                "supervisingProfessionalId": professional,
+                "prescriptionEndorsementConfirmed": true,
+                "prescriptionOriginalContainerConfirmed": attest,
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(supplied.status, 200, "{:?}", supplied.body);
+        let mut revision = supplied.body["revision"].as_i64().expect("revision");
+        if outcome.starts_with("PM-") {
+            revision = signed_entry_over_http(&service, &world, &sale_id, revision)
+                .await
+                .1;
+        }
+        let reply = post_quoted_over_http(
+            &service,
+            &world,
+            &sale_id,
+            revision,
+            "01997a00-0000-7000-8000-0000000002f1",
+        )
+        .await;
+        if outcome.starts_with("PM-") {
+            assert_eq!(reply.status, 200, "{:?}", reply.body);
+            assert_eq!(
+                reply.body["prescriptionRecords"][0]["serialNumber"],
+                outcome
+            );
+            assert_eq!(
+                reply.body["prescriptionRecords"][0]["recordMethod"],
+                "cash_or_credit_memo_book"
+            );
+        } else {
+            assert_eq!(reply.status, 409, "{:?}", reply.body);
+            assert_eq!(reply.body["code"], outcome, "{:?}", reply.body);
+            if outcome == "prescription_requirements_incomplete" {
+                assert_eq!(
+                    reply.body["issues"][0]["field"],
+                    "supply.prescription_memo_path_ineligible"
+                );
+            }
+        }
+    }
+}
+
+/// 1M-B corrective B-R2: a posting that fails after the entry was signed and confirmed leaves the
+/// entry confirmed (it may be signed on paper) and nothing sold; the retry posts under PR-000001.
+#[tokio::test]
+async fn real_service_keeps_a_signed_entry_through_a_failed_posting_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_h"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let (_, revision) = signed_entry_over_http(&service, &world, &sale_id, revision).await;
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("reopen disposable database");
+    sqlx::query(
+        "CREATE TRIGGER gate_fail_tender BEFORE INSERT ON sale_tenders \
+         BEGIN SELECT RAISE(ABORT, 'injected_failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("inject a late failure");
+    let failed = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000002f2",
+    )
+    .await;
+    assert_ne!(failed.status, 200, "{:?}", failed.body);
+    let entries: Vec<(String, String)> =
+        sqlx::query_as("SELECT serial_number,status FROM prescription_supply_records")
+            .fetch_all(&pool)
+            .await
+            .expect("read entries");
+    assert_eq!(
+        entries,
+        vec![("PR-000001".to_owned(), "confirmed".to_owned())],
+        "the signed entry must survive the failed posting unchanged"
+    );
+    let sold: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM prescription_dispensings),\
+         (SELECT COUNT(*) FROM sale_tenders)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count sold");
+    assert_eq!(sold, (0, 0), "a failed posting sold something");
+    sqlx::query("DROP TRIGGER gate_fail_tender")
+        .execute(&pool)
+        .await
+        .expect("remove the injected failure");
+    pool.close().await;
+
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000002f3",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(
+        posted.body["prescriptionRecords"][0]["serialNumber"],
+        "PR-000001"
+    );
+    assert_eq!(posted.body["prescriptionRecords"][0]["status"], "finalized");
+}
+
+/// 1M-B corrective B-R2: a cancelled entry is voided with its reason and its serial never reused;
+/// and a prepared Sale is held until its entry is voided.
+#[tokio::test]
+async fn real_service_voids_a_cancelled_entry_and_never_reuses_its_serial_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_h"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let prepared = prepare_entry_over_http(&service, &world, &sale_id, revision).await;
+    assert_eq!(prepared.status, 200, "{:?}", prepared.body);
+    let record = prepared.body["prescriptionRecords"][0]["id"]
+        .as_str()
+        .expect("record id")
+        .to_owned();
+
+    // The prepared Sale is held as the pharmacist is to sign it.
+    let held = sale_line(
+        &service,
+        &world,
+        &sale_id,
+        prepared.body["revision"].as_i64().expect("revision"),
+        "pack",
+        1,
+        8000,
+    )
+    .await;
+    assert_eq!(held.status, 409, "{:?}", held.body);
+    assert_eq!(held.body["code"], "prescription_record_prepared");
+
+    let voided = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescription-supply-records/{record}/void"),
+        Some(json!({ "reason": "customer left before paying" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(voided.status, 200, "{:?}", voided.body);
+    assert_eq!(voided.body["status"], "void");
+    assert_eq!(voided.body["voidReason"], "customer left before paying");
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    let again = prepare_entry_over_http(
+        &service,
+        &world,
+        &sale_id,
+        detail.body["revision"].as_i64().expect("revision"),
+    )
+    .await;
+    assert_eq!(again.status, 200, "{:?}", again.body);
+    let serials: Vec<(String, String)> = again.body["prescriptionRecords"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .map(|record| {
+            (
+                record["serialNumber"].as_str().unwrap().to_owned(),
+                record["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        serials,
+        vec![
+            ("PR-000001".to_owned(), "void".to_owned()),
+            ("PR-000002".to_owned(), "prepared".to_owned()),
+        ]
+    );
 }
