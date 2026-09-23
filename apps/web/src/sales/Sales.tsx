@@ -20,7 +20,7 @@ import type {
 import type { RegulatoryGate, RegulatoryScheme, SaleQuote, SaleQuoteLine } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
 import { SCHEME_LABELS, listProfessionals } from "../regulatory/regulatoryApi";
-import { PRESCRIPTION_ISSUE_TEXT, RECORD_METHOD_LABELS, RECORD_STATUS_LABELS, SUPPLY_ISSUE_TEXT, getPrescription, listPrescriptions } from "../prescriptions/prescriptionApi";
+import { H1_STATUS_LABELS, PRESCRIPTION_ISSUE_TEXT, RECORD_METHOD_LABELS, RECORD_STATUS_LABELS, SUPPLY_ISSUE_TEXT, getPrescription, listPrescriptions } from "../prescriptions/prescriptionApi";
 import { businessToday } from "../platform/businessDate";
 import { LocalServiceError } from "../platform/localService";
 import { listParties } from "../parties/partyApi";
@@ -915,7 +915,7 @@ function PostedInvoice({ sale }: { sale: SaleDetail }) {
             <div className="totals-grand"><dt>Invoice total</dt><dd className="numeric">{paiseToAmountText(sale.grandTotalPaise)}</dd></div>
           </dl>}
 
-      {sale.prescriptionRecords.length > 0 && <PrescriptionRecordsSection records={sale.prescriptionRecords} />}
+      {(sale.prescriptionRecords.length > 0 || sale.h1RegisterEntries.length > 0) && <PrescriptionRecordsSection sale={sale} />}
 
       {sale.tenders.length > 0 && <p className="pos-summary__note">Paid by {TENDER_LABELS[sale.tenders[0].method]} · {paiseToAmountText(sale.tenders[0].amountPaise)}{sale.tenders[0].referenceText ? ` · ${sale.tenders[0].referenceText}` : ""}</p>}
 
@@ -1020,9 +1020,9 @@ function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
 }) {
   if (!gate || gate === "clear") return null;
   const text = gate === "unresolved"
-    ? "Classification unresolved — not sellable until recorded"
+    ? (scheme === "punjab_restricted_supply" ? "Punjab restricted-supply position not recorded — not sellable until recorded" : "Classification unresolved — not sellable until recorded")
     : gate === "prescription_required"
-      ? "Schedule H — sold only on a prescription"
+      ? (scheme === "schedule_h1" ? "Schedule H1 — sold only on a prescription, with its separate H1 register entry" : "Schedule H — sold only on a prescription")
       : workflowText(scheme);
   return <small className={`regulatory-line regulatory-line--${gate}`} role="note">
     {text}
@@ -1036,7 +1036,8 @@ function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
  */
 function workflowText(scheme: RegulatoryScheme | null): string {
   switch (scheme) {
-    case "schedule_h1": return "Schedule H1 dispensing requires the H1 register workflow, which is not yet available.";
+    case "ndps_purview": return "Schedule H1 with an NDPS purview that applies or is not recorded — an unsupported NDPS-intersection workflow AUSHADHARTH does not support.";
+    case "punjab_restricted_supply": return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
     case "schedule_x": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
     case "schedule_c":
     case "schedule_c1": return `${SCHEME_LABELS[scheme]} — its statutory record is not yet available, so it cannot be sold.`;
@@ -1046,7 +1047,9 @@ function workflowText(scheme: RegulatoryScheme | null): string {
 
 function blockedLineText(line: SaleQuoteLine): string {
   return line.regulatoryGate === "unresolved"
-    ? "a medicine with no recorded schedule position. An owner can record it on the product."
+    ? (line.regulatoryGateScheme === "punjab_restricted_supply"
+        ? "a medicine whose Punjab restricted-supply position is not recorded. An owner can record it on the product."
+        : "a medicine with no recorded schedule position. An owner can record it on the product.")
     : workflowText(line.regulatoryGateScheme);
 }
 
@@ -1240,14 +1243,20 @@ function StatutoryRecordStep({ sale, quote, canDispense, onChanged }: {
     onError: (caught) => setNotice(isStale(caught) ? STALE_DOCUMENT_MESSAGE : postingProblem(caught))
   });
   const live = sale.prescriptionRecords.filter((record) => record.status === "prepared" || record.status === "confirmed");
-  const ready = quote.supply.issues.length === 1 && quote.supply.issues[0] === "prescription_record_not_prepared"
+  // Phase 1M-C: the separate Schedule H1 layer, prepared together with the statutory record.
+  const liveH1 = sale.h1RegisterEntries.filter((entry) => entry.status === "prepared" || entry.status === "confirmed");
+  const preparable = new Set(["prescription_record_not_prepared", "schedule_h1_register_not_prepared"]);
+  const ready = quote.supply.issues.length > 0 && quote.supply.issues.every((code) => preparable.has(code))
+    && quote.supply.issues.includes("prescription_record_not_prepared")
     && quote.lines.every((line) => line.prescription.issue === null);
+  const needsH1 = quote.lines.some((line) => line.regulatoryGate === "prescription_required" && line.regulatoryGateScheme === "schedule_h1");
   if (live.length === 0 && !ready) return null;
   return <div className="pos-prescription__record" role="group" aria-labelledby="pos-record-title" data-testid="statutory-record-step">
     <p className="pos-prescription__heading" id="pos-record-title"><strong>Statutory record — rule 65(3)(1)</strong></p>
     {live.length === 0
       ? <>
           <p className="pos-prescription__state">Everything else for this supply is in order. Prepare the entry next: it is given its serial number and printed for the registered pharmacist to sign by hand. Nothing is sold, and no stock leaves, until the entry is signed and confirmed and the sale is posted.</p>
+          {needsH1 && <p className="pos-prescription__state" data-testid="h1-layer-note">This supply includes Schedule H1. A separate Schedule H1 working entry is prepared at the same time: its hard copy is placed in the pharmacy's separate H1 register and authenticated by the registered pharmacist before the sale is posted.</p>}
           {canDispense
             ? <button className="button button--secondary" type="button" onClick={() => { setNotice(null); prepare.mutate(); }} disabled={prepare.isPending}>{prepare.isPending ? "Preparing…" : "Prepare statutory record"}</button>
             : <p className="panel-note" role="note">A pharmacist or the owner prepares the entry.</p>}
@@ -1265,6 +1274,18 @@ function StatutoryRecordStep({ sale, quote, canDispense, onChanged }: {
             ? <Link className="button button--secondary" to={`/app/prescription-records/${record.id}`}>{record.status === "prepared" ? "Open the entry to print and confirm" : "Open the entry"}</Link>
             : record.status === "prepared" && <p className="panel-note" role="note">A pharmacist or the owner confirms the signature. A cashier cannot.</p>}
         </li>)}
+        {liveH1.length > 0 && <li data-testid="live-h1">
+          <p className="pos-prescription__state"><strong>Schedule H1 register</strong> — separate from the entry above. {liveH1.map((entry) => <span key={entry.id}><span data-testid="live-h1-reference">{entry.reference}</span> (AUSHADHARTH Reference, line {entry.lineNumber}) · <span data-testid="live-h1-status">{H1_STATUS_LABELS[entry.status]}</span>. </span>)}</p>
+          {liveH1.some((entry) => entry.status === "prepared") && <ol className="pos-prescription__steps">
+            <li>Print the Schedule H1 hard copy.</li>
+            <li>Place it in the pharmacy's separate Schedule H1 register.</li>
+            <li>The registered pharmacist authenticates it by hand. AUSHADHARTH does not sign it.</li>
+            <li>A pharmacist confirms both. The sale can then be posted.</li>
+          </ol>}
+          {canDispense
+            ? <Link className="button button--secondary" to={`/app/sales/${sale.id}/h1-register`}>{liveH1.some((entry) => entry.status === "prepared") ? "Open the H1 hard copy to print and confirm" : "Open the H1 hard copy"}</Link>
+            : liveH1.some((entry) => entry.status === "prepared") && <p className="panel-note" role="note">A pharmacist or the owner confirms the H1 hard copy. A cashier cannot.</p>}
+        </li>}
         <li className="panel-note">While the entry is live this sale cannot be changed. To change it, void the entry from the entry page; its serial is kept and not reused.</li>
       </ul>}
     {notice && <div className="inline-notice inline-notice--error" role="alert">{notice}</div>}
@@ -1275,15 +1296,22 @@ function StatutoryRecordStep({ sale, quote, canDispense, onChanged }: {
  * Phase 1M-B — the rule 65(3)(1) entries of this Sale, void ones included. A cashier sees the serial
  * and state; the entry itself, which names the patient, opens for the dispensing roles only.
  */
-function PrescriptionRecordsSection({ records }: { records: SaleDetail["prescriptionRecords"] }) {
+function PrescriptionRecordsSection({ sale }: { sale: SaleDetail }) {
   const role = useAuth().status?.user?.role;
   const canOpen = role === "owner_admin" || role === "pharmacist";
   return <section className="panel-callout" aria-labelledby="sale-records-title" data-testid="sale-records">
     <strong id="sale-records-title">Prescription-supply record (rule 65(3))</strong>
-    <ul>{records.map((record) => <li key={record.id}>
+    <ul>{sale.prescriptionRecords.map((record) => <li key={record.id}>
       {record.serialNumber} · {RECORD_METHOD_LABELS[record.recordMethod]} · for {record.prescriptionReference} · {RECORD_STATUS_LABELS[record.status]}
       {canOpen && <> · <Link to={`/app/prescription-records/${record.id}`}>Open the entry</Link></>}
     </li>)}</ul>
+    {sale.h1RegisterEntries.length > 0 && <>
+      <strong>Schedule H1 register (rule 65(3)(1)(h)) — separate record</strong>
+      <ul data-testid="sale-h1-records">{sale.h1RegisterEntries.map((entry) => <li key={entry.id}>
+        {entry.reference} (AUSHADHARTH Reference, line {entry.lineNumber}) · {H1_STATUS_LABELS[entry.status]}
+      </li>)}</ul>
+      {canOpen && <Link to={`/app/sales/${sale.id}/h1-register`}>Open the H1 hard copy</Link>}
+    </>}
   </section>;
 }
 

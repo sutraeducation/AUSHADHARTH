@@ -44,13 +44,36 @@ pub const SALE_GATING_SCHEMES: [&str; 5] = [
 
 /// The schemes whose statutory record this software cannot yet produce.
 ///
-/// Schedule H1 needs its own separate register under rule 65(3)(1)(h); Schedule X needs the
-/// duplicate prescription and the rule 65(21) register; Schedule C and C(1) need the rule 65(4)(1)
-/// register or memo particulars. None of them is satisfied by a prescription alone, so a sale that
-/// needs any of them is refused rather than posted without it. Schedule H is not here: since Phase
-/// 1M-B its prescription workflow exists, and a Schedule H line is gated on that instead.
-pub const WORKFLOW_PENDING_SCHEMES: [&str; 4] =
-    ["schedule_h1", "schedule_x", "schedule_c", "schedule_c1"];
+/// Schedule X needs the duplicate prescription and the rule 65(21) register; Schedule C and C(1)
+/// need the rule 65(4)(1) register or memo particulars. None of them is satisfied by a prescription
+/// alone, so a sale that needs any of them is refused rather than posted without it. Schedule H is
+/// not here since Phase 1M-B, and Schedule H1 is not here since Phase 1M-C: both are gated on their
+/// prescription workflow, and H1 additionally on its separate rule 65(3)(1)(h) working entry.
+pub const WORKFLOW_PENDING_SCHEMES: [&str; 3] = ["schedule_x", "schedule_c", "schedule_c1"];
+
+/// Phase 1M-C — State-level regulatory axes, recorded like any other finding but kept apart from
+/// `SCHEMES` on purpose: they are not central schedules, they are not frozen into the version-1
+/// central snapshot, and they gate only where the store's premises are in that State.
+///
+/// `punjab_restricted_supply` is a product's position under Punjab notification No.
+/// 9/16/21-3H6/1039 dated 25-03-2021 (eight habit-forming drugs whose stocking and sale need a
+/// departmental permission and monthly statements). It is not Schedule H1, not NDPS purview and not
+/// an external-order H1 condition. AUSHADHARTH does not implement that State workflow; it refuses.
+pub const STATE_SCHEMES: [&str; 1] = ["punjab_restricted_supply"];
+
+/// Every scheme an owner may record a finding under.
+pub const CLASSIFIABLE_SCHEMES: [&str; 7] = [
+    "schedule_h",
+    "schedule_h1",
+    "schedule_x",
+    "schedule_c",
+    "schedule_c1",
+    "ndps_purview",
+    "punjab_restricted_supply",
+];
+
+/// The GST state code of Punjab in the frozen `state_codes` reference table.
+pub const PUNJAB_STATE_CODE: &str = "03";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -132,9 +155,20 @@ pub enum SaleGate {
     Unresolved,
     /// Lawfully sellable, but only with a statutory record this phase does not implement.
     WorkflowUnavailable { scheme: &'static str },
-    /// Schedule H: sellable only on a prescription, under a registered pharmacist's supervision,
-    /// with every rule 65 fact present. Whether they are is the posting's question, not this one's.
+    /// Schedule H or H1: sellable only on a prescription, under a registered pharmacist's
+    /// supervision, with every rule 65 fact present — and for H1 the separate working entry too.
+    /// Whether they are is the posting's question, not this one's.
     PrescriptionRequired,
+    /// Phase 1M-C — a combination this software does not support, although each part alone may be:
+    /// `schedule_h1_ndps` is a Schedule H1 drug whose NDPS purview applies or is unknown. This is
+    /// AUSHADHARTH's own unsupported-workflow boundary, not a requirement rule 65 states.
+    UnsupportedIntersection { reason: &'static str },
+    /// Phase 1M-C — a State workflow this software does not implement applies to the product at a
+    /// store in that State.
+    StateWorkflowUnavailable { scheme: &'static str },
+    /// Phase 1M-C — the product's position under a State axis that governs this store is not
+    /// recorded, or the store's premises State itself is not recorded.
+    StateUnresolved { scheme: &'static str },
 }
 
 /// The gate, from the resolved position and the product's kind.
@@ -157,13 +191,149 @@ pub fn gate(product_kind: &str, resolved: &ResolvedRegulatory) -> SaleGate {
     {
         return SaleGate::Unresolved;
     }
+    // Phase 1M-C: Schedule H1 is sellable only where its NDPS purview is established NOT to apply.
+    // An NDPS-purview H1 drug, or one whose purview nobody has recorded, is an unsupported
+    // NDPS-intersection workflow.
+    if resolved.answer("schedule_h1") == Resolution::Applies
+        && resolved.answer("ndps_purview") != Resolution::DoesNotApply
+    {
+        return SaleGate::UnsupportedIntersection {
+            reason: "schedule_h1_ndps",
+        };
+    }
     // Last, so an unsupported scheme or an unknown position always wins: a line that is both
     // Schedule H and Schedule C is held to Schedule C as well, and a supported H requirement never
     // cancels an unsupported one.
-    if resolved.answer("schedule_h") == Resolution::Applies {
+    if resolved.answer("schedule_h") == Resolution::Applies
+        || resolved.answer("schedule_h1") == Resolution::Applies
+    {
         return SaleGate::PrescriptionRequired;
     }
     SaleGate::Clear
+}
+
+/// Phase 1M-C — a line's position under the State axes, as the posting freezes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateAnswer {
+    /// The GST state code of the store's recorded premises, or `None` where it is not recorded.
+    pub premises_state_code: Option<String>,
+    pub punjab: StateAxisAnswer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAxisAnswer {
+    /// The premises are in the State: the recorded finding, or `Unknown`.
+    Resolved(Resolution),
+    /// The premises are elsewhere; the axis does not govern this store.
+    NotApplicable,
+    /// The premises State is not recorded, so whether the axis governs cannot be said.
+    Undetermined,
+}
+
+impl StateAnswer {
+    /// The exact JSON a posted line freezes in `regulatory_state_snapshot`.
+    pub fn to_snapshot_json(&self) -> String {
+        let premises = match &self.premises_state_code {
+            Some(code) => format!("\"{code}\""),
+            None => "null".to_owned(),
+        };
+        let punjab = match self.punjab {
+            StateAxisAnswer::Resolved(answer) => answer.as_str(),
+            StateAxisAnswer::NotApplicable => "not_applicable",
+            StateAxisAnswer::Undetermined => "undetermined",
+        };
+        format!("{{\"premises_state_code\":{premises},\"punjab_restricted_supply\":\"{punjab}\"}}")
+    }
+}
+
+/// The State gate, where one governs. `None` means no State axis stands in the way.
+///
+/// Kind matters as for the central gate: an unknown or undetermined State position stops a
+/// medicine, never a device or a general item; a positive finding stops anything.
+pub fn state_gate(product_kind: &str, state: &StateAnswer) -> Option<SaleGate> {
+    match state.punjab {
+        StateAxisAnswer::Resolved(Resolution::Applies) => {
+            Some(SaleGate::StateWorkflowUnavailable {
+                scheme: "punjab_restricted_supply",
+            })
+        }
+        StateAxisAnswer::Resolved(Resolution::Unknown) | StateAxisAnswer::Undetermined
+            if product_kind == "medicine" =>
+        {
+            Some(SaleGate::StateUnresolved {
+                scheme: "punjab_restricted_supply",
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The full gate, in the order the posting judges it: the central classification and any central
+/// intersection this software does not support first, then the State boundary, then the
+/// prescription requirement.
+pub fn combined_gate(
+    product_kind: &str,
+    resolved: &ResolvedRegulatory,
+    state: &StateAnswer,
+) -> SaleGate {
+    let central = gate(product_kind, resolved);
+    match central {
+        SaleGate::WorkflowUnavailable { .. }
+        | SaleGate::Unresolved
+        | SaleGate::UnsupportedIntersection { .. } => central,
+        _ => state_gate(product_kind, state).unwrap_or(central),
+    }
+}
+
+/// The GST state code of the store's recorded premises, or `None` where no premises address, no
+/// State, or no Indian State is recorded. Never the GSTIN prefix or the place of supply.
+pub async fn resolve_premises_state(
+    connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let code: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT CASE WHEN address.country_code='IN' AND code.jurisdiction='IN' \
+         THEN code.state_code END FROM store_addresses address \
+         LEFT JOIN state_codes code ON code.id=address.state_id WHERE address.store_id=?",
+    )
+    .bind(store_id)
+    .fetch_optional(&mut **connection)
+    .await?;
+    Ok(code.flatten())
+}
+
+/// A product's State position on one date, for a store whose premises are `premises`.
+pub async fn resolve_state_for_product(
+    connection: &mut PoolConnection<Sqlite>,
+    product_id: &str,
+    date: &str,
+    premises: Option<&str>,
+) -> Result<StateAnswer, sqlx::Error> {
+    let punjab = match premises {
+        None => StateAxisAnswer::Undetermined,
+        Some(code) if code != PUNJAB_STATE_CODE => StateAxisAnswer::NotApplicable,
+        Some(_) => {
+            let applies: Option<i64> = sqlx::query_scalar(
+                "SELECT applies FROM product_regulatory_classifications \
+                 WHERE product_id=? AND scheme='punjab_restricted_supply' AND status='active' \
+                   AND effective_from<=? AND (effective_to IS NULL OR effective_to>?)",
+            )
+            .bind(product_id)
+            .bind(date)
+            .bind(date)
+            .fetch_optional(&mut **connection)
+            .await?;
+            StateAxisAnswer::Resolved(match applies {
+                Some(1) => Resolution::Applies,
+                Some(_) => Resolution::DoesNotApply,
+                None => Resolution::Unknown,
+            })
+        }
+    };
+    Ok(StateAnswer {
+        premises_state_code: premises.map(str::to_owned),
+        punjab,
+    })
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -341,7 +511,7 @@ mod tests {
     /// held to the unsupported scheme.
     #[test]
     fn schedule_h_with_an_unsupported_scheme_stays_blocked_on_that_scheme() {
-        for other in ["schedule_h1", "schedule_x", "schedule_c", "schedule_c1"] {
+        for other in ["schedule_x", "schedule_c", "schedule_c1"] {
             let mut resolved = all(Resolution::DoesNotApply);
             resolved.set("schedule_h", Resolution::Applies);
             resolved.set(other, Resolution::Applies);
@@ -388,6 +558,179 @@ mod tests {
              \"schedule_c\":\"unknown\",\"schedule_c1\":\"unknown\",\"ndps_purview\":\"unknown\"}"
         );
         assert_eq!(resolved.to_snapshot_json(), resolved.to_snapshot_json());
+    }
+
+    /// Phase 1M-C: Schedule H1 whose NDPS purview is established not to apply needs a
+    /// prescription (and, at posting, its separate working entry) — it is no longer a missing
+    /// workflow.
+    #[test]
+    fn schedule_h1_outside_ndps_requires_a_prescription() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_h1", Resolution::Applies);
+        assert_eq!(gate("medicine", &resolved), SaleGate::PrescriptionRequired);
+        resolved.set("schedule_h", Resolution::Applies);
+        assert_eq!(gate("medicine", &resolved), SaleGate::PrescriptionRequired);
+    }
+
+    /// C-04/C-05/C-64: NDPS applies or unknown on a Schedule H1 drug is an unsupported
+    /// NDPS-intersection workflow — not a verified H1 requirement, and not Schedule H's rule.
+    #[test]
+    fn schedule_h1_with_ndps_applying_or_unknown_is_an_unsupported_intersection() {
+        for ndps in [Resolution::Applies, Resolution::Unknown] {
+            let mut resolved = all(Resolution::DoesNotApply);
+            resolved.set("schedule_h1", Resolution::Applies);
+            resolved.set("ndps_purview", ndps);
+            assert_eq!(
+                gate("medicine", &resolved),
+                SaleGate::UnsupportedIntersection {
+                    reason: "schedule_h1_ndps"
+                }
+            );
+        }
+        // Schedule H alone keeps its 1M-B behaviour: NDPS does not gate it.
+        let mut h = all(Resolution::DoesNotApply);
+        h.set("schedule_h", Resolution::Applies);
+        h.set("ndps_purview", Resolution::Unknown);
+        assert_eq!(gate("medicine", &h), SaleGate::PrescriptionRequired);
+    }
+
+    /// Schedule X, C and C(1) still outrank H1.
+    #[test]
+    fn schedule_h1_with_x_or_c_stays_blocked_on_that_scheme() {
+        for other in WORKFLOW_PENDING_SCHEMES {
+            let mut resolved = all(Resolution::DoesNotApply);
+            resolved.set("schedule_h1", Resolution::Applies);
+            resolved.set(other, Resolution::Applies);
+            assert_eq!(
+                gate("medicine", &resolved),
+                SaleGate::WorkflowUnavailable { scheme: other }
+            );
+        }
+    }
+
+    fn punjab(answer: StateAxisAnswer) -> StateAnswer {
+        StateAnswer {
+            premises_state_code: Some(PUNJAB_STATE_CODE.to_owned()),
+            punjab: answer,
+        }
+    }
+
+    /// C-69/C-71: in a Punjab store the axis refuses when it applies, and fails closed for a
+    /// medicine when it is unknown or the premises State is undetermined; elsewhere it is ignored.
+    #[test]
+    fn the_punjab_axis_gates_only_where_it_governs() {
+        let clear = all(Resolution::DoesNotApply);
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &clear,
+                &punjab(StateAxisAnswer::Resolved(Resolution::Applies))
+            ),
+            SaleGate::StateWorkflowUnavailable {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &clear,
+                &punjab(StateAxisAnswer::Resolved(Resolution::Unknown))
+            ),
+            SaleGate::StateUnresolved {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &clear,
+                &punjab(StateAxisAnswer::Resolved(Resolution::DoesNotApply))
+            ),
+            SaleGate::Clear
+        );
+        let undetermined = StateAnswer {
+            premises_state_code: None,
+            punjab: StateAxisAnswer::Undetermined,
+        };
+        assert_eq!(
+            combined_gate("medicine", &clear, &undetermined),
+            SaleGate::StateUnresolved {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        // A general item is never stopped by an unknown, only by a positive finding.
+        assert_eq!(
+            combined_gate(
+                "general_pharmacy_item",
+                &ResolvedRegulatory::unknown(),
+                &punjab(StateAxisAnswer::Resolved(Resolution::Unknown))
+            ),
+            SaleGate::Clear
+        );
+        let elsewhere = StateAnswer {
+            premises_state_code: Some("27".to_owned()),
+            punjab: StateAxisAnswer::NotApplicable,
+        };
+        assert_eq!(
+            combined_gate("medicine", &clear, &elsewhere),
+            SaleGate::Clear
+        );
+    }
+
+    /// C-72: the central H1 answer and the Punjab answer are independent both ways, and the central
+    /// refusals outrank the State one.
+    #[test]
+    fn the_central_and_state_axes_stay_independent() {
+        let mut h1 = all(Resolution::DoesNotApply);
+        h1.set("schedule_h1", Resolution::Applies);
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &h1,
+                &punjab(StateAxisAnswer::Resolved(Resolution::DoesNotApply))
+            ),
+            SaleGate::PrescriptionRequired
+        );
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &h1,
+                &punjab(StateAxisAnswer::Resolved(Resolution::Applies))
+            ),
+            SaleGate::StateWorkflowUnavailable {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        // The central snapshot never carries the State axis.
+        assert!(!h1.to_snapshot_json().contains("punjab"));
+        let mut x = all(Resolution::DoesNotApply);
+        x.set("schedule_x", Resolution::Applies);
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &x,
+                &punjab(StateAxisAnswer::Resolved(Resolution::Applies))
+            ),
+            SaleGate::WorkflowUnavailable {
+                scheme: "schedule_x"
+            }
+        );
+    }
+
+    #[test]
+    fn the_state_snapshot_is_exact() {
+        assert_eq!(
+            punjab(StateAxisAnswer::Resolved(Resolution::DoesNotApply)).to_snapshot_json(),
+            "{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"does_not_apply\"}"
+        );
+        assert_eq!(
+            StateAnswer {
+                premises_state_code: None,
+                punjab: StateAxisAnswer::Undetermined
+            }
+            .to_snapshot_json(),
+            "{\"premises_state_code\":null,\"punjab_restricted_supply\":\"undetermined\"}"
+        );
     }
 
     #[test]

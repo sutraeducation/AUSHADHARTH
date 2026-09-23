@@ -23,8 +23,25 @@ const IDs = {
   sale: "01997d00-0000-7000-8000-000000000030",
   line: "01997d00-0000-7000-8000-000000000031",
   user: "01997d00-0000-7000-8000-000000000040",
-  record: "01997d00-0000-7000-8000-000000000050"
+  record: "01997d00-0000-7000-8000-000000000050",
+  h1: "01997d00-0000-7000-8000-000000000060"
 };
+
+function h1Sheet(overrides: Record<string, unknown> = {}) {
+  return {
+    store: { legalName: "Care Pharmacy Private Limited", displayName: "Care Pharmacy", addressLine1: "12 Market Road", addressLine2: null, city: "Ludhiana", stateName: "Punjab", postalCode: "141001", licences: ["Form 20 PB-20-1234", "Form 21 PB-21-1234"] },
+    entries: [{
+      id: IDs.h1, reference: "AH1-000001", status: "prepared", saleDocumentId: IDs.sale, documentNumber: null, lineNumber: 1,
+      dateOfSupply: "2026-09-21", prescriberName: "Dr. Anjali Rao", prescriberAddress: "Rao Clinic, Pune", patientName: "Sita Kulkarni",
+      drugName: "Cefixime 200 Tablet", quantityAtoms: 10, quantityUnitLabel: "Tablet", supervisingProfessionalName: "Meera Iyer",
+      supervisingRegistrationNumber: "MH-PH-44821", supplyRecordSerial: "PR-000003", preparedByDisplayName: "Store User",
+      preparedAtUtc: "2026-09-21T09:58:00Z", hardCopyPlacedInRegister: false, pharmacistAuthenticatedHardCopy: false,
+      confirmedByDisplayName: null, confirmedAtUtc: null, finalizedAtUtc: null, voidedAtUtc: null, voidReason: null, returnedAtoms: 0,
+      ...overrides
+    }],
+    annotations: []
+  };
+}
 
 function entry(overrides: Record<string, unknown> = {}) {
   return {
@@ -143,6 +160,23 @@ function service(options: Options = {}) {
     if (url.pathname === `/api/v1/prescription-supply-records/${IDs.record}/void`) {
       if (!dispenser) return failure("authorization_denied", 403);
       return response(entry({ status: "void", voidedByDisplayName: "Store User", voidedAtUtc: "2026-09-21T10:05:00Z", voidReason: String(body.reason) }));
+    }
+    // Phase 1M-C — the Schedule H1 working record.
+    if (url.pathname === `/api/v1/sales/${IDs.sale}/h1-register`) {
+      if (!dispenser) return failure("authorization_denied", 403);
+      return response(h1Sheet());
+    }
+    if (url.pathname === `/api/v1/sales/${IDs.sale}/h1-register/confirm`) {
+      if (!dispenser) return failure("authorization_denied", 403);
+      return response(h1Sheet({ status: "confirmed", hardCopyPlacedInRegister: true, pharmacistAuthenticatedHardCopy: true, confirmedByDisplayName: "Store User", confirmedAtUtc: "2026-09-21T10:00:00Z" }));
+    }
+    if (url.pathname === "/api/v1/h1-register") {
+      if (!dispenser) return failure("authorization_denied", 403);
+      return response(h1Sheet({ status: "finalized", finalizedAtUtc: "2026-09-21T10:05:00Z", returnedAtoms: 5, documentNumber: "INV/2627/000004" }));
+    }
+    if (url.pathname === `/api/v1/h1-register/${IDs.h1}/annotations`) {
+      if (!dispenser) return failure("authorization_denied", 403);
+      return response({ id: "01997d00-0000-7000-8000-000000000071", entryId: IDs.h1, note: String(body.note), createdByDisplayName: "Store User", createdAtUtc: "2026-09-21T11:00:00Z" }, 201);
     }
     // The Sale page the create flow returns to is not under test here.
     if (url.pathname.startsWith("/api/v1/")) return failure("internal_error", 500);
@@ -385,5 +419,76 @@ describe("the rule 65(3)(1) entry", () => {
     const double = renderApp(`/app/prescription-records/${IDs.record}`, service({ role: "cashier" }));
     expect(await screen.findByText("Prescriptions are not available to this role")).toBeInTheDocument();
     expect(double.fetchMock.mock.calls.some(([input]) => String(input).includes("/prescription-supply-records/"))).toBe(false);
+  });
+});
+
+describe("the Schedule H1 working record (Phase 1M-C)", () => {
+  /** C-07, C-08, C-09, C-57: the clause (h) particulars, the internal reference labelled as such,
+   *  the DCC recommendation described as a recommendation, and no signature claimed. */
+  it("prints the clause (h) particulars and says what the copy is, and is not", async () => {
+    renderApp(`/app/sales/${IDs.sale}/h1-register`);
+    const table = await screen.findByTestId("h1-entries");
+    for (const text of ["Dr. Anjali Rao", "Rao Clinic, Pune", "Sita Kulkarni", "Cefixime 200 Tablet", "10 Tablet", "AH1-000001"]) {
+      expect(within(table).getByText(new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))).toBeInTheDocument();
+    }
+    expect(within(table).getByText("AUSHADHARTH Reference (internal)")).toBeInTheDocument();
+    expect(within(table).getByText(/Internal — not a register serial/)).toBeInTheDocument();
+    expect(screen.getByText(/Care Pharmacy Private Limited/)).toBeInTheDocument();
+    expect(screen.getByText(/Form 20 PB-20-1234/)).toBeInTheDocument();
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/official committee recommendation, not a statutory amendment/);
+    expect(body).toMatch(/The rule itself lists no signature among the particulars/);
+    expect(body).toMatch(/AUSHADHARTH's record is a working record, not that register/);
+    expect(body).not.toMatch(/signed by AUSHADHARTH|digitally signed|electronically signed|e-signed|H1 register serial/i);
+    expect(screen.getByTestId("h1-status")).toHaveTextContent("Prepared. Not yet placed in the H1 register or authenticated. Nothing has been sold.");
+  });
+
+  /** C-58, C-59: the electronic entry alone does not complete it; both physical acts are needed. */
+  it("confirms only with both physical acts, per supply", async () => {
+    const double = renderApp(`/app/sales/${IDs.sale}/h1-register`);
+    const submit = await screen.findByRole("button", { name: "Confirm placement and authentication" });
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("The printed hard copy has been placed in the separate Schedule H1 register"));
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("The registered pharmacist has authenticated the pasted copy by hand"));
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(double.writes.some((write) => write.path.endsWith("/h1-register/confirm"))).toBe(true));
+    const write = double.writes.find((each) => each.path.endsWith("/h1-register/confirm"))!;
+    expect(write.path).toBe(`/api/v1/sales/${IDs.sale}/h1-register/confirm`);
+    expect(write.body).toEqual({ hardCopyPlacedInRegister: true, pharmacistAuthenticatedHardCopy: true });
+    expect(await screen.findByTestId("h1-status")).toHaveTextContent("AUSHADHARTH did not sign this copy.");
+    expect(screen.queryByRole("button", { name: "Confirm placement and authentication" })).not.toBeInTheDocument();
+    // C-67: nothing on the page confirms a day's entries at once.
+    expect(screen.queryByRole("button", { name: /all|day|batch/i })).not.toBeInTheDocument();
+  });
+
+  /** C-25, C-60: a cashier cannot open or confirm the H1 record, and no request is made. */
+  it("keeps the H1 record from a cashier", async () => {
+    for (const path of [`/app/sales/${IDs.sale}/h1-register`, "/app/h1-register"]) {
+      const double = renderApp(path, service({ role: "cashier" }));
+      expect(await screen.findByText("Prescriptions are not available to this role")).toBeInTheDocument();
+      expect(double.fetchMock.mock.calls.some(([input]) => String(input).includes("h1-register"))).toBe(false);
+      cleanup();
+    }
+  });
+
+  /** C-46, C-49, C-22: the register view is by date, shows a return beside the unchanged entry,
+   *  and appends a note without editing anything. */
+  it("reads the register by date and appends notes beside unchanged entries", async () => {
+    const double = renderApp("/app/h1-register");
+    const table = await screen.findByTestId("h1-entries");
+    expect(within(table).getByText(/5 returned since \(recorded separately; this entry is unchanged\)/)).toBeInTheDocument();
+    expect(within(table).getByText("Finalized with the posted sale")).toBeInTheDocument();
+    const request = double.fetchMock.mock.calls.map(([input]) => String(input)).find((url) => url.includes("/api/v1/h1-register?"))!;
+    expect(new URL(request, "http://local.test").searchParams.has("from")).toBe(true);
+    expect(request).not.toMatch(/Sita|patient/i);
+    fireEvent.click(screen.getByRole("button", { name: "Add a note to AH1-000001" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("The entry itself never changes.");
+    fireEvent.change(within(dialog).getByLabelText("Note"), { target: { value: "Initials clarified on the pasted copy." } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add note" }));
+    await waitFor(() => expect(double.writes.some((write) => write.path.endsWith("/annotations"))).toBe(true));
+    expect(double.writes.find((write) => write.path.endsWith("/annotations"))!.body).toEqual({ note: "Initials clarified on the pasted copy." });
   });
 });

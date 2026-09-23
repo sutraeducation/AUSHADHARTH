@@ -177,7 +177,8 @@ export const SCHEME_LABELS: Record<RegulatoryScheme, string> = {
   schedule_x: "Schedule X",
   schedule_c: "Schedule C",
   schedule_c1: "Schedule C(1)",
-  ndps_purview: "NDPS Act purview"
+  ndps_purview: "NDPS Act purview",
+  punjab_restricted_supply: "Punjab restricted supply (State notification)"
 };
 
 export const ANSWER_LABELS: Record<RegulatoryAnswer, string> = {

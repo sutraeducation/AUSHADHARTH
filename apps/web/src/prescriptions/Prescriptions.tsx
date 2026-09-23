@@ -21,6 +21,11 @@ import {
   REPEAT_LABELS,
   confirmSupplyRecord,
   voidSupplyRecord,
+  annotateH1Entry,
+  confirmSaleH1Entries,
+  getSaleH1Sheet,
+  listH1Register,
+  H1_STATUS_LABELS,
   RECORD_STATUS_LABELS,
   getSupplyRecord,
   archivePrescriber,
@@ -701,7 +706,7 @@ function PrescriptionRecordView() {
   const live = entry.status === "prepared" || entry.status === "confirmed";
   const statusText = {
     prepared: "Prepared. Not signed: awaiting the registered pharmacist's handwritten signature on this entry, and this serial on the prescription. Nothing has been sold.",
-    confirmed: `A pharmacist, ${entry.confirmedByDisplayName ?? "a user"}, confirmed at ${entry.confirmedAtUtc ?? ""} that the registered pharmacist signed this entry by hand and its serial is on the prescription. The sale can now be posted. AUSHADHARTH did not sign this entry.`,
+    confirmed: `A pharmacist, ${entry.confirmedByDisplayName ?? "a user"}, confirmed at ${entry.confirmedAtUtc ?? ""} that the registered pharmacist signed this entry by hand and its serial is on the prescription. The sale can be posted once every other requirement — including any Schedule H1 register entry — is met. AUSHADHARTH did not sign this entry.`,
     finalized: `Finalized with sale ${entry.documentNumber ?? ""} at ${entry.finalizedAtUtc ?? ""}. Handwritten signature and serial confirmed by ${entry.confirmedByDisplayName ?? "a user"} at ${entry.confirmedAtUtc ?? ""}, before the supply. AUSHADHARTH did not sign this entry.`,
     void: `Void — cancelled before the supply by ${entry.voidedByDisplayName ?? "a user"} at ${entry.voidedAtUtc ?? ""}: ${entry.voidReason ?? ""}. Nothing was supplied under it. Its serial is kept and not given to another entry.`
   }[entry.status];
@@ -901,6 +906,237 @@ function ArchiveDialog({ title, description, actionLabel = "Archive", onClose, o
       <div className="dialog-actions">
         <button className="button button--secondary" type="button" onClick={onClose}>Cancel</button>
         <button className="button button--danger" type="submit" disabled={!reason.trim() || busy}>{actionLabel}</button>
+      </div>
+    </form>
+  </CatalogDialog>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-C — the Schedule H1 working record
+//
+// Rule 65(3)(1)(h) requires a separate register, which the pharmacy keeps. AUSHADHARTH keeps a
+// working record of each entry and prints its hard copy for that register; it is not the register.
+// The 48th Drugs Consultative Committee (24-07-2015, agenda item 11) recommended, for records kept
+// electronically, that hard copies be pasted in the register and authenticated by the registered
+// pharmacist — an official CDSCO-hosted committee recommendation, not a statutory amendment, which
+// AUSHADHARTH follows conservatively.
+// ---------------------------------------------------------------------------------------------
+
+function H1StoreHeader({ sheet }: { sheet: H1SheetData }) {
+  const store = sheet.store;
+  const address = [store.addressLine1, store.addressLine2, store.city, store.stateName, store.postalCode].filter(Boolean).join(", ");
+  return <div className="record-leaf__store">
+    <strong>{store.legalName ?? store.displayName}</strong>
+    {address && <span>{address}</span>}
+    {store.licences.length > 0 && <span>Licences: {store.licences.join(" · ")}</span>}
+  </div>;
+}
+
+type H1SheetData = Awaited<ReturnType<typeof getSaleH1Sheet>>;
+
+function H1EntryTable({ sheet, showStatus }: { sheet: H1SheetData; showStatus: boolean }) {
+  return <div className="table-scroll"><table className="data-table record-leaf__lines" data-testid="h1-entries">
+    <thead><tr>
+      <th scope="col">Date of supply</th>
+      <th scope="col">Name and address of the prescriber</th>
+      <th scope="col">Name of the patient</th>
+      <th scope="col">Name of the drug</th>
+      <th scope="col" className="numeric">Quantity supplied</th>
+      <th scope="col">AUSHADHARTH Reference (internal)</th>
+      {showStatus && <th scope="col">State</th>}
+    </tr></thead>
+    <tbody>{sheet.entries.map((entry) => <tr key={entry.id} data-testid={`h1-entry-${entry.reference}`}>
+      <td data-label="Date of supply">{entry.dateOfSupply}</td>
+      <td data-label="Prescriber">{entry.prescriberName}<br /><small className="row-subtext">{entry.prescriberAddress}</small></td>
+      <td data-label="Patient">{entry.patientName}</td>
+      <td data-label="Drug">{entry.drugName}</td>
+      <td data-label="Quantity" className="numeric">{entry.quantityAtoms} {entry.quantityUnitLabel ?? ""}{entry.returnedAtoms > 0 && <small className="row-subtext">{entry.returnedAtoms} returned since (recorded separately; this entry is unchanged)</small>}</td>
+      <td data-label="AUSHADHARTH Reference">{entry.reference}<br /><small className="row-subtext">Internal — not a register serial. Rule 65 entry {entry.supplyRecordSerial}{entry.documentNumber ? ` · sale ${entry.documentNumber}` : ""}</small></td>
+      {showStatus && <td data-label="State">{H1_STATUS_LABELS[entry.status]}{entry.voidReason && <small className="row-subtext">{entry.voidReason}</small>}</td>}
+    </tr>)}</tbody>
+  </table></div>;
+}
+
+export function H1HardCopyPage() {
+  usePageTitle("Schedule H1 hard copy");
+  return <DispenserOnly><H1HardCopyView /></DispenserOnly>;
+}
+
+/**
+ * One supply's Schedule H1 hard copy: the clause (h) particulars of every H1 line, with the store's
+ * legal identity, printed for the separate physical H1 register. Nothing here is the register, and
+ * nothing here signs anything: the registered pharmacist authenticates the pasted copy by hand, and
+ * a pharmacist then confirms both acts so the sale can be posted.
+ */
+function H1HardCopyView() {
+  const { id } = useParams();
+  const queryClient = useQueryClient();
+  const sheet = useQuery({ queryKey: ["h1-sheet", id], queryFn: () => getSaleH1Sheet(id!), enabled: Boolean(id), retry: false });
+  const [placed, setPlaced] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const confirm = useMutation({
+    mutationFn: () => confirmSaleH1Entries(id!),
+    onSuccess: (updated) => {
+      setProblem(null);
+      queryClient.setQueryData(["h1-sheet", id], updated);
+      void queryClient.invalidateQueries({ queryKey: ["sales"] });
+    },
+    onError: (caught) => setProblem(caught instanceof LocalServiceError ? caught.message : "The H1 entries could not be confirmed.")
+  });
+  if (sheet.isPending) return <section className="master-panel"><Loading label="Loading the H1 hard copy…" /></section>;
+  if (sheet.isError) return <section className="master-panel"><QueryError label="This H1 hard copy could not be loaded" error={sheet.error} onRetry={() => void sheet.refetch()} /></section>;
+  const data = sheet.data;
+  const live = { ...data, entries: data.entries.filter((entry) => entry.status !== "void") };
+  const prepared = live.entries.some((entry) => entry.status === "prepared");
+  const pharmacist = live.entries[0];
+  return <div className="record-page">
+    <header className="page-header print-hide">
+      <div>
+        <p className="eyebrow">OPERATIONS</p>
+        <h1>Schedule H1 hard copy</h1>
+        <p>For the pharmacy's separate Schedule H1 register · {live.entries.length} {live.entries.length === 1 ? "entry" : "entries"}</p>
+      </div>
+      <div className="page-header__actions">
+        <button className="button button--primary" type="button" onClick={() => window.print()}>Print the hard copy</button>
+        <Link className="button button--secondary" to={`/app/sales/${id}`}>Back to the sale</Link>
+      </div>
+    </header>
+
+    <article className="master-panel record-leaf" aria-labelledby="h1-leaf-title">
+      <h2 id="h1-leaf-title">Schedule H1 supply — rule 65(3)(1)(h), Drugs Rules, 1945</h2>
+      <H1StoreHeader sheet={data} />
+      {live.entries.length === 0
+        ? <p className="panel-note">This sale has no live Schedule H1 working entry.</p>
+        : <H1EntryTable sheet={live} showStatus={false} />}
+      {pharmacist && <p className="record-leaf__status">Registered pharmacist responsible: {pharmacist.supervisingProfessionalName} · registration {pharmacist.supervisingRegistrationNumber}</p>}
+      <div className="record-leaf__signature">
+        <span>Authentication by the registered pharmacist (by hand, on the pasted copy)</span>
+        <span className="record-leaf__signature-line" aria-hidden="true" />
+      </div>
+      <p className="record-leaf__status" data-testid="h1-status">{prepared
+        ? "Prepared. Not yet placed in the H1 register or authenticated. Nothing has been sold."
+        : live.entries.length > 0 && live.entries.every((entry) => entry.status === "finalized")
+          ? `Finalized with the posted sale. Placement and authentication confirmed by ${live.entries[0].confirmedByDisplayName ?? "a user"} at ${live.entries[0].confirmedAtUtc ?? ""}. AUSHADHARTH did not sign this copy.`
+          : live.entries.length > 0
+            ? `Placement in the H1 register and the registered pharmacist's authentication confirmed by ${live.entries[0].confirmedByDisplayName ?? "a user"} at ${live.entries[0].confirmedAtUtc ?? ""}. The sale can now be posted. AUSHADHARTH did not sign this copy.`
+            : ""}</p>
+    </article>
+
+    <section className="master-panel print-hide" aria-labelledby="h1-basis-title">
+      <h2 id="h1-basis-title">What this copy is for</h2>
+      <p className="panel-note">Rule 65(3)(1)(h) requires the supply of a Schedule H1 drug to be recorded in a separate register at the time of supply, with the prescriber's name and address, the patient's name, the drug and the quantity supplied, kept for three years and open for inspection. AUSHADHARTH's record is a working record, not that register.</p>
+      <p className="panel-note">For records kept electronically, the 48th Drugs Consultative Committee (24 July 2015, agenda item 11) recommended that a hard copy of the required data be pasted in the register and authenticated by the registered pharmacist. That is an official committee recommendation, not a statutory amendment; AUSHADHARTH follows it conservatively. The rule itself lists no signature among the particulars.</p>
+    </section>
+
+    {prepared && <form className="master-panel print-hide record-complete" onSubmit={(event) => { event.preventDefault(); setProblem(null); if (placed && authenticated) confirm.mutate(); }} aria-label="Confirm the H1 hard copy">
+      <h2>Before the sale is posted</h2>
+      <ol className="panel-note">
+        <li>Print this hard copy.</li>
+        <li>Place it in the pharmacy's separate Schedule H1 register.</li>
+        <li>The registered pharmacist{pharmacist ? `, ${pharmacist.supervisingProfessionalName},` : ""} authenticates the pasted copy by hand.</li>
+        <li>Confirm both here. Only a pharmacist or the owner can; a cashier cannot. Then post the sale.</li>
+      </ol>
+      <label className="check-field">
+        <input id="h1-placed" type="checkbox" checked={placed} onChange={(event) => setPlaced(event.target.checked)} />
+        <span>The printed hard copy has been placed in the separate Schedule H1 register</span>
+      </label>
+      <label className="check-field">
+        <input id="h1-authenticated" type="checkbox" checked={authenticated} onChange={(event) => setAuthenticated(event.target.checked)} />
+        <span>The registered pharmacist has authenticated the pasted copy by hand</span>
+      </label>
+      {problem && <div className="inline-notice inline-notice--error" role="alert">{problem}</div>}
+      <div className="form-actions">
+        <button className="button button--primary" type="submit" disabled={!placed || !authenticated || confirm.isPending}>{confirm.isPending ? "Saving…" : "Confirm placement and authentication"}</button>
+      </div>
+    </form>}
+  </div>;
+}
+
+export function H1RegisterPage() {
+  usePageTitle("Schedule H1 register");
+  return <DispenserOnly><H1RegisterView /></DispenserOnly>;
+}
+
+/**
+ * The H1 working record for a period, in date order, for the dispensing roles and for inspection.
+ * Searched by date only: there is no patient search. Returns are shown beside the entry they
+ * relate to; the entry itself never changes. A note may be appended to a finalized entry.
+ */
+function H1RegisterView() {
+  const today = businessToday();
+  const [from, setFrom] = useState(today);
+  const [to, setTo] = useState(today);
+  const [range, setRange] = useState({ from: today, to: today });
+  const queryClient = useQueryClient();
+  const register = useQuery({ queryKey: ["h1-register", range.from, range.to], queryFn: () => listH1Register(range.from, range.to), retry: false });
+  const [noting, setNoting] = useState<string | null>(null);
+  return <div className="record-page">
+    <header className="page-header print-hide">
+      <div>
+        <p className="eyebrow">OPERATIONS</p>
+        <h1>Schedule H1 register</h1>
+        <p>AUSHADHARTH's working record of rule 65(3)(1)(h) entries. The statutory register is the pharmacy's separate physical register.</p>
+      </div>
+      <div className="page-header__actions">
+        <button className="button button--primary" type="button" onClick={() => window.print()}>Print</button>
+      </div>
+    </header>
+    <form className="master-panel print-hide h1-register-filter" onSubmit={(event) => { event.preventDefault(); setRange({ from, to }); }} aria-label="Choose the period">
+      <div className="field"><label htmlFor="h1-from">From</label><input id="h1-from" type="date" value={from} onChange={(event) => setFrom(event.target.value)} required /></div>
+      <div className="field"><label htmlFor="h1-to">To</label><input id="h1-to" type="date" value={to} onChange={(event) => setTo(event.target.value)} required /></div>
+      <button className="button button--secondary" type="submit">Show</button>
+    </form>
+    <article className="master-panel record-leaf" aria-labelledby="h1-register-title">
+      <h2 id="h1-register-title">Schedule H1 entries, {range.from} to {range.to}</h2>
+      {register.isPending
+        ? <Loading label="Loading the H1 register…" />
+        : register.isError
+          ? <QueryError label="The H1 register could not be loaded" error={register.error} onRetry={() => void register.refetch()} />
+          : <>
+              <H1StoreHeader sheet={register.data} />
+              {register.data.entries.length === 0
+                ? <p className="panel-note">No Schedule H1 entry in this period.</p>
+                : <H1EntryTable sheet={register.data} showStatus />}
+              {register.data.annotations.length > 0 && <section aria-labelledby="h1-notes-title">
+                <h3 id="h1-notes-title">Notes appended afterwards</h3>
+                <ul>{register.data.annotations.map((note) => {
+                  const entry = register.data.entries.find((each) => each.id === note.entryId);
+                  return <li key={note.id}>{entry?.reference ?? "Entry"} · {note.createdByDisplayName ?? "a user"} · {note.createdAtUtc}: {note.note}</li>;
+                })}</ul>
+              </section>}
+              <div className="print-hide">
+                {register.data.entries.filter((entry) => entry.status === "finalized").map((entry) => <button key={entry.id} className="button button--secondary" type="button" onClick={() => setNoting(entry.id)}>Add a note to {entry.reference}</button>)}
+              </div>
+            </>}
+    </article>
+    {noting && <NoteDialog
+      onClose={() => setNoting(null)}
+      onSave={async (note) => {
+        await annotateH1Entry(noting, note);
+        setNoting(null);
+        void queryClient.invalidateQueries({ queryKey: ["h1-register"] });
+      }}
+    />}
+  </div>;
+}
+
+function NoteDialog({ onClose, onSave }: { onClose: () => void; onSave: (note: string) => Promise<void> }) {
+  const [note, setNote] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  return <CatalogDialog title="Add a note" description="The entry itself never changes. The note is appended beside it with your name and the time, and cannot be edited or removed." onClose={onClose}>
+    <form className="master-form" onSubmit={(event) => {
+      event.preventDefault();
+      setError(null);
+      setBusy(true);
+      onSave(note).catch((caught) => setError(caught instanceof LocalServiceError ? caught.message : "The note could not be saved.")).finally(() => setBusy(false));
+    }}>
+      <div className="field"><label htmlFor="h1-note">Note</label><textarea id="h1-note" value={note} onChange={(event) => setNote(event.target.value)} maxLength={1000} required /></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="dialog-actions">
+        <button className="button button--secondary" type="button" onClick={onClose}>Cancel</button>
+        <button className="button button--primary" type="submit" disabled={note.trim().length < 3 || busy}>Add note</button>
       </div>
     </form>
   </CatalogDialog>;

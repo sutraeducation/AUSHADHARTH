@@ -1249,11 +1249,32 @@ export const SaleRecordSummarySchema = z.object({
   prescriptionReference: z.string()
 });
 
+/**
+ * Phase 1M-C. A Schedule H1 working entry's lifecycle: `prepared` (the electronic working entry
+ * exists; nothing is sold), `confirmed` (a dispensing user confirmed its hard copy was placed in the
+ * separate physical H1 register and authenticated by the registered pharmacist), `finalized` (with
+ * the posted Sale), `void` (cancelled before supply; kept; its reference never reused).
+ */
+export const H1EntryStatusSchema = z.enum(["prepared", "confirmed", "finalized", "void"]);
+
+/**
+ * Phase 1M-C. An H1 working entry as a Sale shows it: its AUSHADHARTH Reference (internal, not a
+ * register serial) and state. The particulars, which name the patient, are read by the dispensing
+ * roles only.
+ */
+export const SaleH1EntrySummarySchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  status: H1EntryStatusSchema,
+  lineNumber: z.number().int()
+});
+
 export const SaleDetailSchema = SaleSchema.extend({
   lines: z.array(SaleLineSchema).default([]),
   tenders: z.array(SaleTenderSchema).default([]),
   supply: SaleSupplySchema.default({ supervisingProfessionalId: null, prescriptionEndorsementConfirmed: false, prescriptionOriginalContainerConfirmed: false }),
-  prescriptionRecords: z.array(SaleRecordSummarySchema).default([])
+  prescriptionRecords: z.array(SaleRecordSummarySchema).default([]),
+  h1RegisterEntries: z.array(SaleH1EntrySummarySchema).default([])
 });
 
 /**
@@ -1354,15 +1375,20 @@ export const RegulatorySchemeSchema = z.enum([
   "schedule_x",
   "schedule_c",
   "schedule_c1",
-  "ndps_purview"
+  "ndps_purview",
+  // Phase 1M-C: a State axis, not a central schedule — the product's position under Punjab
+  // notification No. 9/16/21-3H6/1039 (25-03-2021). Gates only where the store's premises are in
+  // Punjab, as an unsupported State workflow.
+  "punjab_restricted_supply"
 ]);
 
 export const RegulatoryAnswerSchema = z.enum(["applies", "does_not_apply", "unknown"]);
 
 /**
- * What a Sale of this product would do today: sell; sell only on a prescription (Schedule H, since
- * Phase 1M-B); refuse as unresolved; or refuse because the statutory record it needs does not exist
- * in this version yet (Schedule H1, X, C, C(1)).
+ * What a Sale of this product would do today: sell; sell only on a prescription (Schedule H since
+ * Phase 1M-B, Schedule H1 since Phase 1M-C); refuse as unresolved; or refuse because the workflow it
+ * needs does not exist in this version (Schedule X, C, C(1), an NDPS-intersection H1 line, or the
+ * Punjab State boundary). The scheme beside it says which.
  */
 export const RegulatoryGateSchema = z.enum(["clear", "prescription_required", "unresolved", "workflow_unavailable"]);
 
@@ -1382,7 +1408,11 @@ export const PrescriptionIssueCodeSchema = z.enum([
   "prescription_dated_after_supply",
   "prescription_date_invalid",
   // Rule 65(3)(1)(f): the entry must name the manufacturer.
-  "manufacturer_not_recorded"
+  "manufacturer_not_recorded",
+  // Phase 1M-C: an unresolved veterinary-H1 workflow — not a statement that the supply is prohibited.
+  "schedule_h1_veterinary_workflow_unresolved",
+  // Phase 1M-C: H1 applies on the posting day but not on the Sale's business date.
+  "schedule_h1_commenced_after_business_date"
 ]);
 
 export const SupplyIssueCodeSchema = z.enum([
@@ -1395,7 +1425,12 @@ export const SupplyIssueCodeSchema = z.enum([
   "prescription_record_not_prepared",
   "prescription_record_not_confirmed",
   // B-R2: the prepared entry no longer matches the Sale, the election or the pharmacist.
-  "prescription_record_stale"
+  "prescription_record_stale",
+  // Phase 1M-C: the separate Schedule H1 working entry — prepared, then confirmed (hard copy placed
+  // in the H1 register and authenticated by the registered pharmacist), and still exact.
+  "schedule_h1_register_not_prepared",
+  "schedule_h1_register_not_confirmed",
+  "schedule_h1_register_stale"
 ]);
 
 export const LinePrescriptionSummarySchema = z.object({
@@ -1513,8 +1548,13 @@ export const SaleErrorCodeSchema = z.enum([
   "regulatory_classification_unresolved",
   // Phase 1M-A: the line needs a register this version does not implement yet (Schedule C, C(1)).
   "regulated_sale_workflow_not_available",
-  // Phase 1M-B: a Schedule H1 line; its register (rule 65(3)(1)(h)) is a later phase.
-  "schedule_h1_register_not_available",
+  // Phase 1M-C: an H1 line whose NDPS purview applies or is unrecorded — an unsupported
+  // NDPS-intersection workflow, a boundary of this software rather than a requirement of rule 65.
+  "schedule_h1_ndps_workflow_not_available",
+  // Phase 1M-C: an additional Punjab drug-control workflow AUSHADHARTH does not implement.
+  "state_restricted_drug_workflow_not_available",
+  // Phase 1M-C: the Punjab position, or the store's premises State, is not recorded.
+  "state_regulatory_position_unresolved",
   // Phase 1M-B: a Schedule X line; its workflow and rule 65(21) record are a later phase.
   "schedule_x_workflow_not_available",
   // Phase 1M-B: a Schedule H supply without everything rule 65 asks; the issues name each one.
@@ -2860,3 +2900,66 @@ export type PrescriptionSupplyRecord = z.infer<typeof PrescriptionSupplyRecordSc
 export type PrescriptionRecordMethod = z.infer<typeof PrescriptionRecordMethodSchema>;
 export type PrescriptionRecordStatus = z.infer<typeof PrescriptionRecordStatusSchema>;
 export type SaleRecordSummary = z.infer<typeof SaleRecordSummarySchema>;
+export type SaleH1EntrySummary = z.infer<typeof SaleH1EntrySummarySchema>;
+export type H1EntryStatus = z.infer<typeof H1EntryStatusSchema>;
+
+/**
+ * Phase 1M-C. The Schedule H1 working record, for one Sale's hard copy or a period's register view.
+ * Rule 65(3)(1)(h)'s particulars are the prescriber's name and address, the patient's name, the
+ * drug and the quantity supplied; everything else here is AUSHADHARTH's internal record.
+ */
+export const H1EntrySchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  status: H1EntryStatusSchema,
+  saleDocumentId: z.string(),
+  documentNumber: z.string().nullable(),
+  lineNumber: z.number().int(),
+  dateOfSupply: z.string(),
+  prescriberName: z.string(),
+  prescriberAddress: z.string(),
+  patientName: z.string(),
+  drugName: z.string(),
+  quantityAtoms: z.number().int(),
+  quantityUnitLabel: z.string().nullable(),
+  supervisingProfessionalName: z.string(),
+  supervisingRegistrationNumber: z.string(),
+  supplyRecordSerial: z.string(),
+  preparedByDisplayName: z.string().nullable(),
+  preparedAtUtc: z.string(),
+  hardCopyPlacedInRegister: z.boolean(),
+  pharmacistAuthenticatedHardCopy: z.boolean(),
+  confirmedByDisplayName: z.string().nullable(),
+  confirmedAtUtc: z.string().nullable(),
+  finalizedAtUtc: z.string().nullable(),
+  voidedAtUtc: z.string().nullable(),
+  voidReason: z.string().nullable(),
+  returnedAtoms: z.number().int()
+});
+
+export const H1AnnotationSchema = z.object({
+  id: z.string(),
+  entryId: z.string(),
+  note: z.string(),
+  createdByDisplayName: z.string().nullable(),
+  createdAtUtc: z.string()
+});
+
+export const H1SheetSchema = z.object({
+  store: z.object({
+    legalName: z.string().nullable(),
+    displayName: z.string(),
+    addressLine1: z.string().nullable(),
+    addressLine2: z.string().nullable(),
+    city: z.string().nullable(),
+    stateName: z.string().nullable(),
+    postalCode: z.string().nullable(),
+    licences: z.array(z.string())
+  }),
+  entries: z.array(H1EntrySchema),
+  annotations: z.array(H1AnnotationSchema)
+});
+
+export type H1Entry = z.infer<typeof H1EntrySchema>;
+export type H1Annotation = z.infer<typeof H1AnnotationSchema>;
+export type H1Sheet = z.infer<typeof H1SheetSchema>;

@@ -1478,6 +1478,43 @@ async fn void_record(
         .execute(&mut *connection)
         .await
         .map_err(map_database_error)?;
+        // Phase 1M-C: the Schedule H1 working entries prepared beside this entry are for the same
+        // supply, which will not now happen as prepared. They are voided with it, kept, and their
+        // AUSHADHARTH References are never reused.
+        let h1: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id,reference FROM prescription_h1_register_entries \
+             WHERE supply_record_id=? AND status IN ('prepared','confirmed')",
+        )
+        .bind(&id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        for (entry_id, reference) in &h1 {
+            sqlx::query(
+                "UPDATE prescription_h1_register_entries SET status='void',voided_by_user_id=?,\
+                 voided_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),void_reason=? \
+                 WHERE id=? AND status IN ('prepared','confirmed')",
+            )
+            .bind(&actor.id)
+            .bind(&reason)
+            .bind(entry_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_database_error)?;
+            record_event(
+                &mut connection,
+                Change {
+                    entity_type: "prescription_h1_register_entry",
+                    entity_id: entry_id,
+                    revision: 3,
+                    action: "archived",
+                    reason: Some(&reason),
+                },
+                serde_json::json!({ "entryId": entry_id, "reference": reference, "status": "void" }),
+                &actor.id,
+            )
+            .await?;
+        }
         // The draft's revision moves, so a screen that read it before the void must reload.
         sqlx::query(
             "UPDATE sale_documents SET revision=revision+1,\
@@ -1525,6 +1562,446 @@ async fn get_prescription(
     Ok(Json(fetch_prescription(&state, &id).await?))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-C — the Schedule H1 working record
+//
+// Rule 65(3)(1)(h) requires a separate register, kept by the pharmacy. AUSHADHARTH keeps a working
+// record of each entry and prints its hard copy; it is not the statutory register and never says
+// so. Following the 48th DCC's recommendation (an official CDSCO-hosted committee recommendation,
+// not proven to amend rule 65), a working entry is confirmed only when a dispensing user records
+// that the hard copy was placed in that register and the registered pharmacist authenticated it by
+// hand. Every read and write here is for the dispensing roles: the entries name the patient.
+// ---------------------------------------------------------------------------------------------
+
+/// The store's legal identity and licences, printed on the hard copy and the register view.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct H1StoreContext {
+    legal_name: Option<String>,
+    display_name: String,
+    address_line1: Option<String>,
+    address_line2: Option<String>,
+    city: Option<String>,
+    state_name: Option<String>,
+    postal_code: Option<String>,
+    licences: Vec<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct H1EntryRow {
+    id: String,
+    /// The AUSHADHARTH Reference: internal, immutable. Not a register serial or page number.
+    reference: String,
+    status: String,
+    sale_document_id: String,
+    document_number: Option<String>,
+    line_number: i64,
+    date_of_supply: String,
+    // Rule 65(3)(1)(h) particulars.
+    prescriber_name: String,
+    prescriber_address: String,
+    patient_name: String,
+    drug_name: String,
+    quantity_atoms: i64,
+    quantity_unit_label: Option<String>,
+    // Internal cross-references and state.
+    supervising_professional_name: String,
+    supervising_registration_number: String,
+    supply_record_serial: String,
+    prepared_by_display_name: Option<String>,
+    prepared_at_utc: String,
+    hard_copy_placed_in_register: bool,
+    pharmacist_authenticated_hard_copy: bool,
+    confirmed_by_display_name: Option<String>,
+    confirmed_at_utc: Option<String>,
+    finalized_at_utc: Option<String>,
+    voided_at_utc: Option<String>,
+    void_reason: Option<String>,
+    /// Returned since, recorded separately against the dispensing. The entry itself never changes.
+    returned_atoms: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct H1AnnotationRow {
+    id: String,
+    entry_id: String,
+    note: String,
+    created_by_display_name: Option<String>,
+    created_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct H1Sheet {
+    store: H1StoreContext,
+    entries: Vec<H1EntryRow>,
+    annotations: Vec<H1AnnotationRow>,
+}
+
+const H1_ENTRY_SELECT: &str = "SELECT entry.id,entry.reference,entry.status,\
+     entry.sale_document_id,document.document_number,line.line_number,entry.date_of_supply,\
+     entry.prescriber_name,entry.prescriber_address,entry.patient_name,entry.drug_name,\
+     entry.quantity_atoms,entry.quantity_unit_label,entry.supervising_professional_name,\
+     entry.supervising_registration_number,record.serial_number AS supply_record_serial,\
+     preparer.display_name AS prepared_by_display_name,entry.prepared_at_utc,\
+     entry.hard_copy_placed_in_register=1 AS hard_copy_placed_in_register,\
+     entry.pharmacist_authenticated_hard_copy=1 AS pharmacist_authenticated_hard_copy,\
+     confirmer.display_name AS confirmed_by_display_name,entry.confirmed_at_utc,\
+     entry.finalized_at_utc,entry.voided_at_utc,entry.void_reason,\
+     (SELECT COALESCE(SUM(reversal.quantity_atoms),0) FROM prescription_dispensing_reversals reversal \
+      WHERE reversal.dispensing_id=entry.dispensing_id) AS returned_atoms \
+     FROM prescription_h1_register_entries entry \
+     JOIN sale_documents document ON document.id=entry.sale_document_id \
+     JOIN sale_lines line ON line.id=entry.sale_line_id \
+     JOIN prescription_supply_records record ON record.id=entry.supply_record_id \
+     LEFT JOIN users preparer ON preparer.id=entry.prepared_by_user_id \
+     LEFT JOIN users confirmer ON confirmer.id=entry.confirmed_by_user_id";
+
+async fn h1_store_context(
+    state: &ReferenceState,
+    store_id: &str,
+) -> Result<H1StoreContext, PrescriptionError> {
+    let identity: (Option<String>, String) =
+        sqlx::query_as("SELECT legal_name,display_name FROM store_identity WHERE store_id=?")
+            .bind(store_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(map_database_error)?;
+    #[allow(clippy::type_complexity)]
+    let address: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT address.line1,address.line2,address.city,code.display_name,address.postal_code \
+         FROM store_addresses address LEFT JOIN state_codes code ON code.id=address.state_id \
+         WHERE address.store_id=?",
+    )
+    .bind(store_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    let licences: Vec<String> = sqlx::query_scalar(
+        "SELECT licence_type||' '||licence_number FROM store_licences \
+         WHERE store_id=? AND status='active' ORDER BY licence_type,licence_number",
+    )
+    .bind(store_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    let (line1, line2, city, state_name, postal_code) = match address {
+        Some((line1, line2, city, state_name, postal_code)) => {
+            (Some(line1), line2, city, state_name, postal_code)
+        }
+        None => (None, None, None, None, None),
+    };
+    Ok(H1StoreContext {
+        legal_name: identity.0,
+        display_name: identity.1,
+        address_line1: line1,
+        address_line2: line2,
+        city,
+        state_name,
+        postal_code,
+        licences,
+    })
+}
+
+async fn fetch_h1_annotations(
+    state: &ReferenceState,
+    entries: &[H1EntryRow],
+) -> Result<Vec<H1AnnotationRow>, PrescriptionError> {
+    let mut annotations = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.status == "finalized") {
+        let mut rows: Vec<H1AnnotationRow> = sqlx::query_as(
+            "SELECT annotation.id,annotation.entry_id,annotation.note,\
+             author.display_name AS created_by_display_name,annotation.created_at_utc \
+             FROM prescription_h1_register_annotations annotation \
+             LEFT JOIN users author ON author.id=annotation.created_by_user_id \
+             WHERE annotation.entry_id=? ORDER BY annotation.created_at_utc,annotation.id",
+        )
+        .bind(&entry.id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(map_database_error)?;
+        annotations.append(&mut rows);
+    }
+    Ok(annotations)
+}
+
+async fn fetch_sale_h1_sheet(
+    state: &ReferenceState,
+    store_id: &str,
+    sale_id: &str,
+) -> Result<H1Sheet, PrescriptionError> {
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT store_id FROM sale_documents WHERE id=?")
+            .bind(sale_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(map_database_error)?;
+    if owner.as_deref() != Some(store_id) {
+        return Err(PrescriptionError::NotFound);
+    }
+    let entries: Vec<H1EntryRow> = sqlx::query_as(&format!(
+        "{H1_ENTRY_SELECT} WHERE entry.sale_document_id=? AND entry.store_id=? \
+         ORDER BY entry.reference_value"
+    ))
+    .bind(sale_id)
+    .bind(store_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    let annotations = fetch_h1_annotations(state, &entries).await?;
+    Ok(H1Sheet {
+        store: h1_store_context(state, store_id).await?,
+        entries,
+        annotations,
+    })
+}
+
+/// The per-supply hard copy: every Schedule H1 working entry of one Sale, with the store's legal
+/// identity, for printing and placing in the separate physical H1 register. Dispensing roles only.
+async fn get_sale_h1_sheet(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<H1Sheet>, PrescriptionError> {
+    require_dispenser_reader(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    let store_id = current_store(&state).await?;
+    Ok(Json(fetch_sale_h1_sheet(&state, &store_id, &id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmH1Request {
+    hard_copy_placed_in_register: bool,
+    pharmacist_authenticated_hard_copy: bool,
+}
+
+/// Confirms, for every prepared Schedule H1 working entry of one Sale at once, the two physical
+/// acts of the DCC arrangement: the printed hard copy was placed in the separate H1 register, and
+/// the registered pharmacist authenticated it by hand. AUSHADHARTH performs neither and never says
+/// it did; it records who confirmed them and when. A pharmacist or the owner only — a cashier may
+/// not attest a professional act. All entries move together, or none does.
+async fn confirm_sale_h1_entries(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmH1Request>,
+) -> Result<Json<H1Sheet>, PrescriptionError> {
+    let actor = require_dispenser(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    if !request.hard_copy_placed_in_register {
+        return Err(validation(
+            "hardCopyPlacedInRegister",
+            "the printed hard copy must be placed in the separate Schedule H1 register before it is confirmed",
+        ));
+    }
+    if !request.pharmacist_authenticated_hard_copy {
+        return Err(validation(
+            "pharmacistAuthenticatedHardCopy",
+            "the registered pharmacist must authenticate the hard copy by hand before it is confirmed",
+        ));
+    }
+    let store_id = current_store(&state).await?;
+    let mut connection = begin_immediate(&state).await?;
+    let outcome = async {
+        let sale: Option<(String, String)> =
+            sqlx::query_as("SELECT store_id,status FROM sale_documents WHERE id=?")
+                .bind(&id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(map_database_error)?;
+        let (sale_store, sale_status) = sale.ok_or(PrescriptionError::NotFound)?;
+        if sale_store != store_id {
+            return Err(PrescriptionError::NotFound);
+        }
+        if sale_status != "draft" {
+            return Err(PrescriptionError::RecordState);
+        }
+        let prepared: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id,reference FROM prescription_h1_register_entries \
+             WHERE sale_document_id=? AND store_id=? AND status='prepared' ORDER BY reference_value",
+        )
+        .bind(&id)
+        .bind(&store_id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        if prepared.is_empty() {
+            return Err(PrescriptionError::RecordState);
+        }
+        for (entry_id, reference) in &prepared {
+            let updated = sqlx::query(
+                "UPDATE prescription_h1_register_entries SET status='confirmed',\
+                 hard_copy_placed_in_register=1,pharmacist_authenticated_hard_copy=1,\
+                 confirmed_by_user_id=?,confirmed_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 WHERE id=? AND status='prepared'",
+            )
+            .bind(&actor.id)
+            .bind(entry_id)
+            .execute(&mut *connection)
+            .await;
+            match updated {
+                Ok(done) if done.rows_affected() == 1 => {}
+                // The database refuses a confirmation whose pharmacist is no longer a registered
+                // pharmacist on record, or whose confirmer is not a dispensing user.
+                Ok(_) | Err(_) => return Err(PrescriptionError::RecordState),
+            }
+            record_event(
+                &mut connection,
+                Change {
+                    entity_type: "prescription_h1_register_entry",
+                    entity_id: entry_id,
+                    revision: 2,
+                    action: "updated",
+                    reason: Some("hard copy placed in the H1 register and authenticated by the registered pharmacist"),
+                },
+                serde_json::json!({ "entryId": entry_id, "reference": reference, "status": "confirmed" }),
+                &actor.id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    finish(connection, outcome).await?;
+    Ok(Json(fetch_sale_h1_sheet(&state, &store_id, &id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct H1RegisterQuery {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// The H1 working record for a period, chronologically, for inspection. Dispensing roles only.
+/// Searched by date; there is no patient-name search.
+async fn list_h1_register(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Query(query): Query<H1RegisterQuery>,
+) -> Result<Json<H1Sheet>, PrescriptionError> {
+    require_dispenser_reader(&state, &headers).await?;
+    let store_id = current_store(&state).await?;
+    let today: String =
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes')")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(map_database_error)?;
+    let from = match query.from.as_deref() {
+        Some(value) => validate_date(value, "from")?,
+        None => today.clone(),
+    };
+    let to = match query.to.as_deref() {
+        Some(value) => validate_date(value, "to")?,
+        None => today,
+    };
+    if to < from {
+        return Err(validation("to", "must not be before from"));
+    }
+    let entries: Vec<H1EntryRow> = sqlx::query_as(&format!(
+        "{H1_ENTRY_SELECT} WHERE entry.store_id=? AND entry.date_of_supply BETWEEN ? AND ? \
+         ORDER BY entry.date_of_supply,entry.reference_value"
+    ))
+    .bind(&store_id)
+    .bind(&from)
+    .bind(&to)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    let annotations = fetch_h1_annotations(&state, &entries).await?;
+    Ok(Json(H1Sheet {
+        store: h1_store_context(&state, &store_id).await?,
+        entries,
+        annotations,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotateH1Request {
+    note: String,
+}
+
+/// Appends a note to a finalized entry — a correction noticed later, a remark for the inspector.
+/// The entry itself never changes. Rule 65 prescribes no correction format, and none is claimed.
+async fn annotate_h1_entry(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AnnotateH1Request>,
+) -> Result<(StatusCode, Json<H1AnnotationRow>), PrescriptionError> {
+    let actor = require_dispenser(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    let note = required_text(&request.note, "note", 1000).map_err(issue)?;
+    if note.chars().count() < 3 {
+        return Err(validation("note", "must say what is being noted"));
+    }
+    let store_id = current_store(&state).await?;
+    let annotation_id = Uuid::now_v7().to_string();
+    let mut connection = begin_immediate(&state).await?;
+    let outcome = async {
+        let entry: Option<(String, String)> = sqlx::query_as(
+            "SELECT status,reference FROM prescription_h1_register_entries WHERE id=? AND store_id=?",
+        )
+        .bind(&id)
+        .bind(&store_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        let (status, reference) = entry.ok_or(PrescriptionError::NotFound)?;
+        if status != "finalized" {
+            return Err(PrescriptionError::RecordState);
+        }
+        sqlx::query(
+            "INSERT INTO prescription_h1_register_annotations (id,entry_id,note,created_by_user_id,\
+             created_at_utc) VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&annotation_id)
+        .bind(&id)
+        .bind(&note)
+        .bind(&actor.id)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        // The note itself may name people, so the audit carries identifiers only.
+        record_event(
+            &mut connection,
+            Change {
+                entity_type: "prescription_h1_register_annotation",
+                entity_id: &annotation_id,
+                revision: 1,
+                action: "created",
+                reason: None,
+            },
+            serde_json::json!({ "annotationId": annotation_id, "entryId": id, "reference": reference }),
+            &actor.id,
+        )
+        .await
+    }
+    .await;
+    finish(connection, outcome).await?;
+    let row: H1AnnotationRow = sqlx::query_as(
+        "SELECT annotation.id,annotation.entry_id,annotation.note,\
+         author.display_name AS created_by_display_name,annotation.created_at_utc \
+         FROM prescription_h1_register_annotations annotation \
+         LEFT JOIN users author ON author.id=annotation.created_by_user_id WHERE annotation.id=?",
+    )
+    .bind(&annotation_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
 pub fn routes() -> Router<ReferenceState> {
     Router::new()
         .route(
@@ -1553,5 +2030,15 @@ pub fn routes() -> Router<ReferenceState> {
         .route(
             "/api/v1/prescription-supply-records/{id}/void",
             post(void_record),
+        )
+        .route("/api/v1/sales/{id}/h1-register", get(get_sale_h1_sheet))
+        .route(
+            "/api/v1/sales/{id}/h1-register/confirm",
+            post(confirm_sale_h1_entries),
+        )
+        .route("/api/v1/h1-register", get(list_h1_register))
+        .route(
+            "/api/v1/h1-register/{id}/annotations",
+            post(annotate_h1_entry),
         )
 }

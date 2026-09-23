@@ -90,8 +90,17 @@ export function RegulatoryClassificationSection({ product, canMutate }: { produc
 }
 
 function gateExplanation(gate: string, scheme: RegulatoryScheme | null, kind: string): string {
+  if (gate === "workflow_unavailable" && scheme === "punjab_restricted_supply") {
+    return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
+  }
+  if (gate === "workflow_unavailable" && scheme === "ndps_purview") {
+    return "Schedule H1 with an NDPS purview that applies or is not recorded — an unsupported NDPS-intersection workflow in this version.";
+  }
   if (gate === "workflow_unavailable" && scheme) {
     return `${SCHEME_LABELS[scheme]} applies. Its prescription or register requirements are not available in this version, so the counter cannot sell it yet.`;
+  }
+  if (gate === "unresolved" && scheme === "punjab_restricted_supply") {
+    return "This store's premises are in Punjab: a medicine cannot be sold until its Punjab restricted-supply position is recorded (or the premises State, if that is what is missing).";
   }
   if (gate === "unresolved") {
     return "A medicine cannot be sold until its position under Schedules H, H1, X, C and C(1) is recorded.";

@@ -469,6 +469,9 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .record-page { display: grid; gap: 16px; }
 .record-leaf { display: grid; gap: 12px; }
 .record-leaf h2 { margin: 0; font-size: .86rem; }
+.record-leaf__store { display: grid; gap: 2px; font-size: .76rem; overflow-wrap: anywhere; }
+.h1-register-filter { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: end; }
+.h1-register-filter .field { margin: 0; min-width: min(180px, 100%); }
 .record-leaf__particulars { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px 16px; margin: 0; }
 .record-leaf__particulars dt { color: var(--ink-500); font-size: .66rem; font-weight: 800; letter-spacing: .03em; }
 .record-leaf__particulars dd { margin: 2px 0 0; font-size: .76rem; overflow-wrap: anywhere; }

@@ -27,7 +27,7 @@ use crate::api::auth::{self, AuthError, AuthenticatedActor};
 use crate::api::reference_masters::ReferenceState;
 use crate::domain::{
     catalog::{CatalogValidationIssue, optional_text, required_text, validate_uuid_v7},
-    regulatory::SCHEMES,
+    regulatory::{CLASSIFIABLE_SCHEMES, SCHEMES},
 };
 
 const CAPACITIES: [&str; 2] = ["registered_pharmacist", "competent_person"];
@@ -386,7 +386,36 @@ async fn get_product_regulatory(
     let resolved = crate::domain::regulatory::resolve_for_product(&mut connection, &id, &as_of)
         .await
         .map_err(map_database_error)?;
-    let gate = crate::domain::regulatory::gate(&product_kind, &resolved);
+    // Phase 1M-C: the State axis is answered for this store's own premises, as the counter will be.
+    let store_id: Option<String> =
+        sqlx::query_scalar("SELECT store_id FROM store_identity LIMIT 1")
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(map_database_error)?;
+    let premises = match store_id.as_deref() {
+        Some(store) => crate::domain::regulatory::resolve_premises_state(&mut connection, store)
+            .await
+            .map_err(map_database_error)?,
+        None => None,
+    };
+    let state_answer = crate::domain::regulatory::resolve_state_for_product(
+        &mut connection,
+        &id,
+        &as_of,
+        premises.as_deref(),
+    )
+    .await
+    .map_err(map_database_error)?;
+    // The recorded finding itself, whatever the store's State: the owner sees what was recorded.
+    let punjab_finding = crate::domain::regulatory::resolve_state_for_product(
+        &mut connection,
+        &id,
+        &as_of,
+        Some(crate::domain::regulatory::PUNJAB_STATE_CODE),
+    )
+    .await
+    .map_err(map_database_error)?;
+    let gate = crate::domain::regulatory::combined_gate(&product_kind, &resolved, &state_answer);
 
     let attributes: Option<(Option<i64>, i64)> = sqlx::query_as(
         "SELECT alcohol_percent_vv_hundredths,revision FROM product_regulatory_attributes \
@@ -402,11 +431,34 @@ async fn get_product_regulatory(
         crate::domain::regulatory::SaleGate::Unresolved => ("unresolved".to_owned(), None),
         crate::domain::regulatory::SaleGate::PrescriptionRequired => (
             "prescription_required".to_owned(),
-            Some("schedule_h".to_owned()),
+            Some(
+                if resolved.answer("schedule_h1") == crate::domain::regulatory::Resolution::Applies
+                {
+                    "schedule_h1"
+                } else {
+                    "schedule_h"
+                }
+                .to_owned(),
+            ),
         ),
         crate::domain::regulatory::SaleGate::WorkflowUnavailable { scheme } => {
             ("workflow_unavailable".to_owned(), Some(scheme.to_owned()))
         }
+        // An unsupported NDPS intersection names the axis the software does not support with H1.
+        crate::domain::regulatory::SaleGate::UnsupportedIntersection { .. } => (
+            "workflow_unavailable".to_owned(),
+            Some("ndps_purview".to_owned()),
+        ),
+        crate::domain::regulatory::SaleGate::StateWorkflowUnavailable { scheme } => {
+            ("workflow_unavailable".to_owned(), Some(scheme.to_owned()))
+        }
+        crate::domain::regulatory::SaleGate::StateUnresolved { scheme } => {
+            ("unresolved".to_owned(), Some(scheme.to_owned()))
+        }
+    };
+    let punjab_answer = match punjab_finding.punjab {
+        crate::domain::regulatory::StateAxisAnswer::Resolved(answer) => answer.as_str(),
+        _ => "unknown",
     };
 
     Ok(Json(ProductRegulatoryResponse {
@@ -419,6 +471,10 @@ async fn get_product_regulatory(
                 scheme: (*scheme).to_owned(),
                 answer: resolved.answer(scheme).as_str().to_owned(),
             })
+            .chain(std::iter::once(SchemeAnswer {
+                scheme: "punjab_restricted_supply".to_owned(),
+                answer: punjab_answer.to_owned(),
+            }))
             .collect(),
         resolved_on: as_of,
         sale_gate,
@@ -444,10 +500,10 @@ async fn create_classification(
     validate_uuid_v7(&id, "id").map_err(issue)?;
 
     let scheme = request.scheme.trim().to_ascii_lowercase();
-    if !SCHEMES.contains(&scheme.as_str()) {
+    if !CLASSIFIABLE_SCHEMES.contains(&scheme.as_str()) {
         return Err(validation(
             "scheme",
-            "must be one of schedule_h, schedule_h1, schedule_x, schedule_c, schedule_c1, ndps_purview",
+            "must be one of schedule_h, schedule_h1, schedule_x, schedule_c, schedule_c1, ndps_purview, punjab_restricted_supply",
         ));
     }
     // A finding without an authority behind it is an opinion, and an opinion must not gate a sale.

@@ -1,4 +1,9 @@
 import {
+  H1AnnotationSchema,
+  H1SheetSchema,
+  type H1Annotation,
+  type H1EntryStatus,
+  type H1Sheet,
   PrescriberSchema,
   PrescriptionDetailSchema,
   PrescriptionSummarySchema,
@@ -166,7 +171,9 @@ export const PRESCRIPTION_ISSUE_TEXT: Record<PrescriptionIssueCode, string> = {
   prescription_repeat_too_soon: "The prescriber's stated interval has not yet passed.",
   prescription_dated_after_supply: "The prescription is dated after this sale.",
   prescription_date_invalid: "A date on the prescription could not be read.",
-  manufacturer_not_recorded: "No manufacturer is recorded for this product, so its register entry cannot name one. An owner can add it on the product."
+  manufacturer_not_recorded: "No manufacturer is recorded for this product, so its register entry cannot name one. An owner can add it on the product.",
+  schedule_h1_veterinary_workflow_unresolved: "A Schedule H1 supply for an animal is not supported yet: an unresolved veterinary-H1 workflow. Rule 65(3)(1)(h) records the name of the patient, and how it applies to veterinary supply is unresolved.",
+  schedule_h1_commenced_after_business_date: "Schedule H1 applies to this product on the day it is being posted but not on this sale's date. Date the sale today to record its H1 working entry."
 };
 
 export const SUPPLY_ISSUE_TEXT: Record<SupplyIssueCode, string> = {
@@ -177,5 +184,48 @@ export const SUPPLY_ISSUE_TEXT: Record<SupplyIssueCode, string> = {
   prescription_memo_path_ineligible: "This pharmacy elected the cash or credit memo book, which may be used only for a drug supplied from or in its original container. Confirm that below.",
   prescription_record_not_prepared: "Everything else is in order. Prepare the statutory record: the entry gets its serial, and nothing is sold yet.",
   prescription_record_not_confirmed: "The entry is prepared. The registered pharmacist signs the printed entry by hand and its serial is written on the prescription; then a pharmacist confirms both on the entry.",
-  prescription_record_stale: "The prepared entry no longer matches this sale, the election or the pharmacist. Void it and prepare a new one."
+  prescription_record_stale: "The prepared entry no longer matches this sale, the election or the pharmacist. Void it and prepare a new one.",
+  schedule_h1_register_not_prepared: "The separate Schedule H1 working entry is prepared together with the statutory record.",
+  schedule_h1_register_not_confirmed: "The Schedule H1 hard copy must be placed in the separate H1 register and authenticated by the registered pharmacist, then confirmed.",
+  schedule_h1_register_stale: "The Schedule H1 working entry no longer matches this sale. Void the prescription-supply entry and prepare both again."
+};
+
+// --- Phase 1M-C: the Schedule H1 working record -----------------------------------------------
+
+/** One Sale's Schedule H1 working entries, with the store's legal identity. Dispensing roles only. */
+export async function getSaleH1Sheet(saleId: string): Promise<H1Sheet> {
+  return H1SheetSchema.parse(await localServiceRequest(`/api/v1/sales/${saleId}/h1-register`));
+}
+
+/**
+ * Records that the printed hard copy was placed in the separate physical H1 register and that the
+ * registered pharmacist authenticated it by hand. AUSHADHARTH performs neither act; the Store
+ * Service refuses the confirmation without both, and refuses a cashier.
+ */
+export async function confirmSaleH1Entries(saleId: string): Promise<H1Sheet> {
+  return H1SheetSchema.parse(await localServiceRequest(`/api/v1/sales/${saleId}/h1-register/confirm`, {
+    method: "POST",
+    body: JSON.stringify({ hardCopyPlacedInRegister: true, pharmacistAuthenticatedHardCopy: true })
+  }));
+}
+
+/** The H1 working record for a period, chronologically. Searched by date only. */
+export async function listH1Register(from: string, to: string): Promise<H1Sheet> {
+  return H1SheetSchema.parse(await localServiceRequest(`/api/v1/h1-register?${new URLSearchParams({ from, to })}`));
+}
+
+/** Appends a note to a finalized entry. The entry itself never changes. */
+export async function annotateH1Entry(entryId: string, note: string): Promise<H1Annotation> {
+  return H1AnnotationSchema.parse(await localServiceRequest(`/api/v1/h1-register/${entryId}/annotations`, {
+    method: "POST",
+    body: JSON.stringify({ note })
+  }));
+}
+
+/** The counter's words for an H1 working entry's state. None of them says the software signed. */
+export const H1_STATUS_LABELS: Record<H1EntryStatus, string> = {
+  prepared: "Prepared — hard copy to be placed in the H1 register and authenticated",
+  confirmed: "Placed and authenticated — confirmed",
+  finalized: "Finalized with the posted sale",
+  void: "Void — cancelled before the supply; reference not reused"
 };

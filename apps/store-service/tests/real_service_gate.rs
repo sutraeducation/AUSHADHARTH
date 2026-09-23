@@ -5655,13 +5655,15 @@ async fn real_service_leaves_an_ordinary_sale_untouched_over_http() {
     );
 }
 
-/// 1M-B gate 8-9: Schedule H1 and Schedule X stay refused however complete the prescription.
+/// 1M-B gate 8-9, revised in 1M-C: Schedule X stays refused however complete the prescription, and
+/// so does a Schedule H1 line whose NDPS purview is unrecorded (as here): an unsupported
+/// NDPS-intersection workflow. The supported H1 path is proved by the Phase 1M-C tests below.
 #[tokio::test]
 async fn real_service_keeps_schedule_h1_and_x_refused_with_a_complete_prescription_over_http() {
     for (inside, code) in [
         (
             &["schedule_h", "schedule_h1"][..],
-            "schedule_h1_register_not_available",
+            "schedule_h1_ndps_workflow_not_available",
         ),
         (&["schedule_x"][..], "schedule_x_workflow_not_available"),
     ] {
@@ -5925,4 +5927,328 @@ async fn real_service_voids_a_cancelled_entry_and_never_reuses_its_serial_over_h
             ("PR-000002".to_owned(), "prepared".to_owned()),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-C — the Schedule H1 working record, over the real socket
+// ---------------------------------------------------------------------------------------------
+
+/// Posts for the quoted total with another session: a cashier, here.
+async fn post_quoted_over_http_as(
+    service: &Service,
+    cookie: &str,
+    world: &SaleWorld,
+    sale_id: &str,
+    revision: i64,
+    key: &str,
+) -> Reply {
+    let total = quote_over_http(service, world, sale_id).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": key,
+            "tenders": [{ "method": "cash", "amountPaise": total }]
+        })),
+        Some(cookie),
+    )
+    .await
+}
+
+const PUNJAB: &str = "01997300-0000-7000-8000-000000000003";
+
+/// One owner-recorded finding for the world's product, through the owner's API.
+async fn finding_over_http(service: &Service, world: &SaleWorld, scheme: &str, applies: bool) {
+    let finding = call(
+        service,
+        "POST",
+        &format!(
+            "/api/v1/products/{}/regulatory/classifications",
+            world.product
+        ),
+        Some(json!({
+            "scheme": scheme,
+            "applies": applies,
+            "effectiveFrom": "2020-01-01",
+            "sourceCitation": "Owner-recorded finding with its authority",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(finding.status, 201, "{scheme}: {:?}", finding.body);
+}
+
+/// The world's product in Schedule H1 alone, NDPS purview established not to apply, with its
+/// rule 65(3) basis and a registered pharmacist. Returns (professional, prescription item).
+async fn h1_world_over_http(service: &Service, world: &SaleWorld) -> (String, String) {
+    schedule_over_http(service, world, &["schedule_h1"]).await;
+    finding_over_http(service, world, "ndps_purview", false).await;
+    record_basis_over_http(service, world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(service, world).await;
+    let (_, item) = prescription_over_http(service, world, None, 20).await;
+    (professional, item)
+}
+
+async fn confirm_h1_over_http(service: &Service, cookie: &str, sale: &str) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale}/h1-register/confirm"),
+        Some(json!({ "hardCopyPlacedInRegister": true, "pharmacistAuthenticatedHardCopy": true })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// Prepares both layers and confirms both, as a pharmacist does; returns the Sale's revision.
+async fn h1_ready_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    sale: &str,
+    revision: i64,
+) -> i64 {
+    let (_, revision) = signed_entry_over_http(service, world, sale, revision).await;
+    let confirmed = confirm_h1_over_http(service, &world.cookie, sale).await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    revision
+}
+
+/// Phase 1M-C, C-68 over HTTP: the supported ordinary H1 supply, end to end through the real
+/// router, auth and database. Both layers are prepared; the electronic entry alone does not post;
+/// a cashier can neither confirm nor read the register; the pharmacist's confirmation lets the
+/// cashier post; both layers finalize.
+#[tokio::test]
+async fn real_service_supplies_schedule_h1_with_its_separate_register_entry_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let (professional, item) = h1_world_over_http(&service, &world).await;
+    let (sale_id, revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+
+    let quote = quote_over_http(&service, &world, &sale_id).await;
+    assert_eq!(quote["lines"][0]["regulatoryGate"], "prescription_required");
+    assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_h1");
+    let prepared = prepare_entry_over_http(&service, &world, &sale_id, revision).await;
+    assert_eq!(prepared.status, 200, "{:?}", prepared.body);
+    assert_eq!(prepared.body["status"], "draft");
+    assert_eq!(
+        prepared.body["h1RegisterEntries"][0]["reference"],
+        "AH1-000001"
+    );
+    let revision = prepared.body["revision"].as_i64().expect("revision");
+    let record = prepared.body["prescriptionRecords"][0]["id"]
+        .as_str()
+        .expect("record")
+        .to_owned();
+    let confirmed = confirm_entry_over_http(&service, &world.cookie, &record).await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // The electronic working entry alone does not complete the H1 layer.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000003a1",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["issues"][0]["field"],
+        "supply.schedule_h1_register_not_confirmed"
+    );
+
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "h1-cashier",
+        "01997a00-0000-7000-8000-0000000003c1",
+    )
+    .await;
+    let denied = confirm_h1_over_http(&service, &cashier, &sale_id).await;
+    assert_eq!(denied.status, 403, "{:?}", denied.body);
+    for path in [
+        format!("/api/v1/sales/{sale_id}/h1-register"),
+        "/api/v1/h1-register?from=2026-09-01&to=2026-09-30".to_owned(),
+    ] {
+        let denied = call(&service, "GET", &path, None, Some(&cashier)).await;
+        assert_eq!(denied.status, 403, "{path}: {:?}", denied.body);
+        assert!(!denied.body.to_string().contains("Sita Kulkarni"));
+    }
+
+    let sheet = confirm_h1_over_http(&service, &world.cookie, &sale_id).await;
+    assert_eq!(sheet.status, 200, "{:?}", sheet.body);
+    assert_eq!(sheet.body["entries"][0]["patientName"], "Sita Kulkarni");
+    assert_eq!(sheet.body["entries"][0]["status"], "confirmed");
+
+    let posted = post_quoted_over_http_as(
+        &service,
+        &cashier,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000003a2",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["prescriptionRecords"][0]["status"], "finalized");
+    assert_eq!(posted.body["h1RegisterEntries"][0]["status"], "finalized");
+    assert!(!posted.body.to_string().contains("Sita Kulkarni"));
+}
+
+/// Phase 1M-C, C-69/C-70 over HTTP: at a store whose premises are in Punjab, an owner-recorded
+/// Punjab finding refuses the sale as an unsupported State workflow, in neutral words.
+#[tokio::test]
+async fn real_service_refuses_a_punjab_restricted_line_as_an_unsupported_workflow_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let (professional, item) = h1_world_over_http(&service, &world).await;
+    let moved = call(
+        &service,
+        "PUT",
+        "/api/v1/store/address",
+        Some(json!({
+            "expectedRevision": 1, "line1": "12 Mall Road", "city": "Ludhiana",
+            "stateId": PUNJAB, "postalCode": "141001"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(moved.status, 200, "{:?}", moved.body);
+    finding_over_http(&service, &world, "punjab_restricted_supply", true).await;
+    let (sale_id, revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let refused = prepare_entry_over_http(&service, &world, &sale_id, revision).await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["code"],
+        "state_restricted_drug_workflow_not_available"
+    );
+    assert_eq!(
+        refused.body["message"],
+        "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support."
+    );
+    let text = refused.body.to_string().to_lowercase();
+    for word in ["banned", "prohibit", "illegal"] {
+        assert!(!text.contains(word), "{word}");
+    }
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000003b1",
+    )
+    .await;
+    assert_eq!(posted.status, 409, "{:?}", posted.body);
+    assert_eq!(
+        posted.body["code"],
+        "state_restricted_drug_workflow_not_available"
+    );
+}
+
+/// Phase 1M-C, C-55: a finalized H1 working entry survives a backup and restore, byte for byte,
+/// with its guards still in force on the restored database.
+#[tokio::test]
+async fn real_service_keeps_h1_entries_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_sale_world(service, 1).await;
+    let (professional, item) = h1_world_over_http(service, &world).await;
+    let (sale_id, revision) =
+        prepared_sale_over_http(service, &world, &item, &professional, 1).await;
+    let revision = h1_ready_over_http(service, &world, &sale_id, revision).await;
+    let posted = post_quoted_over_http(
+        service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000003d1",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    let before = call(
+        service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/h1-register"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(before.status, 200, "{:?}", before.body);
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+    let bytes = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &bytes,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+    let restored: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT reference,status,patient_name,drug_name FROM prescription_h1_register_entries",
+    )
+    .fetch_all(&reopened)
+    .await
+    .expect("entries");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].0, before.body["entries"][0]["reference"]);
+    assert_eq!(restored[0].1, "finalized");
+    assert_eq!(restored[0].2, before.body["entries"][0]["patientName"]);
+    // The guards came back with the data.
+    for statement in [
+        "UPDATE prescription_h1_register_entries SET patient_name='Someone Else'",
+        "DELETE FROM prescription_h1_register_entries",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&reopened).await.is_err(),
+            "{statement}"
+        );
+    }
+    reopened.close().await;
 }

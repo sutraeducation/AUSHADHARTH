@@ -111,6 +111,7 @@ function sale(overrides: Partial<SaleDetail> = {}): SaleDetail {
     lines: [], tenders: [],
     supply: { supervisingProfessionalId: null, prescriptionEndorsementConfirmed: false, prescriptionOriginalContainerConfirmed: false },
     prescriptionRecords: [],
+    h1RegisterEntries: [],
     ...overrides
   };
 }
@@ -159,7 +160,7 @@ type Options = {
   remainingAtoms?: number;
   /** Phase 1M-B: the rule 65(3)(2) election in force; the register unless a test says otherwise. */
   recordMethod?: SupplySummary["recordMethod"];
-  regulatoryGateScheme?: "schedule_h" | "schedule_h1" | "schedule_x" | "schedule_c" | "schedule_c1" | null;
+  regulatoryGateScheme?: "schedule_h" | "schedule_h1" | "schedule_x" | "schedule_c" | "schedule_c1" | "ndps_purview" | "punjab_restricted_supply" | null;
 };
 
 /**
@@ -744,14 +745,16 @@ describe("Point of sale", () => {
   });
 
   /** Phase 1M-A: a classified Schedule H1 line waits for the prescription workflow; no fake form. */
-  it("withholds posting for a Schedule H1 line without offering a prescription form", async () => {
+  // Phase 1M-C: an H1 line is refused only where its NDPS purview applies or is unrecorded — the
+  // unsupported NDPS-intersection workflow. The supported H1 path is proved further below.
+  it("withholds posting for an NDPS-intersection Schedule H1 line without offering a prescription form", async () => {
     renderApp(`/app/sales/${IDs.sale}`, saleService({
       documents: [sale({ lines: [line()] })],
       regulatoryGate: "workflow_unavailable",
-      regulatoryGateScheme: "schedule_h1"
+      regulatoryGateScheme: "ndps_purview"
     }));
     await screen.findByRole("heading", { name: "Counter sale", level: 1 });
-    expect(await screen.findByText("Schedule H1 dispensing requires the H1 register workflow, which is not yet available.")).toBeInTheDocument();
+    expect((await screen.findAllByText((_, element) => element?.tagName === "SMALL" && (element.textContent ?? "").includes("an unsupported NDPS-intersection workflow AUSHADHARTH does not support"))).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
     expect(screen.queryByLabelText(/prescri/i)).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/patient/i)).not.toBeInTheDocument();
@@ -882,6 +885,52 @@ describe("Point of sale", () => {
     expect(document.body.textContent).not.toMatch(/signed by AUSHADHARTH|digitally signed|electronically signed/i);
   });
 
+  /** Phase 1M-C (C-11, C-58, C-60, C-67): the separate H1 layer sits beside the statutory record,
+   *  per supply, with its own physical steps; only a dispensing role is sent to confirm it. */
+  it("shows the separate Schedule H1 layer beside the statutory record, per supply", async () => {
+    for (const role of ["pharmacist", "cashier"] as const) {
+      renderApp(`/app/sales/${IDs.sale}`, saleService({
+        role,
+        documents: [sale({
+          lines: [line({ prescriptionItemId: PRESCRIPTION_ITEM_ID })],
+          supply: { supervisingProfessionalId: PROFESSIONALS[0].id, prescriptionEndorsementConfirmed: true, prescriptionOriginalContainerConfirmed: false },
+          prescriptionRecords: [{ id: "01997a00-0000-7000-8000-0000000000e1", serialNumber: "PR-000001", recordMethod: "prescription_register" as const, status: "confirmed" as const, prescriptionReference: "RX-000001" }],
+          h1RegisterEntries: [{ id: "01997a00-0000-7000-8000-0000000000f1", reference: "AH1-000001", status: "prepared" as const, lineNumber: 1 }]
+        })],
+        regulatoryGate: "prescription_required",
+        regulatoryGateScheme: "schedule_h1"
+      }));
+      const layer = await screen.findByTestId("live-h1");
+      expect(within(layer).getByTestId("live-h1-reference")).toHaveTextContent("AH1-000001");
+      expect(layer).toHaveTextContent("AUSHADHARTH Reference");
+      expect(layer).toHaveTextContent("Place it in the pharmacy's separate Schedule H1 register.");
+      expect(layer).toHaveTextContent("The registered pharmacist authenticates it by hand. AUSHADHARTH does not sign it.");
+      if (role === "pharmacist") {
+        expect(within(layer).getByRole("link", { name: "Open the H1 hard copy to print and confirm" })).toHaveAttribute("href", `/app/sales/${IDs.sale}/h1-register`);
+      } else {
+        expect(within(layer).queryByRole("link")).not.toBeInTheDocument();
+        expect(layer).toHaveTextContent("A pharmacist or the owner confirms the H1 hard copy. A cashier cannot.");
+      }
+      expect(screen.getByText("Schedule H1 — sold only on a prescription, with its separate H1 register entry")).toBeInTheDocument();
+      expect(document.body.textContent).not.toMatch(/end of day|signed by AUSHADHARTH|digitally signed/i);
+      cleanup();
+    }
+  });
+
+  /** Phase 1M-C (C-64, C-66, C-70): the NDPS and Punjab refusals say what AUSHADHARTH does not
+   *  support, never that a sale is prohibited or a drug banned. */
+  it("names the NDPS and Punjab boundaries as unsupported workflows, not prohibitions", async () => {
+    for (const [scheme, text] of [
+      ["punjab_restricted_supply", "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support."],
+      ["ndps_purview", "an unsupported NDPS-intersection workflow AUSHADHARTH does not support"]
+    ] as const) {
+      renderApp(`/app/sales/${IDs.sale}`, saleService({ documents: [sale({ lines: [line()] })], regulatoryGate: "workflow_unavailable", regulatoryGateScheme: scheme }));
+      expect((await screen.findAllByText((_, element) => element?.tagName === "SMALL" && (element.textContent ?? "").includes(text))).length).toBeGreaterThan(0);
+      expect(document.body.textContent).not.toMatch(/banned|prohibited|illegal/i);
+      cleanup();
+    }
+  });
+
   it("lets a cashier see the state but not link prescriptions or name the pharmacist", async () => {
     renderApp(`/app/sales/${IDs.sale}`, saleService({ role: "cashier", documents: [sale({ lines: [line()] })], regulatoryGate: "prescription_required" }));
     expect(await screen.findByTestId("prescription-panel")).toBeInTheDocument();
@@ -948,7 +997,7 @@ describe("Point of sale", () => {
     });
     renderApp(`/app/sales/${IDs.sale}`, service);
     fireEvent.click(await screen.findByRole("button", { name: "Take 179.20 and post" }));
-    expect(await screen.findByText("This Schedule H sale is missing prescription requirements. This is more than the prescription has left.")).toBeInTheDocument();
+    expect(await screen.findByText("This prescription sale is missing prescription requirements. This is more than the prescription has left.")).toBeInTheDocument();
   });
 
   it("says when no rule 65(3)(2) election is recorded and withholds posting", async () => {

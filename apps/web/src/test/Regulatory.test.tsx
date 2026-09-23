@@ -90,6 +90,11 @@ function renderApp(path: string, double = service()) {
   return double;
 }
 
+// The Drugs Rules panel is ready only after the whole App has booted in this worker: auth,
+// system info, the route, and the product’s own queries. Measured at 0.3s alone, 0.5s in the full
+// suite and 0.75s under load — too close to the 1s default of findBy, which expired in one run.
+// The wait is a readiness budget only; every assertion below it stays exact.
+const awaitGate = () => screen.findByTestId("regulatory-gate", {}, { timeout: 3000 });
 const panel = () => screen.getByRole("region", { name: "Drugs Rules Classification" });
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -97,7 +102,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("Drugs Rules classification on a product", () => {
   it("shows every scheme as unknown, in words, for a product nobody has classified", async () => {
     renderApp(`/app/products/${IDs.product}`);
-    await screen.findByTestId("regulatory-gate");
+    await awaitGate();
     const section = within(panel());
     // A name that says "Schedule H1" classified nothing.
     expect(section.getAllByText("Unknown — not recorded")).toHaveLength(6);
@@ -108,7 +113,7 @@ describe("Drugs Rules classification on a product", () => {
 
   it("will not record a finding until applies or does-not-apply is chosen explicitly", async () => {
     const double = renderApp(`/app/products/${IDs.product}`);
-    await screen.findByTestId("regulatory-gate");
+    await awaitGate();
     fireEvent.click(within(panel()).getByRole("button", { name: "Record Finding" }));
     const dialog = await screen.findByRole("dialog");
     const submit = within(dialog).getByRole("button", { name: "Record Finding" });
@@ -129,7 +134,7 @@ describe("Drugs Rules classification on a product", () => {
 
   it("refuses to send a finding with no authority behind it", async () => {
     renderApp(`/app/products/${IDs.product}`);
-    await screen.findByTestId("regulatory-gate");
+    await awaitGate();
     fireEvent.click(within(panel()).getByRole("button", { name: "Record Finding" }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.change(within(dialog).getByLabelText("Scheme"), { target: { value: "schedule_h1" } });
@@ -141,7 +146,7 @@ describe("Drugs Rules classification on a product", () => {
 
   it("offers a cashier no way to classify, and shows the same position read-only", async () => {
     renderApp(`/app/products/${IDs.product}`, service({ role: "cashier" }));
-    await screen.findByTestId("regulatory-gate");
+    await awaitGate();
     expect(within(panel()).queryByRole("button", { name: "Record Finding" })).not.toBeInTheDocument();
     expect(within(panel()).getAllByText("Unknown — not recorded")).toHaveLength(6);
   });
@@ -159,7 +164,7 @@ describe("Drugs Rules classification on a product", () => {
         classifications: [{ id: IDs.finding, revision: 1, status: "active", scheme: "schedule_x", applies: true, effectiveFrom: "2020-01-01", effectiveTo: null, sourceCitation: "Drugs Rules, 1945, Schedule X", reason: null, determinedByUserId: IDs.user, createdAtUtc: stamp.createdAtUtc, updatedAtUtc: stamp.updatedAtUtc }]
       }
     }));
-    await screen.findByTestId("regulatory-gate");
+    await awaitGate();
     const gate = within(panel()).getByTestId("regulatory-gate");
     expect(gate).toHaveTextContent("Regulated sale — workflow not yet available");
     expect(gate).toHaveTextContent("Schedule X applies");

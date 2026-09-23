@@ -97,9 +97,20 @@ pub(crate) enum SaleError {
         line_number: i64,
         scheme: &'static str,
     },
-    /// Phase 1M-B: Schedule H1 needs its own separate register under rule 65(3)(1)(h). A
-    /// prescription alone does not satisfy it, so the line is refused however complete it is.
-    ScheduleH1RegisterNotAvailable {
+    /// Phase 1M-C: a Schedule H1 line whose NDPS purview applies or is not recorded. AUSHADHARTH
+    /// does not support that combined workflow — an unsupported NDPS-intersection workflow, which
+    /// is a boundary of this software and not a requirement rule 65 itself states.
+    ScheduleH1NdpsWorkflowNotAvailable {
+        line_number: i64,
+    },
+    /// Phase 1M-C: an additional Punjab drug-control workflow applies to this drug at this store,
+    /// and AUSHADHARTH does not implement it. Not a statement that the sale is prohibited.
+    StateRestrictedDrugWorkflowNotAvailable {
+        line_number: i64,
+    },
+    /// Phase 1M-C: the medicine's position under the Punjab boundary, or the store's premises
+    /// State itself, is not recorded, so the boundary cannot be judged.
+    StateRegulatoryPositionUnresolved {
         line_number: i64,
     },
     /// Phase 1M-B: Schedule X needs the duplicate prescription and the rule 65(21) register.
@@ -334,14 +345,42 @@ impl IntoResponse for SaleError {
                     available_atoms: None,
                 },
             ),
-            Self::ScheduleH1RegisterNotAvailable { line_number } => (
+            Self::ScheduleH1NdpsWorkflowNotAvailable { line_number } => (
                 StatusCode::CONFLICT,
                 ErrorBody {
-                    code: "schedule_h1_register_not_available",
-                    message: "Schedule H1 dispensing requires the H1 register workflow, which is not yet available.",
+                    code: "schedule_h1_ndps_workflow_not_available",
+                    message: "This Schedule H1 drug is, or may be, within the NDPS Act, and AUSHADHARTH does not support that combined workflow.",
                     issues: vec![ErrorIssue {
                         field: format!("lines.{line_number}"),
-                        message: "This line is Schedule H1. Remove it to post the rest.".to_owned(),
+                        message: "Unsupported NDPS-intersection workflow: record the product's NDPS position as not applying if that is the finding, or remove this line to post the rest.".to_owned(),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::StateRestrictedDrugWorkflowNotAvailable { line_number } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "state_restricted_drug_workflow_not_available",
+                    message: "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message: "Remove this line to post the rest.".to_owned(),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::StateRegulatoryPositionUnresolved { line_number } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "state_regulatory_position_unresolved",
+                    message: "This medicine's position under the Punjab drug-control boundary is not recorded, or the store's premises State is not recorded.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message: "Record the product's Punjab finding in Drug Compliance, or the store's premises address in Store Profile.".to_owned(),
                     }],
                     expected_revision: None,
                     current_revision: None,
@@ -366,7 +405,7 @@ impl IntoResponse for SaleError {
                 StatusCode::CONFLICT,
                 ErrorBody {
                     code: "prescription_requirements_incomplete",
-                    message: "This Schedule H sale is missing prescription requirements.",
+                    message: "This prescription sale is missing prescription requirements.",
                     issues: issues
                         .iter()
                         .map(|issue| ErrorIssue {
@@ -874,6 +913,18 @@ struct SaleDetailResponse {
     /// Phase 1M-B: the rule 65(3)(1) entries this Sale created. Serials and states only — the
     /// particulars, which name the patient, are read from the entry by the dispensing roles.
     prescription_records: Vec<SaleRecordSummary>,
+    /// Phase 1M-C: this Sale's Schedule H1 working entries. AUSHADHARTH References and states only
+    /// — the particulars, which name the patient, are read by the dispensing roles.
+    h1_register_entries: Vec<SaleH1EntrySummary>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct SaleH1EntrySummary {
+    id: String,
+    reference: String,
+    status: String,
+    line_number: i64,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -1997,8 +2048,13 @@ async fn quote_sale(
     let mut quoted = Vec::with_capacity(lines.len());
     let mut amounts = Vec::with_capacity(lines.len());
     let mut taxable_supply = Vec::with_capacity(lines.len());
-    let regulatory =
-        resolve_regulatory_for_lines(&mut connection, &lines, &header.business_date).await?;
+    let regulatory = resolve_regulatory_for_lines(
+        &mut connection,
+        &header.store_id,
+        &lines,
+        &header.business_date,
+    )
+    .await?;
     // The same judgement posting will make, read-only, so the counter sees exactly what is missing.
     let plan = plan_dispensings(
         &mut connection,
@@ -2041,11 +2097,21 @@ async fn quote_sale(
             regulatory_gate: match regulatory[index].gate {
                 regulatory::SaleGate::Clear => "clear",
                 regulatory::SaleGate::PrescriptionRequired => "prescription_required",
-                regulatory::SaleGate::Unresolved => "unresolved",
-                regulatory::SaleGate::WorkflowUnavailable { .. } => "workflow_unavailable",
+                regulatory::SaleGate::Unresolved | regulatory::SaleGate::StateUnresolved { .. } => {
+                    "unresolved"
+                }
+                regulatory::SaleGate::WorkflowUnavailable { .. }
+                | regulatory::SaleGate::UnsupportedIntersection { .. }
+                | regulatory::SaleGate::StateWorkflowUnavailable { .. } => "workflow_unavailable",
             },
             regulatory_gate_scheme: match regulatory[index].gate {
-                regulatory::SaleGate::WorkflowUnavailable { scheme } => Some(scheme),
+                regulatory::SaleGate::WorkflowUnavailable { scheme }
+                | regulatory::SaleGate::StateWorkflowUnavailable { scheme }
+                | regulatory::SaleGate::StateUnresolved { scheme } => Some(scheme),
+                regulatory::SaleGate::UnsupportedIntersection { .. } => Some("ndps_purview"),
+                regulatory::SaleGate::PrescriptionRequired if regulatory[index].h1_any_day => {
+                    Some("schedule_h1")
+                }
                 regulatory::SaleGate::PrescriptionRequired => Some("schedule_h"),
                 _ => None,
             },
@@ -2388,10 +2454,12 @@ async fn post_within_transaction(
     // And it refuses here: before `allocate_document_number` below, before any inventory movement,
     // before any tender row and before the document becomes posted. A refused Sale leaves a draft
     // with its stock untouched and its series ungapped.
-    let regulatory = resolve_regulatory_for_lines(connection, &lines, &business_date).await?;
-    // Every unsupported scheme is refused before any prescription is examined, so a basket holding
-    // one Schedule H1 or Schedule X line is refused as a whole, naming that line, however complete
-    // the Schedule H paperwork on the other lines is.
+    let regulatory =
+        resolve_regulatory_for_lines(connection, &store_id, &lines, &business_date).await?;
+    // Every unsupported scheme, intersection or State boundary is refused before any prescription
+    // is examined, so a basket holding one Schedule X line, one NDPS-intersection H1 line or one
+    // Punjab-restricted line is refused as a whole, naming that line, however complete the
+    // prescription paperwork on the other lines is.
     refuse_unsupported_schemes(&lines, &regulatory)?;
 
     // Phase 1M-B — the Schedule H prescription, under the same lock and still before any side
@@ -2591,7 +2659,7 @@ async fn post_within_transaction(
              ceiling_basis=?,taxable_value_paise=?,cgst_paise=?,sgst_paise=?,igst_paise=?,\
              cess_paise=?,line_total_paise=?,regulatory_snapshot_version=1,\
              manufacturer_company_id=?,manufacturer_name=?,regulatory_schemes_snapshot=?,\
-             updated_at_utc=? WHERE id=?",
+             regulatory_state_snapshot=?,updated_at_utc=? WHERE id=?",
         )
         .bind(&entry.product_display_name)
         .bind(&entry.pack_display_label)
@@ -2623,6 +2691,9 @@ async fn post_within_transaction(
         .bind(manufacturer_company_id)
         .bind(manufacturer_name)
         .bind(drugs.schemes.to_snapshot_json())
+        // Phase 1M-C: the premises State and the Punjab position on the business date, beside the
+        // central answer and never inside it.
+        .bind(drugs.state.to_snapshot_json())
         .bind(&now)
         .bind(&line.id)
         .execute(&mut **connection)
@@ -2718,6 +2789,12 @@ async fn post_within_transaction(
     if !dispensing.planned.is_empty() {
         finalize_supply_records(connection, id, &dispensing, &dispensing_ids, actor_id, &now)
             .await?;
+    }
+    // Phase 1M-C — each Schedule H1 working entry, confirmed before this posting began (its hard
+    // copy placed in the separate register and authenticated by the registered pharmacist), is
+    // linked to its dispensing and finalized with the Sale, or none of them is.
+    if !dispensing.live_h1.is_empty() {
+        finalize_h1_entries(connection, id, &dispensing, &dispensing_ids, actor_id, &now).await?;
     }
 
     for tender in tenders {
@@ -3610,6 +3687,13 @@ struct LineRegulatory {
     /// The gate: the STRICTER of the business-date position and the position on the day the Sale is
     /// actually being posted. See `resolve_regulatory_for_lines`.
     gate: regulatory::SaleGate,
+    /// Phase 1M-C: the premises State and the Punjab position on the business date, frozen beside
+    /// `schemes` in its own column.
+    state: regulatory::StateAnswer,
+    /// Phase 1M-C: Schedule H1 applies on the business date — the date its working entry records.
+    h1_on_business_date: bool,
+    /// Phase 1M-C: Schedule H1 applies on the business date or on any day the posting could be.
+    h1_any_day: bool,
 }
 
 /// The calendar day(s) the posting instant can be in the store's own time.
@@ -3650,8 +3734,10 @@ fn stricter(first: regulatory::SaleGate, second: regulatory::SaleGate) -> regula
         match gate {
             regulatory::SaleGate::Clear => 0,
             regulatory::SaleGate::PrescriptionRequired => 1,
-            regulatory::SaleGate::Unresolved => 2,
-            regulatory::SaleGate::WorkflowUnavailable { .. } => 3,
+            regulatory::SaleGate::Unresolved | regulatory::SaleGate::StateUnresolved { .. } => 2,
+            regulatory::SaleGate::WorkflowUnavailable { .. }
+            | regulatory::SaleGate::UnsupportedIntersection { .. }
+            | regulatory::SaleGate::StateWorkflowUnavailable { .. } => 3,
         }
     }
     if rank(&second) > rank(&first) {
@@ -3675,10 +3761,16 @@ fn stricter(first: regulatory::SaleGate, second: regulatory::SaleGate) -> regula
 /// money path exactly as Phase 1H froze it.
 async fn resolve_regulatory_for_lines(
     connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
     lines: &[DraftLine],
     business_date: &str,
 ) -> Result<Vec<LineRegulatory>, SaleError> {
     let days = posting_days(connection).await?;
+    // Phase 1M-C: the store's premises State, read under the same lock as everything else. Never
+    // the GSTIN prefix, the place of supply, the customer or the device.
+    let premises = regulatory::resolve_premises_state(connection, store_id)
+        .await
+        .map_err(map_database_error)?;
     let mut resolved = Vec::with_capacity(lines.len());
     for line in lines {
         let product_kind: String =
@@ -3691,12 +3783,34 @@ async fn resolve_regulatory_for_lines(
         let schemes = regulatory::resolve_for_product(connection, &line.product_id, business_date)
             .await
             .map_err(map_database_error)?;
-        let mut gate = regulatory::gate(&product_kind, &schemes);
+        let state = regulatory::resolve_state_for_product(
+            connection,
+            &line.product_id,
+            business_date,
+            premises.as_deref(),
+        )
+        .await
+        .map_err(map_database_error)?;
+        let h1_on_business_date = schemes.answer("schedule_h1") == regulatory::Resolution::Applies;
+        let mut h1_any_day = h1_on_business_date;
+        let mut gate = regulatory::combined_gate(&product_kind, &schemes, &state);
         for day in &days {
             let on_day = regulatory::resolve_for_product(connection, &line.product_id, day)
                 .await
                 .map_err(map_database_error)?;
-            gate = stricter(gate, regulatory::gate(&product_kind, &on_day));
+            let state_on_day = regulatory::resolve_state_for_product(
+                connection,
+                &line.product_id,
+                day,
+                premises.as_deref(),
+            )
+            .await
+            .map_err(map_database_error)?;
+            h1_any_day |= on_day.answer("schedule_h1") == regulatory::Resolution::Applies;
+            gate = stricter(
+                gate,
+                regulatory::combined_gate(&product_kind, &on_day, &state_on_day),
+            );
         }
         let manufacturer =
             regulatory::resolve_manufacturer(connection, &line.product_id, business_date)
@@ -3706,6 +3820,9 @@ async fn resolve_regulatory_for_lines(
             schemes,
             manufacturer,
             gate,
+            state,
+            h1_on_business_date,
+            h1_any_day,
         });
     }
     Ok(resolved)
@@ -3759,6 +3876,21 @@ fn prescription_issue_message(code: &str) -> &'static str {
         }
         "prescription_record_stale" => {
             "The prescription-supply entry no longer matches this sale. Void it and prepare a new one."
+        }
+        "schedule_h1_register_not_prepared" => {
+            "Prepare the Schedule H1 working entry: its hard copy is placed in the separate H1 register and authenticated by the registered pharmacist before the sale is posted."
+        }
+        "schedule_h1_register_not_confirmed" => {
+            "The Schedule H1 working entry is prepared but not confirmed: place its hard copy in the separate H1 register, have the registered pharmacist authenticate it by hand, then confirm both."
+        }
+        "schedule_h1_register_stale" => {
+            "The Schedule H1 working entry no longer matches this sale. Void the prescription-supply entry and prepare both again."
+        }
+        "schedule_h1_veterinary_workflow_unresolved" => {
+            "A Schedule H1 supply for an animal is not supported: rule 65(3)(1)(h) records the name of the patient, and how it applies to veterinary supply is unresolved."
+        }
+        "schedule_h1_commenced_after_business_date" => {
+            "Schedule H1 applies to this product on the day it is being posted but not on the sale's business date. Date the sale today to record its H1 working entry."
         }
         _ => "A prescription requirement is not met.",
     }
@@ -3817,6 +3949,10 @@ struct DispensingPlan {
     expected_lines: Vec<(String, RecordLineFacts)>,
     /// This Sale's prepared or confirmed entries.
     live_records: Vec<LiveRecord>,
+    /// Phase 1M-C: the rule 65(3)(1)(h) particulars each Schedule H1 line's working entry must carry.
+    h1_expected: Vec<H1LineFacts>,
+    /// Phase 1M-C: this Sale's prepared or confirmed Schedule H1 working entries.
+    live_h1: Vec<LiveH1Entry>,
 }
 
 /// Which rule 65(3)(1) book, from which election.
@@ -3837,6 +3973,7 @@ struct LinkedItem {
     repeat_interval_days: Option<i64>,
     product_id: String,
     prescribed_quantity_atoms: i64,
+    subject_kind: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -3910,6 +4047,11 @@ async fn plan_dispensings(
         if required && drugs.manufacturer.is_none() {
             flag(&mut summary, "manufacturer_not_recorded");
         }
+        // Phase 1M-C: an H1 working entry records the Schedule H1 position of the business date.
+        // A drug scheduled into H1 since that date cannot be entered truthfully under it.
+        if required && drugs.h1_any_day && !drugs.h1_on_business_date {
+            flag(&mut summary, "schedule_h1_commenced_after_business_date");
+        }
 
         match (required, link) {
             (false, None) => {}
@@ -3940,7 +4082,7 @@ async fn plan_dispensings(
                      prescription.status,prescription.reference,prescription.prescribed_on,\
                      prescription.repeat_authority,prescription.repeat_times,\
                      prescription.repeat_interval_days,item.product_id,\
-                     item.prescribed_quantity_atoms \
+                     item.prescribed_quantity_atoms,prescription.subject_kind \
                      FROM prescription_items item \
                      JOIN prescriptions prescription ON prescription.id=item.prescription_id \
                      WHERE item.id=?",
@@ -4007,6 +4149,12 @@ async fn plan_dispensings(
 
                         if item.status != "active" {
                             flag(&mut summary, "prescription_archived");
+                        } else if drugs.h1_any_day && item.subject_kind != "human" {
+                            // Phase 1M-C: an unresolved veterinary-H1 workflow. Rule 65(3)(1)(h) asks
+                            // for "the name of the patient"; the owner of an animal is not put in
+                            // its place without authority. Not a statement that the supply is
+                            // prohibited — only that AUSHADHARTH does not support it.
+                            flag(&mut summary, "schedule_h1_veterinary_workflow_unresolved");
                         } else if let Some(authority) = authority {
                             let request = prescriptions::DispenseRequest {
                                 product_id: &line.product_id,
@@ -4133,6 +4281,8 @@ async fn plan_dispensings(
     let mut original_container_confirmed = false;
     let mut expected_lines = Vec::new();
     let mut live_records = Vec::new();
+    let mut h1_expected = Vec::new();
+    let mut live_h1 = Vec::new();
     if supervision_required {
         original_container_confirmed = sqlx::query_scalar::<_, i64>(
             "SELECT prescription_original_container_confirmed FROM sale_documents WHERE id=?",
@@ -4168,6 +4318,7 @@ async fn plan_dispensings(
         // prescription, both confirmed — and still exactly what is about to be supplied.
         if issues.is_empty() {
             expected_lines = expected_record_lines(connection, lines, regulatory, &planned).await?;
+            h1_expected = expected_h1_lines(connection, lines, regulatory, &planned).await?;
             if let (Some(plan_record), Some(snapshot)) = (record.as_ref(), supervision.as_ref()) {
                 live_records = evaluate_records(
                     connection,
@@ -4178,6 +4329,17 @@ async fn plan_dispensings(
                     original_container_confirmed,
                     &planned,
                     &expected_lines,
+                    &mut issues,
+                )
+                .await?;
+                // Phase 1M-C — the second, separate layer: the Schedule H1 working entry of every
+                // H1 line, confirmed (hard copy placed and authenticated) and still exact.
+                live_h1 = evaluate_h1_entries(
+                    connection,
+                    sale_id,
+                    business_date,
+                    snapshot,
+                    &h1_expected,
                     &mut issues,
                 )
                 .await?;
@@ -4195,7 +4357,159 @@ async fn plan_dispensings(
         original_container_confirmed,
         expected_lines,
         live_records,
+        h1_expected,
+        live_h1,
     })
+}
+
+/// Phase 1M-C — the rule 65(3)(1)(h) particulars of one Schedule H1 line, from exactly the sources
+/// the database proves the working entry against: the prescription's prescriber and patient, the
+/// product's name, and the line's quantity.
+#[derive(Debug, Clone, PartialEq, FromRow)]
+struct H1LineFacts {
+    sale_line_id: String,
+    prescription_id: String,
+    prescription_item_id: String,
+    product_id: String,
+    prescriber_name: String,
+    prescriber_address: String,
+    patient_name: String,
+    drug_name: String,
+    quantity_atoms: i64,
+    quantity_unit_label: Option<String>,
+}
+
+/// One entry per planned dispensing whose line is Schedule H1 on the business date. Two H1 drugs
+/// are two entries, never one merged row.
+async fn expected_h1_lines(
+    connection: &mut PoolConnection<Sqlite>,
+    lines: &[DraftLine],
+    regulatory: &[LineRegulatory],
+    planned: &[PlannedDispensing],
+) -> Result<Vec<H1LineFacts>, SaleError> {
+    let mut expected = Vec::new();
+    for planned in planned {
+        let Some(index) = lines
+            .iter()
+            .position(|line| line.id == planned.sale_line_id)
+        else {
+            return Err(SaleError::Internal);
+        };
+        if !regulatory[index].h1_on_business_date {
+            continue;
+        }
+        let facts: H1LineFacts = sqlx::query_as(
+            "SELECT ? AS sale_line_id,prescription.id AS prescription_id,\
+             ? AS prescription_item_id,? AS product_id,prescription.prescriber_name,\
+             prescription.prescriber_address,prescription.subject_name AS patient_name,\
+             product.display_name AS drug_name,? AS quantity_atoms,\
+             unit.display_name AS quantity_unit_label \
+             FROM prescriptions prescription JOIN products product ON product.id=? \
+             LEFT JOIN units_of_measure unit ON unit.id=product.base_unit_id \
+             WHERE prescription.id=?",
+        )
+        .bind(&planned.sale_line_id)
+        .bind(&planned.prescription_item_id)
+        .bind(&planned.product_id)
+        .bind(planned.quantity_atoms)
+        .bind(&planned.product_id)
+        .bind(&planned.prescription_id)
+        .fetch_one(&mut **connection)
+        .await
+        .map_err(map_database_error)?;
+        expected.push(facts);
+    }
+    Ok(expected)
+}
+
+/// A live (prepared or confirmed) Schedule H1 working entry of this Sale.
+#[derive(Debug, Clone, FromRow)]
+struct LiveH1Entry {
+    id: String,
+    sale_line_id: String,
+    status: String,
+    prescription_id: String,
+    prescription_item_id: String,
+    product_id: String,
+    prescriber_name: String,
+    prescriber_address: String,
+    patient_name: String,
+    drug_name: String,
+    quantity_atoms: i64,
+    quantity_unit_label: Option<String>,
+    date_of_supply: String,
+    supervising_professional_id: String,
+    supervising_professional_name: String,
+    supervising_registration_number: String,
+}
+
+/// Where this Sale's Schedule H1 working entries stand: one per H1 line, confirmed, and still
+/// exactly the prescriber, patient, drug, quantity, date and pharmacist of the supply.
+async fn evaluate_h1_entries(
+    connection: &mut PoolConnection<Sqlite>,
+    sale_id: &str,
+    business_date: &str,
+    supervision: &SupervisionSnapshot,
+    expected: &[H1LineFacts],
+    issues: &mut Vec<PrescriptionIssue>,
+) -> Result<Vec<LiveH1Entry>, SaleError> {
+    let live: Vec<LiveH1Entry> = sqlx::query_as(
+        "SELECT id,sale_line_id,status,prescription_id,prescription_item_id,product_id,\
+         prescriber_name,prescriber_address,patient_name,drug_name,quantity_atoms,\
+         quantity_unit_label,date_of_supply,supervising_professional_id,\
+         supervising_professional_name,supervising_registration_number \
+         FROM prescription_h1_register_entries \
+         WHERE sale_document_id=? AND status IN ('prepared','confirmed') ORDER BY reference_value",
+    )
+    .bind(sale_id)
+    .fetch_all(&mut **connection)
+    .await
+    .map_err(map_database_error)?;
+    let mut raise = |code: &'static str| {
+        if !issues.iter().any(|issue| issue.code == code) {
+            issues.push(PrescriptionIssue {
+                line_number: None,
+                code,
+            });
+        }
+    };
+    for facts in expected {
+        let Some(entry) = live
+            .iter()
+            .find(|entry| entry.sale_line_id == facts.sale_line_id)
+        else {
+            raise("schedule_h1_register_not_prepared");
+            continue;
+        };
+        let same = entry.prescription_id == facts.prescription_id
+            && entry.prescription_item_id == facts.prescription_item_id
+            && entry.product_id == facts.product_id
+            && entry.prescriber_name == facts.prescriber_name
+            && entry.prescriber_address == facts.prescriber_address
+            && entry.patient_name == facts.patient_name
+            && entry.drug_name == facts.drug_name
+            && entry.quantity_atoms == facts.quantity_atoms
+            && entry.quantity_unit_label == facts.quantity_unit_label
+            && entry.date_of_supply == business_date
+            && entry.supervising_professional_id == supervision.professional_id
+            && entry.supervising_professional_name == supervision.full_name
+            && entry.supervising_registration_number == supervision.registration_number;
+        if !same {
+            raise("schedule_h1_register_stale");
+        } else if entry.status == "prepared" {
+            raise("schedule_h1_register_not_confirmed");
+        }
+    }
+    // An entry for a line that is no longer Schedule H1, or no longer dispensed, cannot be left
+    // behind to be finalized.
+    if live.iter().any(|entry| {
+        !expected
+            .iter()
+            .any(|facts| facts.sale_line_id == entry.sale_line_id)
+    }) {
+        raise("schedule_h1_register_stale");
+    }
+    Ok(live)
 }
 
 /// The rule 65(3)(1) particulars (e) and (f) of one Sale line, read from exactly the sources posting
@@ -4364,10 +4678,13 @@ async fn evaluate_records(
 }
 
 /// The record-state issues, which only preparing, confirming or voiding an entry resolves.
-const RECORD_STATE_ISSUES: [&str; 3] = [
+const RECORD_STATE_ISSUES: [&str; 6] = [
     "prescription_record_not_prepared",
     "prescription_record_not_confirmed",
     "prescription_record_stale",
+    "schedule_h1_register_not_prepared",
+    "schedule_h1_register_not_confirmed",
+    "schedule_h1_register_stale",
 ];
 
 /// Rule 65(3)(2): the election in force for this supply.
@@ -4415,8 +4732,9 @@ async fn resolve_record_election(
 }
 
 /// The Drugs Rules scheme gate, shared by preparing an entry and by posting, so preparing a rule 65
-/// record can never be a way round it: an unresolved medicine, Schedule H1, Schedule X, or a
-/// Schedule C / C(1) line is refused here, naming the line, before anything is written.
+/// record can never be a way round it: an unresolved medicine, Schedule X, a Schedule C / C(1) line,
+/// an NDPS-intersection H1 line, or a Punjab-boundary line is refused here, naming the line, before
+/// anything is written.
 fn refuse_unsupported_schemes(
     lines: &[DraftLine],
     regulatory: &[LineRegulatory],
@@ -4429,10 +4747,18 @@ fn refuse_unsupported_schemes(
                     line_number: line.line_number,
                 });
             }
-            regulatory::SaleGate::WorkflowUnavailable {
-                scheme: "schedule_h1",
-            } => {
-                return Err(SaleError::ScheduleH1RegisterNotAvailable {
+            regulatory::SaleGate::UnsupportedIntersection { .. } => {
+                return Err(SaleError::ScheduleH1NdpsWorkflowNotAvailable {
+                    line_number: line.line_number,
+                });
+            }
+            regulatory::SaleGate::StateWorkflowUnavailable { .. } => {
+                return Err(SaleError::StateRestrictedDrugWorkflowNotAvailable {
+                    line_number: line.line_number,
+                });
+            }
+            regulatory::SaleGate::StateUnresolved { .. } => {
+                return Err(SaleError::StateRegulatoryPositionUnresolved {
                     line_number: line.line_number,
                 });
             }
@@ -4469,7 +4795,18 @@ async fn ensure_no_live_record(
     .fetch_optional(&mut *connection)
     .await
     .map_err(map_database_error)?;
-    match live {
+    if let Some(serial) = live {
+        return Err(SaleError::PrescriptionRecordPrepared { serial });
+    }
+    let live_h1: Option<String> = sqlx::query_scalar(
+        "SELECT reference FROM prescription_h1_register_entries \
+         WHERE sale_document_id=? AND status IN ('prepared','confirmed') LIMIT 1",
+    )
+    .bind(sale_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    match live_h1 {
         Some(serial) => Err(SaleError::PrescriptionRecordPrepared { serial }),
         None => Ok(()),
     }
@@ -4548,7 +4885,8 @@ async fn prepare_within_transaction(
         });
     }
     let lines = load_lines(connection, id).await?;
-    let regulatory = resolve_regulatory_for_lines(connection, &lines, &business_date).await?;
+    let regulatory =
+        resolve_regulatory_for_lines(connection, &store_id, &lines, &business_date).await?;
     refuse_unsupported_schemes(&lines, &regulatory)?;
     let plan = plan_dispensings(
         connection,
@@ -4583,17 +4921,15 @@ async fn prepare_within_transaction(
     }
     // A live entry that no longer matches must be voided, not overwritten: its serial may be on
     // paper already.
-    if plan
-        .issues
-        .iter()
-        .any(|issue| issue.code == "prescription_record_stale")
-    {
-        return Err(SaleError::PrescriptionRequirementsIncomplete(vec![
-            PrescriptionIssue {
-                line_number: None,
-                code: "prescription_record_stale",
-            },
-        ]));
+    for stale in ["prescription_record_stale", "schedule_h1_register_stale"] {
+        if plan.issues.iter().any(|issue| issue.code == stale) {
+            return Err(SaleError::PrescriptionRequirementsIncomplete(vec![
+                PrescriptionIssue {
+                    line_number: None,
+                    code: stale,
+                },
+            ]));
+        }
     }
     let record = plan.record.as_ref().ok_or(SaleError::Internal)?;
     let supervision = plan.supervision.as_ref().ok_or(SaleError::Internal)?;
@@ -4613,6 +4949,12 @@ async fn prepare_within_transaction(
         }
     }
     let mut prepared_any = false;
+    // Which rule 65(3)(1) entry records each prescription: the live one, or the one written now.
+    let mut record_for: Vec<(String, String)> = plan
+        .live_records
+        .iter()
+        .map(|entry| (entry.prescription_id.clone(), entry.id.clone()))
+        .collect();
     for prescription_id in needed {
         if plan
             .live_records
@@ -4644,6 +4986,7 @@ async fn prepare_within_transaction(
         .await
         .map_err(map_database_error)?;
         let record_id = Uuid::now_v7().to_string();
+        record_for.push((prescription_id.to_owned(), record_id.clone()));
         sqlx::query(
             "INSERT INTO prescription_supply_records (id,store_id,sale_document_id,prescription_id,\
              record_method,election_id,serial_value,serial_number,date_of_supply,prescriber_name,\
@@ -4719,6 +5062,85 @@ async fn prepare_within_transaction(
         .await?;
         prepared_any = true;
     }
+    // Phase 1M-C — the separate Schedule H1 working entry of each H1 line: one per line, each with
+    // the next AUSHADHARTH Reference (internal; not a register serial). The database proves every
+    // particular against the prescription, the product and the line.
+    for facts in &plan.h1_expected {
+        if plan
+            .live_h1
+            .iter()
+            .any(|entry| entry.sale_line_id == facts.sale_line_id)
+        {
+            continue;
+        }
+        let supply_record_id = record_for
+            .iter()
+            .find(|(prescription, _)| *prescription == facts.prescription_id)
+            .map(|(_, record)| record.clone())
+            .ok_or(SaleError::Internal)?;
+        let reference_value: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(reference_value),0)+1 FROM prescription_h1_register_entries \
+             WHERE store_id=?",
+        )
+        .bind(&store_id)
+        .fetch_one(&mut **connection)
+        .await
+        .map_err(map_database_error)?;
+        let reference = format!("AH1-{reference_value:06}");
+        let entry_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO prescription_h1_register_entries (id,store_id,sale_document_id,\
+             sale_line_id,supply_record_id,prescription_id,prescription_item_id,product_id,\
+             reference_value,reference,date_of_supply,prescriber_name,prescriber_address,\
+             patient_name,drug_name,quantity_atoms,quantity_unit_label,\
+             supervising_professional_id,supervising_professional_name,\
+             supervising_registration_number,prepared_by_user_id,prepared_at_utc) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&entry_id)
+        .bind(&store_id)
+        .bind(id)
+        .bind(&facts.sale_line_id)
+        .bind(&supply_record_id)
+        .bind(&facts.prescription_id)
+        .bind(&facts.prescription_item_id)
+        .bind(&facts.product_id)
+        .bind(reference_value)
+        .bind(&reference)
+        .bind(&business_date)
+        .bind(&facts.prescriber_name)
+        .bind(&facts.prescriber_address)
+        .bind(&facts.patient_name)
+        .bind(&facts.drug_name)
+        .bind(facts.quantity_atoms)
+        .bind(&facts.quantity_unit_label)
+        .bind(&supervision.professional_id)
+        .bind(&supervision.full_name)
+        .bind(&supervision.registration_number)
+        .bind(actor_id)
+        .bind(&now)
+        .execute(&mut **connection)
+        .await
+        .map_err(map_database_error)?;
+        // Identifiers, the reference and the state only: never the patient or the prescriber.
+        audit_entity(
+            connection,
+            "prescription_h1_register_entry",
+            &entry_id,
+            "created",
+            &json!({
+                "saleDocumentId": id,
+                "saleLineId": facts.sale_line_id,
+                "supplyRecordId": supply_record_id,
+                "reference": reference,
+                "status": "prepared",
+            }),
+            actor_id,
+            &now,
+        )
+        .await?;
+        prepared_any = true;
+    }
     if prepared_any {
         // The draft's revision moves, so a screen that read it before the preparation must reload.
         sqlx::query("UPDATE sale_documents SET revision=revision+1,updated_at_utc=? WHERE id=?")
@@ -4784,6 +5206,53 @@ async fn finalize_supply_records(
             &entry.id,
             "posted",
             &json!({ "saleDocumentId": sale_id, "status": "finalized" }),
+            actor_id,
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Phase 1M-C — finalizes this Sale's confirmed Schedule H1 working entries inside its posting,
+/// each linked to the dispensing of its own line. The database checks the link and refuses the
+/// posting if any H1 line is left without a finalized entry.
+async fn finalize_h1_entries(
+    connection: &mut PoolConnection<Sqlite>,
+    sale_id: &str,
+    plan: &DispensingPlan,
+    dispensing_ids: &[(String, String)],
+    actor_id: &str,
+    now: &str,
+) -> Result<(), SaleError> {
+    for entry in &plan.live_h1 {
+        if entry.status != "confirmed" {
+            return Err(SaleError::Internal);
+        }
+        let dispensing_id = dispensing_ids
+            .iter()
+            .find(|(line_id, _)| *line_id == entry.sale_line_id)
+            .map(|(_, dispensing_id)| dispensing_id.as_str())
+            .ok_or(SaleError::Internal)?;
+        let finalized = sqlx::query(
+            "UPDATE prescription_h1_register_entries SET status='finalized',dispensing_id=?,\
+             finalized_at_utc=? WHERE id=? AND status='confirmed'",
+        )
+        .bind(dispensing_id)
+        .bind(now)
+        .bind(&entry.id)
+        .execute(&mut **connection)
+        .await
+        .map_err(map_database_error)?;
+        if finalized.rows_affected() != 1 {
+            return Err(SaleError::Internal);
+        }
+        audit_entity(
+            connection,
+            "prescription_h1_register_entry",
+            &entry.id,
+            "posted",
+            &json!({ "saleDocumentId": sale_id, "dispensingId": dispensing_id, "status": "finalized" }),
             actor_id,
             now,
         )
@@ -5057,12 +5526,23 @@ async fn fetch_detail(pool: &SqlitePool, id: &str) -> Result<SaleDetailResponse,
     .fetch_all(pool)
     .await
     .map_err(map_database_error)?;
+    let h1_register_entries = sqlx::query_as::<_, SaleH1EntrySummary>(
+        "SELECT entry.id,entry.reference,entry.status,line.line_number \
+         FROM prescription_h1_register_entries entry \
+         JOIN sale_lines line ON line.id=entry.sale_line_id \
+         WHERE entry.sale_document_id=? ORDER BY entry.reference_value",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_database_error)?;
     Ok(SaleDetailResponse {
         sale,
         lines,
         tenders,
         supply,
         prescription_records,
+        h1_register_entries,
     })
 }
 
@@ -7342,11 +7822,11 @@ mod tests {
             "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
              batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
              tax_treatment_kind,taxable_value_paise,line_total_paise,regulatory_snapshot_version,\
-             regulatory_schemes_snapshot,manufacturer_company_id,manufacturer_name,created_at_utc,\
-             updated_at_utc) \
+             regulatory_schemes_snapshot,regulatory_state_snapshot,manufacturer_company_id,\
+             manufacturer_name,created_at_utc,updated_at_utc) \
              SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,'exempt',0,0,\
-             regulatory_snapshot_version,regulatory_schemes_snapshot,manufacturer_company_id,\
-             manufacturer_name,created_at_utc,updated_at_utc \
+             regulatory_snapshot_version,regulatory_schemes_snapshot,regulatory_state_snapshot,\
+             manufacturer_company_id,manufacturer_name,created_at_utc,updated_at_utc \
              FROM sale_lines WHERE sale_document_id=? LIMIT 1",
         )
         .bind(Uuid::now_v7().to_string())
@@ -11201,7 +11681,8 @@ mod tests {
         // regulatory gate would refuse first and this test would prove nothing about its own guard.
         sqlx::query(
             "UPDATE sale_lines SET tax_treatment_kind=CASE WHEN product_id=? THEN 'exempt' \
-             ELSE 'taxable' END,regulatory_snapshot_version=1,regulatory_schemes_snapshot=? \
+             ELSE 'taxable' END,regulatory_snapshot_version=1,regulatory_schemes_snapshot=?,\
+             regulatory_state_snapshot='{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}' \
              WHERE sale_document_id=?",
         )
         .bind(&product)
@@ -11618,8 +12099,9 @@ mod tests {
         let (status, refused) =
             post_sale_request(&f, &later_id, 2, &Uuid::now_v7().to_string(), 8960).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        // Since Phase 1M-B an H1 line is refused with its own typed code.
-        assert_eq!(refused["code"], "schedule_h1_register_not_available");
+        // Since Phase 1M-C an H1 line whose NDPS purview nobody recorded (as here) is refused as an
+        // unsupported NDPS-intersection workflow, with its own typed code.
+        assert_eq!(refused["code"], "schedule_h1_ndps_workflow_not_available");
     }
 
     /// 8. A finding whose period has closed no longer governs, and the product falls back to
@@ -11974,8 +12456,9 @@ mod tests {
         let smuggled = sqlx::query(
             "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
              batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
-             created_at_utc,updated_at_utc) \
-             SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,created_at_utc,\
+             regulatory_state_snapshot,created_at_utc,updated_at_utc) \
+             SELECT ?,?,2,product_id,product_pack_id,batch_id,'pack',1,10,0,\
+             '{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}',created_at_utc,\
              updated_at_utc FROM sale_lines WHERE sale_document_id=? LIMIT 1",
         )
         .bind(Uuid::now_v7().to_string())
@@ -12043,18 +12526,22 @@ mod tests {
     }
 
     /// 22. Each of Schedule H, H1 and X refuses on its own, naming itself. Since Phase 1M-B a
-    /// Schedule H line without its prescription is refused for exactly that, while H1 and X stay
-    /// refused because their own workflows do not exist yet.
+    /// Schedule H line without its prescription is refused for exactly that; since Phase 1M-C so is
+    /// a Schedule H1 line established outside NDPS purview; X stays refused because its own
+    /// workflow does not exist yet.
     #[tokio::test]
     async fn every_prescription_schedule_refuses_until_its_workflow_exists() {
         for (scheme, code) in [
             ("schedule_h", "prescription_requirements_incomplete"),
-            ("schedule_h1", "schedule_h1_register_not_available"),
+            ("schedule_h1", "prescription_requirements_incomplete"),
             ("schedule_x", "schedule_x_workflow_not_available"),
         ] {
             let f = fixture().await;
             make_medicine(&f, &f.product_id).await;
             clear_every_schedule(&f, "2020-01-01").await;
+            let (status, body) =
+                classify_scheme(&f, "ndps_purview", false, "2020-01-01", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
             // Since Phase 1M-B a Schedule H supply also needs its rule 65(3) basis; with it in place
             // the refusal below is for what this test is about.
             record_basis(&f, &f.product_id, Some("prescription_register")).await;
@@ -12808,6 +13295,10 @@ mod tests {
         .await
         .unwrap();
         clear_every_schedule(&f, "2020-01-01").await;
+        // NDPS established not to apply, so what is judged below is the H1 date question alone.
+        let (status, body) = classify_scheme(&f, "ndps_purview", false, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        record_basis(&f, &f.product_id, Some("prescription_register")).await;
         close_scheme(&f, "schedule_h1", &commenced).await;
         let (status, body) = classify_scheme(&f, "schedule_h1", true, &commenced, None).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -12838,13 +13329,20 @@ mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        // Since Phase 1M-C the stricter of the two days makes it an H1 line needing its
+        // prescription — and its working entry could not truthfully record the business date.
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "prescription_required");
         assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_h1");
 
         let (status, refused) =
             post_sale_request(&f, &id, 2, &Uuid::now_v7().to_string(), 8960).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        assert_eq!(refused["code"], "schedule_h1_register_not_available");
+        assert_eq!(refused["code"], "prescription_requirements_incomplete");
+        assert!(
+            prescription_issue_codes(&refused)
+                .contains(&"lines.1.schedule_h1_commenced_after_business_date".to_owned()),
+            "{refused}"
+        );
         assert_eq!(
             balance(&f, &f.batch_id).await,
             100,
@@ -13191,6 +13689,26 @@ mod tests {
                 "POST",
                 &format!("/api/v1/prescription-supply-records/{record}/confirm"),
                 json!({ "manualSignatureConfirmed": true, "serialWrittenOnPrescription": true }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        // Phase 1M-C: the H1 working entries, once their hard copy is placed in the separate
+        // register and authenticated by the registered pharmacist.
+        let h1_prepared: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_h1_register_entries \
+             WHERE sale_document_id=? AND status='prepared'",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        if h1_prepared > 0 {
+            let (status, body) = request(
+                f.pool.clone(),
+                "POST",
+                &format!("/api/v1/sales/{id}/h1-register/confirm"),
+                json!({ "hardCopyPlacedInRegister": true, "pharmacistAuthenticatedHardCopy": true }),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -13770,7 +14288,9 @@ mod tests {
 
     // --- Schedules still refused -------------------------------------------------------------
 
-    /// B-21. Schedule H1 is refused with its own typed error however complete the prescription is.
+    /// B-21, revised in Phase 1M-C (C-04/C-05/C-64). A Schedule H1 line whose NDPS purview nobody has
+    /// recorded is refused with its own typed error however complete the prescription is: an
+    /// unsupported NDPS-intersection workflow, not a requirement of rule 65.
     #[tokio::test]
     async fn b21_schedule_h1_is_refused_even_with_a_complete_prescription() {
         let f = fixture().await;
@@ -13779,11 +14299,11 @@ mod tests {
         let professional = pharmacist(&f).await;
         let (_, item) = simple_prescription(&f, 20).await;
         let id = prepared_sale(&f, &item, &professional, 1).await;
-        // The quote names the H1 refusal and reports the linked prescription without calling it
-        // "a link nobody needs": an H1 drug does need one, and still cannot be sold here.
+        // The quote names the NDPS-intersection refusal and reports the linked prescription without
+        // calling it "a link nobody needs": an H1 drug does need one, and still cannot be sold here.
         let quote = quote_of(&f, &id).await;
         assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
-        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_h1");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "ndps_purview");
         assert_eq!(quote["lines"][0]["prescription"]["issue"], Value::Null);
         assert_eq!(
             quote["lines"][0]["prescription"]["prescriptionReference"],
@@ -13791,10 +14311,19 @@ mod tests {
         );
         let (status, refused) = post_as_quoted(&f, &id).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        assert_eq!(refused["code"], "schedule_h1_register_not_available");
+        assert_eq!(refused["code"], "schedule_h1_ndps_workflow_not_available");
         assert_eq!(
             refused["message"],
-            "Schedule H1 dispensing requires the H1 register workflow, which is not yet available."
+            "This Schedule H1 drug is, or may be, within the NDPS Act, and AUSHADHARTH does not support that combined workflow."
+        );
+        let text = refused.to_string().to_lowercase();
+        assert!(
+            text.contains("unsupported ndps-intersection workflow"),
+            "{refused}"
+        );
+        assert!(
+            !text.contains("prohibit") && !text.contains("banned"),
+            "{refused}"
         );
         assert_eq!(issue_fields(&refused), vec!["lines.1".to_owned()]);
         assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
@@ -13889,7 +14418,8 @@ mod tests {
         add_line(&f, &id, &h1, &pack, &batch, 1, 8000).await;
         let (status, refused) = post_as_quoted(&f, &id).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        assert_eq!(refused["code"], "schedule_h1_register_not_available");
+        // NDPS purview unrecorded on the H1 line: an unsupported NDPS-intersection workflow.
+        assert_eq!(refused["code"], "schedule_h1_ndps_workflow_not_available");
         assert_eq!(issue_fields(&refused), vec!["lines.2".to_owned()]);
         assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
         assert_eq!(balance(&f, &batch).await, 100);
@@ -14211,8 +14741,18 @@ mod tests {
         assert_eq!(dispensing_count(&f).await, 1);
     }
 
-    /// Flips a draft to posted by hand, with every posting column filled, as a forger would.
+    /// Flips a draft to posted by hand, with every posting column filled, as a forger would. Since
+    /// Phase 1M-C that includes each line's State snapshot where the test did not write its own.
     async fn flip_to_posted(f: &Fixture, id: &str) -> String {
+        sqlx::query(
+            "UPDATE sale_lines SET regulatory_state_snapshot=\
+             '{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}' \
+             WHERE sale_document_id=? AND regulatory_state_snapshot IS NULL",
+        )
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE sale_documents SET status='posted',document_number='INV/2627/000077',             sequence_value=77,series_code='INV',financial_year='2026-27',             tax_treatment='intra_state',posted_by_user_id=created_by_user_id,             posted_at_utc=updated_at_utc,posting_idempotency_key=? WHERE id=?",
         )
@@ -16009,7 +16549,7 @@ mod tests {
         for (inside, code) in [
             (
                 &["schedule_h", "schedule_h1"][..],
-                "schedule_h1_register_not_available",
+                "schedule_h1_ndps_workflow_not_available",
             ),
             (&["schedule_x"][..], "schedule_x_workflow_not_available"),
             (
@@ -16329,5 +16869,2170 @@ mod tests {
             posted["prescriptionRecords"][1]["serialNumber"],
             "PR-000002"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1M-C — the Schedule H1 working record and the Punjab unsupported-workflow boundary
+    //
+    // Two layers for every H1 supply: the 1M-B rule 65(3)(1) entry, and the separate H1 working
+    // entry whose hard copy is placed in the pharmacy's physical H1 register and authenticated by
+    // the registered pharmacist (the 48th DCC recommendation, followed conservatively). Each proof
+    // names the C-numbers of the approved test plan it covers.
+    // -----------------------------------------------------------------------------------------
+
+    #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+    struct H1State {
+        id: String,
+        reference: String,
+        status: String,
+        sale_line_id: String,
+        supply_record_id: String,
+        patient_name: String,
+        prescriber_name: String,
+        prescriber_address: String,
+        drug_name: String,
+        quantity_atoms: i64,
+        hard_copy_placed_in_register: i64,
+        pharmacist_authenticated_hard_copy: i64,
+        confirmed_by_user_id: Option<String>,
+        dispensing_id: Option<String>,
+        void_reason: Option<String>,
+    }
+
+    async fn h1_entries(f: &Fixture, sale: &str) -> Vec<H1State> {
+        sqlx::query_as(
+            "SELECT id,reference,status,sale_line_id,supply_record_id,patient_name,prescriber_name,\
+             prescriber_address,drug_name,quantity_atoms,hard_copy_placed_in_register,\
+             pharmacist_authenticated_hard_copy,confirmed_by_user_id,dispensing_id,void_reason \
+             FROM prescription_h1_register_entries WHERE sale_document_id=? ORDER BY reference_value",
+        )
+        .bind(sale)
+        .fetch_all(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Records one finding straight into the classification table, as `schedule_product` does.
+    async fn add_finding(f: &Fixture, product_id: &str, scheme: &str, applies: bool, from: &str) {
+        sqlx::query(
+            "INSERT INTO product_regulatory_classifications (id,product_id,scheme,applies,\
+             effective_from,source_citation,determined_by_user_id,revision,status,\
+             created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,'Owner-recorded finding',?,1,'active',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(product_id)
+        .bind(scheme)
+        .bind(i64::from(applies))
+        .bind(from)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Schedule H1 alone (not Schedule H), NDPS purview established not to apply, the rule
+    /// 65(3)(1) basis recorded, and a registered pharmacist on record.
+    async fn h1_fixture() -> (Fixture, String) {
+        let f = fixture().await;
+        schedule_product(&f, &f.product_id, &["schedule_h1"]).await;
+        add_finding(&f, &f.product_id, "ndps_purview", false, "2020-01-01").await;
+        record_basis(&f, &f.product_id, Some("prescription_register")).await;
+        let professional = pharmacist(&f).await;
+        (f, professional)
+    }
+
+    async fn confirm_h1(
+        f: &Fixture,
+        sale: &str,
+        placed: bool,
+        authenticated: bool,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        request_as(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{sale}/h1-register/confirm"),
+            json!({
+                "hardCopyPlacedInRegister": placed,
+                "pharmacistAuthenticatedHardCopy": authenticated,
+            }),
+            Some(token),
+        )
+        .await
+    }
+
+    async fn confirm_records(f: &Fixture, sale: &str) {
+        for entry in entries(f, sale).await {
+            if entry.status == "prepared" {
+                let (status, body) = confirm_as(f, &entry.id, true, true, OWNER).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        }
+    }
+
+    async fn move_store_to(f: &Fixture, state_id: Option<&str>) {
+        sqlx::query("UPDATE store_addresses SET state_id=? WHERE store_id=?")
+            .bind(state_id)
+            .bind(&f.store_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn today_ist(f: &Fixture, offset_days: i64) -> String {
+        sqlx::query_scalar(&format!(
+            "SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes','{offset_days:+} days')"
+        ))
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    /// C-68, C-01, C-02, C-58, C-59, C-60, C-11, C-26, C-27. The supported ordinary H1 supply: an
+    /// H1-only product needs the prescription layer and the separate H1 layer; neither the
+    /// electronic working entry nor either physical act alone completes it; a cashier can neither
+    /// prepare nor confirm; a pharmacist confirms both acts; the cashier then posts; both layers
+    /// finalize with the Sale; stock, dispensing, number and tender are each written exactly once.
+    #[tokio::test]
+    async fn c68_a_supported_h1_supply_needs_both_layers_and_completes() {
+        let (f, professional) = h1_fixture().await;
+        let pharmacist_user = insert_session(&f.pool, "pharmacist", PHARMACIST_TOKEN).await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "prescription_required");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_h1");
+        assert_eq!(
+            quote["supply"]["issues"],
+            json!([
+                "prescription_record_not_prepared",
+                "schedule_h1_register_not_prepared"
+            ])
+        );
+
+        // A cashier cannot prepare either layer.
+        let (status, _) = prepare_as(&f, &id, CASHIER).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, prepared) = prepare_as(&f, &id, OWNER).await;
+        assert_eq!(status, StatusCode::OK, "{prepared}");
+        assert_eq!(prepared["status"], "draft");
+        assert_eq!(prepared["h1RegisterEntries"][0]["reference"], "AH1-000001");
+        assert_eq!(prepared["h1RegisterEntries"][0]["status"], "prepared");
+        assert_nothing_sold(&f, &id).await;
+
+        // The first layer confirmed alone is not enough: the electronic H1 entry is prepared but
+        // its physical acts are not confirmed.
+        confirm_records(&f, &id).await;
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["supply.schedule_h1_register_not_confirmed".to_owned()]
+        );
+        assert_nothing_sold(&f, &id).await;
+
+        // Neither physical act alone confirms; a cashier cannot confirm at all.
+        let (status, _) = confirm_h1(&f, &id, true, true, CASHIER).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, refused) = confirm_h1(&f, &id, true, false, OWNER).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(
+            refused["issues"][0]["field"],
+            "pharmacistAuthenticatedHardCopy"
+        );
+        let (status, refused) = confirm_h1(&f, &id, false, true, OWNER).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["issues"][0]["field"], "hardCopyPlacedInRegister");
+        assert_eq!(h1_entries(&f, &id).await[0].status, "prepared");
+
+        let (status, sheet) = confirm_h1(&f, &id, true, true, PHARMACIST_TOKEN).await;
+        assert_eq!(status, StatusCode::OK, "{sheet}");
+        assert_eq!(sheet["entries"][0]["status"], "confirmed");
+        assert_nothing_sold(&f, &id).await;
+
+        // The cashier posts the confirmed supply.
+        let revision = revision_of(&f, &id).await;
+        let (status, posted) = request_as(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/sales/{id}/post"),
+            json!({
+                "expectedRevision": revision,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "tenders": [{ "method": "cash", "amountPaise": 8960 }],
+            }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["prescriptionRecords"][0]["status"], "finalized");
+        assert_eq!(posted["h1RegisterEntries"][0]["status"], "finalized");
+        let entry = h1_entries(&f, &id).await.remove(0);
+        assert_eq!(
+            entry.confirmed_by_user_id.as_deref(),
+            Some(pharmacist_user.as_str())
+        );
+        let dispensing: String =
+            sqlx::query_scalar("SELECT id FROM prescription_dispensings WHERE sale_document_id=?")
+                .bind(&id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(entry.dispensing_id.as_deref(), Some(dispensing.as_str()));
+        assert_eq!(dispensing_count(&f).await, 1);
+        assert_eq!(balance(&f, &f.batch_id).await, 90);
+        assert_eq!(numbers_issued(&f).await, 1);
+        assert_eq!(tender_rows(&f, &id).await, 1);
+    }
+
+    /// C-07, C-08, C-09, C-10. The entry carries exactly the clause (h) particulars — the
+    /// prescriber's name and address, the patient's NAME (no patient address is stored), the
+    /// drug and the quantity — frozen from the prescription and the line. Its identifier is an
+    /// internal AUSHADHARTH Reference, never presented as a register serial. A blank prescriber
+    /// address cannot be recorded.
+    #[tokio::test]
+    async fn c07_the_entry_holds_exactly_the_clause_h_particulars() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_as(&f, &id, OWNER).await;
+        let entry = h1_entries(&f, &id).await.remove(0);
+        assert_eq!(entry.prescriber_name, "Dr. Anjali Rao");
+        assert_eq!(entry.prescriber_address, "Rao Clinic, FC Road, Pune 411005");
+        assert_eq!(entry.patient_name, PATIENT_NAME);
+        assert_eq!(entry.quantity_atoms, 10);
+        assert_eq!(entry.reference, "AH1-000001");
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('prescription_h1_register_entries')",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        for absent in [
+            "patient_address",
+            "subject_address",
+            "serial_number",
+            "page_number",
+        ] {
+            assert!(!columns.iter().any(|column| column == absent), "{absent}");
+        }
+        let (status, sheet) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/h1-register"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sheet}");
+        let text = sheet.to_string();
+        assert!(
+            !text.contains(PATIENT_ADDRESS),
+            "the hard copy carries the patient's address"
+        );
+        assert!(!text.contains("registerSerial") && !text.contains("pageNumber"));
+        assert_eq!(sheet["entries"][0]["reference"], "AH1-000001");
+        // The database will not hold a blank prescriber address.
+        let error = sqlx::query(
+            "UPDATE prescription_h1_register_entries SET prescriber_address='' WHERE id=?",
+        )
+        .bind(&entry.id)
+        .execute(&f.pool)
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("CHECK") || error.contains("prescription_h1_register_entry_immutable"),
+            "{error}"
+        );
+    }
+
+    /// C-12, C-50, C-51, C-52. Direct SQL cannot forge an H1 supply: no entry without its rule
+    /// 65(3)(1) entry, no entry across Sales, no hand-finalized entry, no edited or deleted
+    /// particular, and no posting with the H1 entry left unfinalized even when every other layer
+    /// was completed by hand.
+    #[tokio::test]
+    async fn c50_direct_sql_cannot_forge_an_h1_supply() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        let other = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_as(&f, &id, OWNER).await;
+        let entry = h1_entries(&f, &id).await.remove(0);
+        let other_line = first_line_id(&f, &other).await;
+
+        // An entry whose line belongs to another Sale, or with no rule 65(3)(1) entry beside it.
+        for (sale, line, record) in [
+            (
+                id.as_str(),
+                other_line.as_str(),
+                entry.supply_record_id.as_str(),
+            ),
+            (
+                other.as_str(),
+                other_line.as_str(),
+                entry.supply_record_id.as_str(),
+            ),
+        ] {
+            let error = sqlx::query(
+                "INSERT INTO prescription_h1_register_entries (id,store_id,sale_document_id,\
+                 sale_line_id,supply_record_id,prescription_id,prescription_item_id,product_id,\
+                 reference_value,reference,date_of_supply,prescriber_name,prescriber_address,\
+                 patient_name,drug_name,quantity_atoms,supervising_professional_id,\
+                 supervising_professional_name,supervising_registration_number,\
+                 prepared_by_user_id,prepared_at_utc) \
+                 SELECT ?,store_id,?,?,?,prescription_id,prescription_item_id,product_id,2,\
+                 'AH1-000002',date_of_supply,prescriber_name,prescriber_address,patient_name,\
+                 drug_name,quantity_atoms,supervising_professional_id,\
+                 supervising_professional_name,supervising_registration_number,\
+                 prepared_by_user_id,prepared_at_utc FROM prescription_h1_register_entries WHERE id=?",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(sale)
+            .bind(line)
+            .bind(record)
+            .bind(&entry.id)
+            .execute(&f.pool)
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("prescription_h1_register_entry_incoherent"),
+                "{error}"
+            );
+        }
+
+        // Forged transitions and edits.
+        for statement in [
+            "UPDATE prescription_h1_register_entries SET status='finalized',\
+             finalized_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            "UPDATE prescription_h1_register_entries SET patient_name='Someone Else'",
+            "UPDATE prescription_h1_register_entries SET quantity_atoms=20",
+            "UPDATE prescription_h1_register_entries SET status='confirmed'",
+            "DELETE FROM prescription_h1_register_entries",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&f.pool).await.is_err(),
+                "{statement}"
+            );
+        }
+        // A cashier's id cannot be written in as the confirmer.
+        let cashier: String = sqlx::query_scalar("SELECT id FROM users WHERE role='cashier'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        let error = sqlx::query(
+            "UPDATE prescription_h1_register_entries SET status='confirmed',\
+             hard_copy_placed_in_register=1,pharmacist_authenticated_hard_copy=1,\
+             confirmed_by_user_id=?,confirmed_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+        )
+        .bind(&cashier)
+        .bind(&entry.id)
+        .execute(&f.pool)
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("prescription_h1_register_entry_immutable"),
+            "{error}"
+        );
+
+        // Every other layer completed by hand; the H1 entry confirmed but left unfinalized.
+        confirm_records(&f, &id).await;
+        confirm_h1(&f, &id, true, true, OWNER).await;
+        let line = first_line_id(&f, &id).await;
+        let (prescription, record): (String, String) = sqlx::query_as(
+            "SELECT prescription_id,supply_record_id FROM prescription_h1_register_entries WHERE id=?",
+        )
+        .bind(&entry.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        // Every snapshot the posting would freeze, written by hand from the prescription entry, so
+        // the 1M-B link and the State gate are satisfied and only the H1 guard is left to refuse.
+        sqlx::query(
+            "UPDATE sale_lines SET regulatory_snapshot_version=1,regulatory_schemes_snapshot=\
+             '{\"schedule_h\":\"does_not_apply\",\"schedule_h1\":\"applies\",\
+             \"schedule_x\":\"does_not_apply\",\"schedule_c\":\"does_not_apply\",\
+             \"schedule_c1\":\"does_not_apply\",\"ndps_purview\":\"does_not_apply\"}',\
+             regulatory_state_snapshot=\
+             '{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}',\
+             product_display_name=(SELECT drug_name FROM prescription_supply_record_lines \
+                 WHERE sale_line_id=sale_lines.id),\
+             manufacturer_name=(SELECT manufacturer_name FROM prescription_supply_record_lines \
+                 WHERE sale_line_id=sale_lines.id),\
+             manufacturer_company_id=(SELECT company_id FROM product_company_roles \
+                 WHERE product_id=sale_lines.product_id AND role='manufacturer' LIMIT 1),\
+             batch_number=(SELECT batch_number FROM prescription_supply_record_lines \
+                 WHERE sale_line_id=sale_lines.id),\
+             batch_expires_on=(SELECT batch_expires_on FROM prescription_supply_record_lines \
+                 WHERE sale_line_id=sale_lines.id),\
+             base_unit_label=(SELECT quantity_unit_label FROM prescription_supply_record_lines \
+                 WHERE sale_line_id=sale_lines.id) WHERE id=?",
+        )
+        .bind(&line)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let dispensing = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO prescription_dispensings (id,store_id,prescription_id,prescription_item_id,\
+             sale_document_id,sale_line_id,product_id,quantity_atoms,dispensed_on,\
+             supervising_professional_id,supervising_professional_name,\
+             supervising_registration_number,endorsement_confirmed_by_user_id,\
+             endorsement_confirmed_at_utc,created_at_utc) VALUES (?,?,?,?,?,?,?,10,?,?,'Meera Iyer',\
+             'MH-PH-44821',?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&dispensing)
+        .bind(&f.store_id)
+        .bind(&prescription)
+        .bind(&item)
+        .bind(&id)
+        .bind(&line)
+        .bind(&f.product_id)
+        .bind(TODAY)
+        .bind(&professional)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE prescription_supply_record_lines SET dispensing_id=? WHERE record_id=?",
+        )
+        .bind(&dispensing)
+        .bind(&record)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE prescription_supply_records SET status='finalized',\
+             finalized_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+        )
+        .bind(&record)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let error = flip_to_posted(&f, &id).await;
+        assert!(
+            error.contains("prescription_h1_register_entry_missing"),
+            "{error}"
+        );
+        assert_eq!(detail(&f, &id).await["status"], "draft");
+    }
+
+    /// C-16, C-17, C-18, C-21. The prepared entry sells nothing; posting waits for BOTH layers, in
+    /// either order; voiding the rule 65(3)(1) entry voids the H1 entry beside it, keeping both
+    /// with the reason, and the next preparation takes the next reference; a finalized entry
+    /// can never be voided.
+    #[tokio::test]
+    async fn c18_voiding_keeps_both_layers_and_never_reuses_a_reference() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_as(&f, &id, OWNER).await;
+        assert_nothing_sold(&f, &id).await;
+        // H1 confirmed first, the prescription entry not: still refused.
+        let (status, _) = confirm_h1(&f, &id, true, true, OWNER).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["supply.prescription_record_not_confirmed".to_owned()]
+        );
+        let record = entries(&f, &id).await.remove(0).id;
+        let (status, voided) = void_as(&f, &record, "customer left before paying", OWNER).await;
+        assert_eq!(status, StatusCode::OK, "{voided}");
+        let voided = h1_entries(&f, &id).await.remove(0);
+        assert_eq!(voided.status, "void");
+        assert_eq!(
+            voided.void_reason.as_deref(),
+            Some("customer left before paying")
+        );
+        // The H1 entry records that its hard copy was placed: the confirmation stays with it.
+        assert_eq!(voided.hard_copy_placed_in_register, 1);
+
+        prepare_as(&f, &id, OWNER).await;
+        let references: Vec<String> = h1_entries(&f, &id)
+            .await
+            .into_iter()
+            .map(|entry| format!("{}:{}", entry.reference, entry.status))
+            .collect();
+        assert_eq!(references, vec!["AH1-000001:void", "AH1-000002:prepared"]);
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        for statement in [
+            "UPDATE prescription_h1_register_entries SET status='void',\
+             voided_by_user_id=confirmed_by_user_id,\
+             voided_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),void_reason='too late' \
+             WHERE status='finalized'",
+            "DELETE FROM prescription_h1_register_entries WHERE status='void'",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&f.pool).await.is_err(),
+                "{statement}"
+            );
+        }
+    }
+
+    /// C-19, C-20. A posting that fails after both layers were confirmed leaves both confirmed —
+    /// the hard copy may already be in the register — and nothing sold; the retry finalizes both.
+    #[tokio::test]
+    async fn c19_a_failed_posting_keeps_both_layers_confirmed_and_the_retry_finalizes() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        assert_eq!(h1_entries(&f, &id).await[0].status, "confirmed");
+        sqlx::query(
+            "CREATE TRIGGER test_fail_tender BEFORE INSERT ON sale_tenders \
+             BEGIN SELECT RAISE(ABORT, 'injected_failure'); END",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, failed) = post_confirmed(&f, &id).await;
+        assert_ne!(status, StatusCode::OK, "{failed}");
+        assert_nothing_sold(&f, &id).await;
+        let entry = h1_entries(&f, &id).await.remove(0);
+        assert_eq!(
+            (entry.status.as_str(), entry.dispensing_id.as_deref()),
+            ("confirmed", None)
+        );
+        assert_eq!(entries(&f, &id).await[0].status, "confirmed");
+        sqlx::query("DROP TRIGGER test_fail_tender")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["h1RegisterEntries"][0]["reference"], "AH1-000001");
+        assert_eq!(posted["h1RegisterEntries"][0]["status"], "finalized");
+    }
+
+    /// C-22, C-23, C-24, C-25. The patient never leaves the dispensing roles: the quote, the Sale
+    /// detail, refusals and audit payloads carry no patient or prescriber particular; the register
+    /// is read by date and reference only; a cashier cannot read the register or a Sale's hard copy
+    /// or append to it, directly by API.
+    #[tokio::test]
+    async fn c25_the_register_stays_with_the_dispensing_roles() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let entry = h1_entries(&f, &id).await.remove(0);
+        let quote = quote_of(&f, &id).await;
+        let sale_detail = detail(&f, &id).await;
+        let audit: Vec<String> = sqlx::query_scalar(
+            "SELECT change_payload FROM master_change_events \
+             WHERE entity_type IN ('prescription_h1_register_entry','prescription_h1_register_annotation')",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert!(!audit.is_empty());
+        let mut texts = vec![
+            quote.to_string(),
+            sale_detail.to_string(),
+            posted.to_string(),
+        ];
+        texts.extend(audit);
+        for text in texts {
+            for private in [
+                PATIENT_NAME,
+                PATIENT_ADDRESS,
+                "Dr. Anjali Rao",
+                "Rao Clinic",
+            ] {
+                assert!(!text.contains(private), "{private} leaked: {text}");
+            }
+        }
+        for (method, uri, body) in [
+            (
+                "GET",
+                "/api/v1/h1-register?from=2026-06-01&to=2026-06-30".to_owned(),
+                Value::Null,
+            ),
+            (
+                "GET",
+                format!("/api/v1/sales/{id}/h1-register"),
+                Value::Null,
+            ),
+            (
+                "POST",
+                format!("/api/v1/h1-register/{}/annotations", entry.id),
+                json!({ "note": "cashier note" }),
+            ),
+            (
+                "POST",
+                format!("/api/v1/sales/{id}/h1-register/confirm"),
+                json!({ "hardCopyPlacedInRegister": true, "pharmacistAuthenticatedHardCopy": true }),
+            ),
+        ] {
+            let (status, denied) =
+                request_as(f.pool.clone(), method, &uri, body, Some(CASHIER)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {denied}");
+            assert!(!denied.to_string().contains(PATIENT_NAME));
+        }
+        // The dispensing roles read it by date.
+        let (status, register) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/h1-register?from={TODAY}&to={TODAY}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{register}");
+        assert_eq!(register["entries"][0]["patientName"], PATIENT_NAME);
+        assert_eq!(
+            register["store"]["legalName"],
+            "Care Pharmacy Private Limited"
+        );
+        let (status, empty) = request(
+            f.pool.clone(),
+            "GET",
+            "/api/v1/h1-register?from=2026-07-01&to=2026-07-31",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty["entries"], json!([]));
+    }
+
+    /// C-28. A login's role is not a registration: the H1 entry names a registered pharmacist from
+    /// the professional record, and the database refuses one who is not.
+    #[tokio::test]
+    async fn c28_the_responsible_pharmacist_is_a_registration_not_a_login() {
+        let (f, professional) = h1_fixture().await;
+        let competent = add_professional(
+            &f,
+            json!({ "fullName": "Store Manager", "capacity": "competent_person" }),
+        )
+        .await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &competent, 1).await;
+        let (status, refused) = prepare_as(&f, &id, OWNER).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["supply.supervising_pharmacist_invalid".to_owned()]
+        );
+        assert!(h1_entries(&f, &id).await.is_empty());
+        // Archived after preparation, before confirmation: the database refuses the confirmation.
+        let good = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_as(&f, &good, OWNER).await;
+        sqlx::query(
+            "UPDATE store_professionals SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='left' WHERE id=?",
+        )
+        .bind(&professional)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, refused) = confirm_h1(&f, &good, true, true, OWNER).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "prescription_record_state_conflict");
+        assert_eq!(h1_entries(&f, &good).await[0].status, "prepared");
+    }
+
+    /// C-29, C-49, C-46, C-47, C-48. After supply the entry never changes. A return is linked
+    /// through the dispensing reversal and shown beside it; the occasion is not given back; a
+    /// dispensing user may append a note, which is itself append-only; a cashier may not.
+    #[tokio::test]
+    async fn c46_returns_and_notes_never_rewrite_the_entry() {
+        let (f, professional) = h1_fixture().await;
+        let (prescription, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 2).await;
+        prepare_and_confirm(&f, &id).await;
+        let (status, _) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        let before = h1_entries(&f, &id).await;
+        // Not before posting, and not by a cashier.
+        let (status, noted) = request_as(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/h1-register/{}/annotations", before[0].id),
+            json!({ "note": "Pharmacist initials clarified on the pasted copy." }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{noted}");
+        let (status, noted) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/h1-register/{}/annotations", before[0].id),
+            json!({ "note": "Pharmacist initials clarified on the pasted copy." }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{noted}");
+        for statement in [
+            "UPDATE prescription_h1_register_annotations SET note='rewritten'",
+            "DELETE FROM prescription_h1_register_annotations",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&f.pool).await.is_err(),
+                "{statement}"
+            );
+        }
+
+        let (status, returned) = return_first_line(&f, &id, 1).await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(h1_entries(&f, &id).await, before);
+        let (status, register) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/h1-register?from={TODAY}&to={TODAY}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{register}");
+        assert_eq!(register["entries"][0]["quantityAtoms"], 20);
+        assert_eq!(register["entries"][0]["returnedAtoms"], 10);
+        assert_eq!(register["annotations"][0]["entryId"], before[0].id);
+        // Beyond what remains returnable is refused, and the entry is still untouched.
+        let sale_line = first_line_id(&f, &id).await;
+        let (status, draft) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/returns",
+            json!({ "returnKind": "sales_return", "originalDocumentId": id, "businessDate": TODAY }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{draft}");
+        let return_id = draft["id"].as_str().unwrap().to_owned();
+        let (status, refused) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/lines"),
+            json!({
+                "expectedRevision": 1,
+                "originalLineId": sale_line,
+                "quantity": 2,
+                "disposition": "quarantined",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "over_return");
+        assert_eq!(h1_entries(&f, &id).await, before);
+        let (_, rx) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/prescriptions/{prescription}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(rx["occasionsUsed"], 1, "a return gave back the occasion");
+    }
+
+    /// Records every central finding for `product_id` as an owner would, with Schedule H1 applying
+    /// from `from` (and not applying before it), and NDPS purview established not to apply.
+    async fn h1_from(f: &Fixture, product_id: &str, from: &str) {
+        make_medicine(f, product_id).await;
+        for scheme in [
+            "schedule_h",
+            "schedule_x",
+            "schedule_c",
+            "schedule_c1",
+            "ndps_purview",
+        ] {
+            add_finding(f, product_id, scheme, false, "2020-01-01").await;
+        }
+        sqlx::query(
+            "INSERT INTO product_regulatory_classifications (id,product_id,scheme,applies,\
+             effective_from,effective_to,source_citation,determined_by_user_id,revision,status,\
+             created_at_utc,updated_at_utc) VALUES (?,?,'schedule_h1',0,'2020-01-01',?,\
+             'Owner-recorded finding',?,1,'active',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(product_id)
+        .bind(from)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        add_finding(f, product_id, "schedule_h1", true, from).await;
+    }
+
+    /// C-30, C-31, C-32, C-34, C-36. Effective dating, from owner-recorded findings only: a
+    /// finding in force from the Sale's own date reaches it (both layers are required and
+    /// complete); a finding already stored but commencing later does not (an ordinary sale, no
+    /// entry); and a posted Sale keeps what it froze when the findings later change. (C-32, after
+    /// commencement, is every other H1 proof here: their findings run from 2020.)
+    #[tokio::test]
+    async fn c30_h1_follows_the_recorded_findings_dates() {
+        let f = fixture().await;
+        let today = today_ist(&f, 0).await;
+        let later = today_ist(&f, 10).await;
+        h1_from(&f, &f.product_id, &today).await;
+        record_basis(&f, &f.product_id, Some("prescription_register")).await;
+        let professional = pharmacist(&f).await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale_on(&f, &item, &professional, 1, &today).await;
+        assert_eq!(
+            quote_of(&f, &id).await["lines"][0]["regulatoryGateScheme"],
+            "schedule_h1"
+        );
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["h1RegisterEntries"][0]["status"], "finalized");
+
+        let (future, pack, batch) = second_product(&f, "Future H1 Tablet").await;
+        h1_from(&f, &future, &later).await;
+        let (status, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/sales",
+            json!({ "customerPartyId": Value::Null, "businessDate": today }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let ordinary = created["id"].as_str().unwrap().to_owned();
+        add_line(&f, &ordinary, &future, &pack, &batch, 1, 8000).await;
+        assert_eq!(
+            quote_of(&f, &ordinary).await["lines"][0]["regulatoryGate"],
+            "clear"
+        );
+        let (status, posted) = post_confirmed(&f, &ordinary).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert!(h1_entries(&f, &ordinary).await.is_empty());
+
+        // The findings change afterwards; neither posted Sale is reinterpreted.
+        sqlx::query("UPDATE product_regulatory_classifications SET applies=1 WHERE product_id=?")
+            .bind(&future)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let snapshot: String = sqlx::query_scalar(
+            "SELECT regulatory_schemes_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&ordinary)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert!(
+            snapshot.contains("\"schedule_h1\":\"does_not_apply\""),
+            "{snapshot}"
+        );
+        assert_eq!(h1_entries(&f, &id).await[0].status, "finalized");
+    }
+
+    /// C-35. A reclassification after preparation is caught at posting: the working entry no
+    /// longer matches a Schedule H1 line, and nothing is sold.
+    #[tokio::test]
+    async fn c35_a_reclassification_after_preparation_is_caught_at_posting() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        // The owner records, as of 2020, that NDPS purview does apply after all.
+        sqlx::query(
+            "UPDATE product_regulatory_classifications SET applies=1 \
+             WHERE product_id=? AND scheme='ndps_purview'",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "schedule_h1_ndps_workflow_not_available");
+        assert_nothing_sold(&f, &id).await;
+        assert_eq!(h1_entries(&f, &id).await[0].status, "confirmed");
+    }
+
+    /// C-37, C-38, C-39, C-40. Races, resolved by the posting lock: two counters for the same
+    /// remaining quantity post once; the same Sale prepared twice at once yields one live entry
+    /// per line; two Sales prepared at once never share a reference.
+    #[tokio::test]
+    async fn c37_concurrent_h1_supplies_never_double_dispense_or_share_a_reference() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 10).await;
+        let left = prepared_sale(&f, &item, &professional, 1).await;
+        let right = prepared_sale(&f, &item, &professional, 1).await;
+        let (one, two) = tokio::join!(prepare_as(&f, &left, OWNER), prepare_as(&f, &right, OWNER));
+        for (status, body) in [&one, &two] {
+            assert!(
+                *status == StatusCode::OK || body["code"] == "service_busy",
+                "{body}"
+            );
+        }
+        let (a, b) = tokio::join!(prepare_as(&f, &left, OWNER), prepare_as(&f, &left, OWNER));
+        for (status, body) in [&a, &b] {
+            assert!(
+                *status == StatusCode::OK
+                    || body["code"] == "service_busy"
+                    || body["code"] == "revision_conflict",
+                "{body}"
+            );
+        }
+        let references: Vec<i64> = sqlx::query_scalar(
+            "SELECT reference_value FROM prescription_h1_register_entries ORDER BY reference_value",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        let expected: Vec<i64> = (1..=references.len() as i64).collect();
+        assert_eq!(
+            references, expected,
+            "references must be distinct and consecutive"
+        );
+        for sale in [&left, &right] {
+            let live = h1_entries(&f, sale)
+                .await
+                .into_iter()
+                .filter(|entry| entry.status != "void")
+                .count();
+            assert!(live <= 1, "one line holds two live entries");
+        }
+        // Both prepared and confirmed; the prescription covers one supply only.
+        for sale in [&left, &right] {
+            if h1_entries(&f, sale).await.is_empty() {
+                prepare_as(&f, sale, OWNER).await;
+            }
+            prepare_and_confirm(&f, sale).await;
+        }
+        let (first, second) = tokio::join!(post_confirmed(&f, &left), post_confirmed(&f, &right));
+        let posted = [&first, &second]
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count();
+        assert_eq!(posted, 1, "{first:?} {second:?}");
+        assert_eq!(dispensing_count(&f).await, 1);
+        let finalized: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_h1_register_entries WHERE status='finalized'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(finalized, 1);
+    }
+
+    /// C-41, C-42, C-43, C-44, C-45. Changes racing, or landing between confirmation and posting,
+    /// yield one coherent answer: a void racing the posting either wins (nothing sold) or loses
+    /// (posted, void refused) — never both; an election withdrawn, a pharmacist archived, or the
+    /// prescription archived stops the posting with both layers left confirmed.
+    #[tokio::test]
+    async fn c45_changes_between_confirmation_and_posting_yield_one_answer() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        let record = entries(&f, &id).await.remove(0).id;
+        let (void, post) =
+            tokio::join!(void_as(&f, &record, "race", OWNER), post_confirmed(&f, &id));
+        let entry = h1_entries(&f, &id).await.remove(0);
+        match (void.0, post.0) {
+            (StatusCode::OK, status) => {
+                assert_ne!(status, StatusCode::OK, "{post:?}");
+                assert_eq!(entry.status, "void");
+                assert_nothing_sold(&f, &id).await;
+            }
+            (_, StatusCode::OK) => assert_eq!(entry.status, "finalized"),
+            other => panic!("{other:?}: {void:?} {post:?}"),
+        }
+
+        for change in ["election", "pharmacist", "prescription"] {
+            let (f, professional) = h1_fixture().await;
+            let (prescription, item) = simple_prescription(&f, 20).await;
+            let id = prepared_sale(&f, &item, &professional, 1).await;
+            prepare_and_confirm(&f, &id).await;
+            let (statement, bound) = match change {
+                "election" => (
+                    "UPDATE store_record_elections SET status='archived',\
+                     archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='x' \
+                     WHERE id<>?",
+                    String::new(),
+                ),
+                "pharmacist" => (
+                    "UPDATE store_professionals SET status='archived',\
+                     archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='x' \
+                     WHERE id=?",
+                    professional.clone(),
+                ),
+                _ => (
+                    "UPDATE prescriptions SET status='archived',\
+                     archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='x' \
+                     WHERE id=?",
+                    prescription.clone(),
+                ),
+            };
+            sqlx::query(statement)
+                .bind(&bound)
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            let (status, refused) = post_confirmed(&f, &id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{change}: {refused}");
+            assert_nothing_sold(&f, &id).await;
+            assert_eq!(h1_entries(&f, &id).await[0].status, "confirmed", "{change}");
+        }
+    }
+
+    /// C-13, C-14, C-15. The memo-book election still needs the separate H1 entry; the prescription
+    /// layer still refuses a substitute or an unauthorised repeat for an H1 drug.
+    #[tokio::test]
+    async fn c13_the_h1_layer_is_separate_from_whichever_book_was_elected() {
+        let f = fixture().await;
+        schedule_product(&f, &f.product_id, &["schedule_h1"]).await;
+        add_finding(&f, &f.product_id, "ndps_purview", false, "2020-01-01").await;
+        record_basis(&f, &f.product_id, Some("cash_or_credit_memo_book")).await;
+        let professional = pharmacist(&f).await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        let revision = revision_of(&f, &id).await;
+        request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/sales/{id}/supply"),
+            json!({
+                "expectedRevision": revision,
+                "supervisingProfessionalId": professional,
+                "prescriptionEndorsementConfirmed": true,
+                "prescriptionOriginalContainerConfirmed": true,
+            }),
+        )
+        .await;
+        let (status, prepared) = prepare_as(&f, &id, OWNER).await;
+        assert_eq!(status, StatusCode::OK, "{prepared}");
+        assert_eq!(
+            prepared["prescriptionRecords"][0]["serialNumber"],
+            "PM-000001"
+        );
+        assert_eq!(prepared["h1RegisterEntries"][0]["reference"], "AH1-000001");
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+
+        // A once-only prescription is not dispensed again, and another product cannot stand in.
+        let again = prepared_sale(&f, &item, &professional, 1).await;
+        let (status, refused) = post_as_quoted(&f, &again).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(
+            prescription_issue_codes(&refused)
+                .contains(&"lines.1.prescription_repeat_not_authorised".to_owned()),
+            "{refused}"
+        );
+        let (other, pack, batch) = second_product(&f, "Cefixime 200").await;
+        schedule_product(&f, &other, &["schedule_h1"]).await;
+        add_finding(&f, &other, "ndps_purview", false, "2020-01-01").await;
+        manufacturer_for(&f, &other).await;
+        let substitute = open_sale(&f, draft_body(None)).await;
+        let line = add_line(&f, &substitute, &other, &pack, &batch, 1, 8000).await;
+        let (_, fresh) = simple_prescription(&f, 20).await;
+        // Rule 65(11A): the link itself is refused, naming the substitution.
+        let (status, body) = link_line(&f, &line, &substitute, Some(&fresh), OWNER).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            prescription_issue_codes(&body),
+            vec!["supply.prescription_substitution_not_permitted".to_owned()]
+        );
+        let quote = quote_of(&f, &substitute).await;
+        assert_eq!(
+            quote["lines"][0]["prescription"]["issue"],
+            "prescription_missing"
+        );
+    }
+
+    /// C-56, C-65. A veterinary Schedule H1 supply is an unresolved veterinary-H1 workflow: refused
+    /// at preparation and at posting, with no entry made — and not described as prohibited.
+    #[tokio::test]
+    async fn c65_a_veterinary_h1_supply_is_an_unresolved_workflow() {
+        let (f, professional) = h1_fixture().await;
+        let created = enter_prescription(
+            &f,
+            prescription_body(
+                &f.product_id,
+                20,
+                json!({ "subjectKind": "animal", "subjectName": "Owner of the dog" }),
+            ),
+        )
+        .await;
+        let item = created["items"][0]["id"].as_str().unwrap().to_owned();
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(
+            quote["lines"][0]["prescription"]["issue"],
+            "schedule_h1_veterinary_workflow_unresolved"
+        );
+        let (status, refused) = prepare_as(&f, &id, OWNER).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["lines.1.schedule_h1_veterinary_workflow_unresolved".to_owned()]
+        );
+        let text = refused.to_string().to_lowercase();
+        assert!(text.contains("unresolved"), "{refused}");
+        assert!(!text.contains("prohibit"), "{refused}");
+        assert!(h1_entries(&f, &id).await.is_empty());
+        assert_eq!(entry_count(&f).await, 0);
+    }
+
+    /// C-03, C-06. An unknown H1 position, or H1 with Schedule X, C or C(1), is refused before any
+    /// entry exists.
+    #[tokio::test]
+    async fn c06_unknown_or_unsupported_h1_combinations_prepare_nothing() {
+        for (inside, unknown_h1, code) in [
+            (
+                &["schedule_h"][..],
+                true,
+                "regulatory_classification_unresolved",
+            ),
+            (
+                &["schedule_h1", "schedule_x"][..],
+                false,
+                "schedule_x_workflow_not_available",
+            ),
+            (
+                &["schedule_h1", "schedule_c"][..],
+                false,
+                "regulated_sale_workflow_not_available",
+            ),
+            (
+                &["schedule_h1", "schedule_c1"][..],
+                false,
+                "regulated_sale_workflow_not_available",
+            ),
+        ] {
+            let f = fixture().await;
+            schedule_product(&f, &f.product_id, inside).await;
+            add_finding(&f, &f.product_id, "ndps_purview", false, "2020-01-01").await;
+            if unknown_h1 {
+                sqlx::query(
+                    "DELETE FROM product_regulatory_classifications WHERE scheme='schedule_h1'",
+                )
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            }
+            record_basis(&f, &f.product_id, Some("prescription_register")).await;
+            let professional = pharmacist(&f).await;
+            let (_, item) = simple_prescription(&f, 20).await;
+            let id = prepared_sale(&f, &item, &professional, 1).await;
+            let (status, refused) = prepare_as(&f, &id, OWNER).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{inside:?}: {refused}");
+            assert_eq!(refused["code"], code, "{inside:?}");
+            let (status, refused) = post_confirmed(&f, &id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{inside:?}: {refused}");
+            assert_eq!(refused["code"], code, "{inside:?}");
+            assert!(h1_entries(&f, &id).await.is_empty(), "{inside:?}");
+        }
+    }
+
+    /// C-66, C-69, C-70, C-71, C-72. The Punjab boundary. At a store whose premises are in Punjab:
+    /// a medicine the owner recorded within the Punjab restriction is refused with the typed
+    /// unsupported-workflow error and neutral words; one with no Punjab finding fails closed; one
+    /// recorded outside it proceeds to the ordinary H1 workflow and completes. The same "applies"
+    /// finding is ignored at a store elsewhere. A general item is untouched.
+    #[tokio::test]
+    async fn c69_the_punjab_boundary_refuses_only_where_it_governs() {
+        let (f, professional) = h1_fixture().await;
+        move_store_to(&f, Some(PUNJAB)).await;
+        let (_, item) = simple_prescription(&f, 20).await;
+
+        // No Punjab finding: unresolved.
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "unresolved");
+        assert_eq!(
+            quote["lines"][0]["regulatoryGateScheme"],
+            "punjab_restricted_supply"
+        );
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "state_regulatory_position_unresolved");
+
+        // Recorded as within the restriction, through the owner's API: refused as unsupported.
+        let (status, body) =
+            classify_scheme(&f, "punjab_restricted_supply", true, "2021-03-25", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        assert_eq!(
+            quote["lines"][0]["regulatoryGateScheme"],
+            "punjab_restricted_supply"
+        );
+        for (status, refused) in [
+            prepare_as(&f, &id, OWNER).await,
+            post_confirmed(&f, &id).await,
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+            assert_eq!(
+                refused["code"],
+                "state_restricted_drug_workflow_not_available"
+            );
+            assert_eq!(
+                refused["message"],
+                "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support."
+            );
+            let text = refused.to_string().to_lowercase();
+            for word in ["banned", "prohibit", "illegal"] {
+                assert!(!text.contains(word), "{word}: {refused}");
+            }
+        }
+        assert!(h1_entries(&f, &id).await.is_empty());
+        assert_nothing_sold(&f, &id).await;
+
+        // The same finding at a store elsewhere is not a Punjab store's boundary.
+        move_store_to(&f, Some(MAHARASHTRA)).await;
+        assert_eq!(
+            quote_of(&f, &id).await["lines"][0]["regulatoryGate"],
+            "prescription_required"
+        );
+
+        // Back in Punjab, recorded outside the restriction: the ordinary H1 workflow completes.
+        move_store_to(&f, Some(PUNJAB)).await;
+        sqlx::query(
+            "UPDATE product_regulatory_classifications SET applies=0 \
+             WHERE product_id=? AND scheme='punjab_restricted_supply'",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["h1RegisterEntries"][0]["status"], "finalized");
+
+        // A general item in the Punjab store, with no finding of any kind, still sells.
+        let (general, pack, batch) = second_product(&f, "Cotton roll").await;
+        let ordinary = open_sale(&f, draft_body(None)).await;
+        add_line(&f, &ordinary, &general, &pack, &batch, 1, 8000).await;
+        let (status, posted) = post_confirmed(&f, &ordinary).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+    }
+
+    /// C-76, C-77, C-78. The posting re-judges the State boundary under its own lock: a Punjab
+    /// finding recorded after both layers were confirmed, or the store's premises moved into
+    /// Punjab, stops the posting with nothing sold. A posted line freezes the premises State and
+    /// the Punjab answer in their own column; the central version-1 snapshot is unchanged in shape.
+    #[tokio::test]
+    async fn c76_the_posting_rechecks_the_state_boundary_and_freezes_it_apart() {
+        for change in ["finding", "premises"] {
+            let (f, professional) = h1_fixture().await;
+            if change == "finding" {
+                move_store_to(&f, Some(PUNJAB)).await;
+                add_finding(
+                    &f,
+                    &f.product_id,
+                    "punjab_restricted_supply",
+                    false,
+                    "2021-03-25",
+                )
+                .await;
+            } else {
+                add_finding(
+                    &f,
+                    &f.product_id,
+                    "punjab_restricted_supply",
+                    true,
+                    "2021-03-25",
+                )
+                .await;
+            }
+            let (_, item) = simple_prescription(&f, 20).await;
+            let id = prepared_sale(&f, &item, &professional, 1).await;
+            prepare_and_confirm(&f, &id).await;
+            if change == "finding" {
+                sqlx::query(
+                    "UPDATE product_regulatory_classifications SET applies=1 \
+                     WHERE product_id=? AND scheme='punjab_restricted_supply'",
+                )
+                .bind(&f.product_id)
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            } else {
+                move_store_to(&f, Some(PUNJAB)).await;
+            }
+            let (status, refused) = post_confirmed(&f, &id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{change}: {refused}");
+            assert_eq!(
+                refused["code"], "state_restricted_drug_workflow_not_available",
+                "{change}"
+            );
+            assert_nothing_sold(&f, &id).await;
+        }
+
+        // What a posted Punjab line freezes.
+        let (f, professional) = h1_fixture().await;
+        move_store_to(&f, Some(PUNJAB)).await;
+        add_finding(
+            &f,
+            &f.product_id,
+            "punjab_restricted_supply",
+            false,
+            "2021-03-25",
+        )
+        .await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, schemes, state): (i64, String, String) = sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,\
+             regulatory_state_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 1);
+        assert!(!schemes.contains("punjab"), "{schemes}");
+        assert_eq!(
+            state,
+            "{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"does_not_apply\"}"
+        );
+        // A premises State that is not recorded fails closed for a medicine.
+        let (f, professional) = h1_fixture().await;
+        move_store_to(&f, None).await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        let (status, refused) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "state_regulatory_position_unresolved");
+    }
+
+    /// C-51 (State snapshot). The database refuses a hand-forged Punjab answer, an "applies" or
+    /// "unknown" Punjab medicine line, and a snapshot naming the wrong premises State.
+    #[tokio::test]
+    async fn c51_the_database_refuses_a_forged_state_snapshot() {
+        let f = fixture().await;
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        move_store_to(&f, Some(PUNJAB)).await;
+        add_finding(
+            &f,
+            &f.product_id,
+            "punjab_restricted_supply",
+            true,
+            "2021-03-25",
+        )
+        .await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        sqlx::query(
+            "UPDATE sale_lines SET regulatory_snapshot_version=1,regulatory_schemes_snapshot=\
+             '{\"schedule_h\":\"does_not_apply\",\"schedule_h1\":\"does_not_apply\",\
+             \"schedule_x\":\"does_not_apply\",\"schedule_c\":\"does_not_apply\",\
+             \"schedule_c1\":\"does_not_apply\",\"ndps_purview\":\"does_not_apply\"}' \
+             WHERE sale_document_id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        for snapshot in [
+            // Claims the finding says "does not apply": it says "applies".
+            "{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"does_not_apply\"}",
+            "{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"applies\"}",
+            // Claims the store is elsewhere.
+            "{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}",
+        ] {
+            sqlx::query(
+                "UPDATE sale_lines SET regulatory_state_snapshot=? WHERE sale_document_id=?",
+            )
+            .bind(snapshot)
+            .bind(&id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+            let error = flip_to_posted(&f, &id).await;
+            assert!(
+                error.contains("state_regulatory_boundary_refuses_posting"),
+                "{snapshot}: {error}"
+            );
+        }
+        // An incoherent shape never gets in at all.
+        let error = sqlx::query(
+            "UPDATE sale_lines SET regulatory_state_snapshot=\
+             '{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"not_applicable\"}' \
+             WHERE sale_document_id=?",
+        )
+        .bind(&id)
+        .execute(&f.pool)
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("regulatory_snapshot_incoherent"), "{error}");
+    }
+
+    /// C-61, C-73, C-74. Nothing is classified from a name or a fact: a medicine named after
+    /// hydroxychloroquine, pregabalin or tramadol with no findings is simply unresolved (never
+    /// "Schedule H1 listed" and never Punjab-restricted by inference); alcohol and pack-volume facts
+    /// that would meet entry 52 change nothing; no finding exists that the owner did not record.
+    #[tokio::test]
+    async fn c73_nothing_is_classified_from_a_name_or_a_criterion() {
+        let f = fixture().await;
+        let seeded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_regulatory_classifications")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(seeded, 0, "a finding was seeded");
+        move_store_to(&f, Some(PUNJAB)).await;
+        for name in [
+            "Hydroxychloroquine 200 mg Tablet",
+            "Pregabalin 75 mg Capsule",
+            "Tramadol 50 mg Tablet",
+        ] {
+            let (product, _, _) = second_product(&f, name).await;
+            make_medicine(&f, &product).await;
+            let (status, position) = request(
+                f.pool.clone(),
+                "GET",
+                &format!("/api/v1/products/{product}/regulatory"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{position}");
+            assert_eq!(position["saleGate"], "unresolved", "{name}");
+            for answer in position["resolved"].as_array().unwrap() {
+                assert_eq!(answer["answer"], "unknown", "{name}: {answer}");
+            }
+        }
+        // Entry 52's facts, recorded, compute nothing: the gate follows findings only.
+        make_medicine(&f, &f.product_id).await;
+        clear_every_schedule(&f, "2020-01-01").await;
+        add_finding(
+            &f,
+            &f.product_id,
+            "punjab_restricted_supply",
+            false,
+            "2021-03-25",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO product_regulatory_attributes (product_id,alcohol_percent_vv_hundredths,\
+             recorded_by_user_id,created_at_utc,updated_at_utc) VALUES (?,1300,?,\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&f.product_id)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_pack_regulatory_attributes (product_pack_id,\
+             net_volume_millilitres_hundredths,recorded_by_user_id,created_at_utc,updated_at_utc) \
+             VALUES (?,10000,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&f.pack_id)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        assert_eq!(
+            quote_of(&f, &id).await["lines"][0]["regulatoryGate"],
+            "clear"
+        );
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert!(h1_entries(&f, &id).await.is_empty());
+    }
+
+    /// C-67, C-75, C-57. There is no batching path: no endpoint confirms or posts H1 entries by
+    /// day, and a confirmation covers only its own Sale. No ESI exemption can be claimed through
+    /// the API: an ESI flag is ignored and the H1 entry is still required. No response calls the
+    /// DCC recommendation law or says rule 65(3)(1)(h) requires a signature.
+    #[tokio::test]
+    async fn c67_there_is_no_batching_and_no_esi_path() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let first = prepared_sale(&f, &item, &professional, 1).await;
+        let second = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_as(&f, &first, OWNER).await;
+        prepare_as(&f, &second, OWNER).await;
+        for uri in [
+            "/api/v1/h1-register/confirm",
+            "/api/v1/h1-register/confirm-day",
+            "/api/v1/h1-register/end-of-day",
+        ] {
+            let (status, _) = request(
+                f.pool.clone(),
+                "POST",
+                uri,
+                json!({ "hardCopyPlacedInRegister": true, "pharmacistAuthenticatedHardCopy": true,
+                        "date": TODAY }),
+            )
+            .await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{uri}: {status}"
+            );
+        }
+        confirm_h1(&f, &first, true, true, OWNER).await;
+        assert_eq!(h1_entries(&f, &first).await[0].status, "confirmed");
+        assert_eq!(h1_entries(&f, &second).await[0].status, "prepared");
+
+        // An ESI claim changes nothing: the second supply still needs its own H1 confirmation.
+        let revision = revision_of(&f, &second).await;
+        let (_, supply) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/sales/{second}/supply"),
+            json!({
+                "expectedRevision": revision,
+                "supervisingProfessionalId": professional,
+                "prescriptionEndorsementConfirmed": true,
+                "esiPrescription": true,
+                "esiScheme": true,
+            }),
+        )
+        .await;
+        assert_eq!(supply["code"], "prescription_record_prepared", "{supply}");
+        confirm_records(&f, &second).await;
+        let (status, refused) = post_confirmed(&f, &second).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["supply.schedule_h1_register_not_confirmed".to_owned()]
+        );
+        let text = refused.to_string().to_lowercase();
+        for claim in [
+            "esi",
+            "dcc",
+            "gazette",
+            "rule 65(3)(1)(h) requires",
+            "e-sign",
+            "digitally",
+        ] {
+            assert!(!text.contains(claim), "{claim}: {refused}");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1M-C pre-freeze corrective C-R1: the two race cases of the approved plan that had no
+    // dedicated proof, and the State-snapshot architecture that was implemented beside the
+    // version-1 central snapshot instead of inside it.
+    // -----------------------------------------------------------------------------------------
+
+    /// Stages a return of `packs` from `sale` up to the point of posting, so a race can begin at
+    /// the posting itself rather than at the paperwork before it.
+    async fn staged_return(f: &Fixture, sale: &str, packs: i64) -> String {
+        let sale_line = first_line_id(f, sale).await;
+        let (status, draft) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/returns",
+            json!({ "returnKind": "sales_return", "originalDocumentId": sale, "businessDate": TODAY }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{draft}");
+        let return_id = draft["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/lines"),
+            json!({
+                "expectedRevision": 1,
+                "originalLineId": sale_line,
+                "quantity": packs,
+                "disposition": "quarantined",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+        return_id
+    }
+
+    async fn post_return(f: &Fixture, return_id: &str) -> (StatusCode, Value) {
+        request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/post"),
+            json!({
+                "expectedRevision": 2,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "taxAdjustmentStatus": "commercial_only",
+            }),
+        )
+        .await
+    }
+
+    /// A prescription for `atoms` that may be supplied on `times` occasions in all.
+    async fn repeatable_prescription(f: &Fixture, atoms: i64, times: i64) -> (String, String) {
+        let created = enter_prescription(
+            f,
+            prescription_body(
+                &f.product_id,
+                atoms,
+                json!({ "repeatAuthority": "stated_times", "repeatTimes": times }),
+            ),
+        )
+        .await;
+        (
+            created["id"].as_str().unwrap().to_owned(),
+            created["items"][0]["id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    async fn occasions_used(f: &Fixture, prescription: &str) -> i64 {
+        let (status, body) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/prescriptions/{prescription}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["occasionsUsed"].as_i64().expect("occasionsUsed")
+    }
+
+    /// What the whole prescription-supply ledger says after every transaction has settled:
+    /// dispensings, the atoms they moved, the atoms given back, and the H1 entries that finalized.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SupplyLedger {
+        dispensings: i64,
+        dispensed_atoms: i64,
+        reversals: i64,
+        reversed_atoms: i64,
+        finalized_entries: i64,
+    }
+
+    async fn supply_ledger(f: &Fixture) -> SupplyLedger {
+        let (dispensings, dispensed_atoms): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensings",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let (reversals, reversed_atoms): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensing_reversals",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let finalized_entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_h1_register_entries WHERE status='finalized'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        SupplyLedger {
+            dispensings,
+            dispensed_atoms,
+            reversals,
+            reversed_atoms,
+            finalized_entries,
+        }
+    }
+
+    /// The ledger invariants that must hold whichever way a race settles: nothing is dispensed
+    /// beyond the prescription, nothing is given back that was never dispensed, no finalized H1
+    /// entry is an orphan, and no dispensing carries two of them.
+    async fn assert_supply_ledger_coherent(f: &Fixture, prescribed_atoms: i64) {
+        let ledger = supply_ledger(f).await;
+        assert!(
+            ledger.dispensed_atoms - ledger.reversed_atoms >= 0,
+            "negative net supply: {ledger:?}"
+        );
+        assert!(
+            ledger.dispensed_atoms - ledger.reversed_atoms <= prescribed_atoms,
+            "over-dispensed: {ledger:?}"
+        );
+        assert!(
+            ledger.reversed_atoms <= ledger.dispensed_atoms,
+            "gave back more than was supplied: {ledger:?}"
+        );
+        assert_eq!(
+            ledger.dispensings, ledger.finalized_entries,
+            "a finalized H1 entry without its dispensing, or the other way about: {ledger:?}"
+        );
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_h1_register_entries entry \
+             WHERE entry.status='finalized' AND (entry.dispensing_id IS NULL OR NOT EXISTS \
+             (SELECT 1 FROM prescription_dispensings dispensing \
+              WHERE dispensing.id=entry.dispensing_id AND dispensing.sale_line_id=entry.sale_line_id))",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "orphan H1 entries");
+        let shared: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT dispensing_id FROM prescription_h1_register_entries \
+             WHERE dispensing_id IS NOT NULL GROUP BY dispensing_id HAVING COUNT(*)>1)",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(shared, 0, "two H1 entries on one dispensing");
+        let over_returned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_dispensings dispensing WHERE \
+             (SELECT COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensing_reversals \
+              WHERE dispensing_id=dispensing.id) > dispensing.quantity_atoms",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(over_returned, 0, "a reversal beyond its dispensing");
+    }
+
+    /// A refused posting of `sale` left everything as it was: still a draft, no number of its own, no
+    /// tender, and the batch holding exactly `stock` — what the supplies before it left behind.
+    async fn assert_this_sale_sold_nothing(f: &Fixture, sale: &str, stock: i64) {
+        assert_nothing_posted(f, sale, &f.batch_id, stock).await;
+        assert_eq!(tender_rows(f, sale).await, 0, "a tender was written");
+    }
+
+    /// Two Schedule H1 supplies of one prescription, both prepared and confirmed while its whole
+    /// quantity is still outstanding: the first takes two strips of it, the second one strip. Once
+    /// the first is posted the second is waiting on exactly what a return would give back.
+    async fn two_confirmed_supplies(
+        f: &Fixture,
+        item: &str,
+        professional: &str,
+    ) -> (String, String) {
+        let first = prepared_sale(f, item, professional, 2).await;
+        let second = prepared_sale(f, item, professional, 1).await;
+        prepare_and_confirm(f, &first).await;
+        prepare_and_confirm(f, &second).await;
+        for sale in [&first, &second] {
+            assert_eq!(h1_entries(f, sale).await[0].status, "confirmed");
+        }
+        (first, second)
+    }
+
+    /// C-R1 Race A. A return of a finalized Schedule H1 supply racing a fresh dispensing of the
+    /// same prescription. The repository's semantics are that a return gives the QUANTITY back
+    /// and never the OCCASION, so the two transactions conflict only over quantity and are
+    /// serialized by the posting lock. Proved in both fixed orders — where the outcome is exact —
+    /// and then concurrently, where either order may win but the ledger must settle coherently
+    /// and the finalized H1 entry must be untouched either way.
+    #[tokio::test]
+    async fn cr1_a_return_racing_a_new_dispensing_settles_once() {
+        // Order 1: the return commits first, so the quantity it gave back is there to be supplied.
+        let (f, professional) = h1_fixture().await;
+        let (prescription, item) = repeatable_prescription(&f, 20, 2).await;
+        let (first, second) = two_confirmed_supplies(&f, &item, &professional).await;
+        let (status, posted) = post_confirmed(&f, &first).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let untouched = h1_entries(&f, &first).await;
+        let (status, returned) = post_return(&f, &staged_return(&f, &first, 1).await).await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let (status, posted) = post_confirmed(&f, &second).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(
+            h1_entries(&f, &first).await,
+            untouched,
+            "the return rewrote a finalized entry"
+        );
+        assert_eq!(h1_entries(&f, &second).await[0].status, "finalized");
+        assert_eq!(
+            occasions_used(&f, &prescription).await,
+            2,
+            "a return gave an occasion back"
+        );
+        assert_supply_ledger_coherent(&f, 20).await;
+        assert_eq!(
+            supply_ledger(&f).await,
+            SupplyLedger {
+                dispensings: 2,
+                dispensed_atoms: 30,
+                reversals: 1,
+                reversed_atoms: 10,
+                finalized_entries: 2,
+            }
+        );
+
+        // Order 2: the fresh dispensing goes first, and the quantity is not there yet. Once the
+        // return has committed the same Sale posts, and the second occasion is consumed once.
+        let (f, professional) = h1_fixture().await;
+        let (prescription, item) = repeatable_prescription(&f, 20, 2).await;
+        let (first, second) = two_confirmed_supplies(&f, &item, &professional).await;
+        let (status, posted) = post_confirmed(&f, &first).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let untouched = h1_entries(&f, &first).await;
+        let staged = staged_return(&f, &first, 1).await;
+        let (status, refused) = post_confirmed(&f, &second).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec!["lines.1.prescription_quantity_exceeded".to_owned()]
+        );
+        assert_this_sale_sold_nothing(&f, &second, 80).await;
+        assert_eq!(h1_entries(&f, &second).await[0].status, "confirmed");
+        assert_eq!(occasions_used(&f, &prescription).await, 1);
+        let (status, returned) = post_return(&f, &staged).await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let (status, posted) = post_confirmed(&f, &second).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(h1_entries(&f, &first).await, untouched);
+        assert_eq!(occasions_used(&f, &prescription).await, 2);
+        assert_supply_ledger_coherent(&f, 20).await;
+
+        // Concurrently: both transactions are offered at once. Whichever the posting lock takes
+        // first, exactly one coherent ledger emerges — never a supply beyond the prescription,
+        // never a second consumption of the same occasion, never a changed finalized entry.
+        let (f, professional) = h1_fixture().await;
+        let (prescription, item) = repeatable_prescription(&f, 20, 2).await;
+        let (first, second) = two_confirmed_supplies(&f, &item, &professional).await;
+        let (status, posted) = post_confirmed(&f, &first).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let untouched = h1_entries(&f, &first).await;
+        let staged = staged_return(&f, &first, 1).await;
+        let (returned, dispensed) =
+            tokio::join!(post_return(&f, &staged), post_confirmed(&f, &second));
+        let entry = h1_entries(&f, &second).await.remove(0);
+        let ledger = supply_ledger(&f).await;
+        match (returned.0, dispensed.0) {
+            (StatusCode::OK, StatusCode::OK) => {
+                // The return was serialized first: the strip it gave back paid for the new supply.
+                assert_eq!(entry.status, "finalized");
+                assert_eq!(occasions_used(&f, &prescription).await, 2);
+                assert_eq!(ledger.dispensings, 2);
+                assert_eq!(ledger.reversals, 1);
+            }
+            (StatusCode::OK, _) => {
+                // The new supply was judged first, against the quantity still outstanding, and
+                // refused. The return then committed on its own.
+                assert_eq!(entry.status, "confirmed");
+                assert_eq!(occasions_used(&f, &prescription).await, 1);
+                assert_eq!(ledger.reversals, 1);
+                assert_this_sale_sold_nothing(&f, &second, 90).await;
+            }
+            (_, StatusCode::OK) => panic!(
+                "a supply was made out of quantity that no committed return ever gave back: \
+                 {returned:?} {dispensed:?}"
+            ),
+            _ => {
+                // Neither settled: nothing moved at all.
+                assert_eq!(entry.status, "confirmed");
+                assert_eq!(occasions_used(&f, &prescription).await, 1);
+                assert_eq!(ledger.reversals, 0);
+                assert_this_sale_sold_nothing(&f, &second, 80).await;
+            }
+        }
+        // Whichever way it settled, the refusal named the quantity and nothing was left half-done.
+        if dispensed.0 != StatusCode::OK {
+            assert!(
+                prescription_issue_codes(&dispensed.1)
+                    .contains(&"lines.1.prescription_quantity_exceeded".to_owned())
+                    || dispensed.1["code"] == "service_busy",
+                "{dispensed:?}"
+            );
+        }
+        assert_eq!(h1_entries(&f, &first).await, untouched);
+        assert_supply_ledger_coherent(&f, 20).await;
+        assert!(ledger.reversals <= 1, "the return was applied twice");
+    }
+
+    /// C-R1 Race B. An append-only annotation racing an authorized reading of the register. The
+    /// annotation is a single committed insert, so a reader sees the register either without it or
+    /// with the whole of it, never half of it; the entry itself is never touched; the note appears
+    /// exactly once with its author and time; and neither racer changes who may read.
+    #[tokio::test]
+    async fn cr1_b_an_annotation_racing_a_register_read_is_atomic() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let id = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &id).await;
+        let (status, posted) = post_confirmed(&f, &id).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let before = h1_entries(&f, &id).await;
+        let entry = before[0].clone();
+        const NOTE: &str = "The pharmacist's initials on the pasted hard copy were clarified in ink on the same day.";
+
+        let read = |token: &'static str| {
+            let pool = f.pool.clone();
+            async move {
+                request_as(
+                    pool,
+                    "GET",
+                    &format!("/api/v1/h1-register?from={TODAY}&to={TODAY}"),
+                    Value::Null,
+                    Some(token),
+                )
+                .await
+            }
+        };
+        let annotate = |note: &'static str| {
+            let pool = f.pool.clone();
+            let entry_id = entry.id.clone();
+            async move {
+                request(
+                    pool,
+                    "POST",
+                    &format!("/api/v1/h1-register/{entry_id}/annotations"),
+                    json!({ "note": note }),
+                )
+                .await
+            }
+        };
+
+        // The read is offered at the same moment as the append, in both orders.
+        for _ in 0..2 {
+            let ((status, sheet), (created, body)) = tokio::join!(read(OWNER), annotate(NOTE));
+            assert_eq!(created, StatusCode::CREATED, "{body}");
+            assert_eq!(status, StatusCode::OK, "{sheet}");
+            let seen = sheet["annotations"].as_array().expect("annotations").len();
+            assert!(seen <= 2, "{sheet}");
+            for annotation in sheet["annotations"].as_array().unwrap() {
+                // Nothing half-written is ever visible: the note, its author and its time are
+                // either all there or the annotation is not there at all.
+                assert_eq!(annotation["note"], NOTE, "{sheet}");
+                assert_eq!(annotation["entryId"], entry.id, "{sheet}");
+                assert!(
+                    annotation["createdByDisplayName"].is_string()
+                        && annotation["createdAtUtc"].is_string(),
+                    "{sheet}"
+                );
+            }
+            // The entry beside them is the one that was supplied, unchanged.
+            assert_eq!(sheet["entries"][0]["reference"], entry.reference, "{sheet}");
+            assert_eq!(sheet["entries"][0]["status"], "finalized", "{sheet}");
+            assert_eq!(sheet["entries"][0]["quantityAtoms"], entry.quantity_atoms);
+        }
+
+        // Two appends racing each other: each lands exactly once, and neither overwrites the other.
+        let (left, right) = tokio::join!(annotate("Left-hand note."), annotate("Right-hand note."));
+        for (status, body) in [&left, &right] {
+            assert_eq!(*status, StatusCode::CREATED, "{body}");
+        }
+        let notes: Vec<String> = sqlx::query_scalar(
+            "SELECT note FROM prescription_h1_register_annotations ORDER BY created_at_utc,note",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(notes.iter().filter(|note| *note == NOTE).count(), 2);
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| *note == "Left-hand note.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| *note == "Right-hand note.")
+                .count(),
+            1
+        );
+        let (authors, times): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT created_by_user_id),COUNT(created_at_utc) \
+             FROM prescription_h1_register_annotations",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(authors, 1);
+        assert_eq!(times, notes.len() as i64, "an annotation without its time");
+
+        // Annotating never reaches the entry, and an entry can never be moved to another store.
+        assert_eq!(h1_entries(&f, &id).await, before);
+        for statement in [
+            "UPDATE prescription_h1_register_entries SET store_id='elsewhere'",
+            "UPDATE prescription_h1_register_annotations SET created_by_user_id='someone-else'",
+            "DELETE FROM prescription_h1_register_annotations",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&f.pool).await.is_err(),
+                "{statement}"
+            );
+        }
+
+        // Neither racer changed who may read: a cashier still cannot read the register or append.
+        let (status, refused) = read(CASHIER).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let (status, refused) = request_as(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/h1-register/{}/annotations", entry.id),
+            json!({ "note": "Cashier's note." }),
+            Some(CASHIER),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        // The register is this store's alone: the read is filtered by the store that owns the
+        // entry, an entry's store can never be rewritten (above), and a posted Sale can never be
+        // moved to another store either.
+        let (status, sheet) = read(OWNER).await;
+        assert_eq!(status, StatusCode::OK, "{sheet}");
+        assert_eq!(sheet["entries"].as_array().unwrap().len(), 1, "{sheet}");
+        assert_eq!(sheet["entries"][0]["reference"], entry.reference, "{sheet}");
+        let error = sqlx::query("UPDATE sale_documents SET store_id='elsewhere' WHERE id=?")
+            .bind(&id)
+            .execute(&f.pool)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sale_document_is_posted"), "{error}");
+        assert_eq!(h1_entries(&f, &id).await, before);
+    }
+
+    /// C-R1 snapshot architecture. The State answer is frozen in its own column beside the
+    /// unchanged version-1 central snapshot. A Sale that has been posted is never re-judged when
+    /// the premises or the owner's findings change afterwards; a Sale posted now freezes both
+    /// answers; neither can be edited after posting, by any hand; and the two answers are
+    /// independent of one another. (That migration 0023 writes nothing into the lines of Sales
+    /// posted before it is proved by the migration_0023 tests.)
+    #[tokio::test]
+    async fn cr1_c_the_state_snapshot_is_frozen_beside_the_central_one() {
+        let (f, professional) = h1_fixture().await;
+        let (_, item) = simple_prescription(&f, 20).await;
+        let historical = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &historical).await;
+        let (status, posted) = post_confirmed(&f, &historical).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let frozen: (i64, String, Option<String>) = sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,\
+             regulatory_state_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&historical)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(frozen.0, 1, "the central snapshot changed version");
+        assert_eq!(
+            frozen.2.as_deref(),
+            Some(
+                "{\"premises_state_code\":\"27\",\"punjab_restricted_supply\":\"not_applicable\"}"
+            ),
+            "a Sale outside Punjab must freeze that the axis did not reach it"
+        );
+
+        // The premises move into Punjab and the owner records a restriction that would refuse this
+        // very drug today. Nothing reaches back into what was already supplied.
+        move_store_to(&f, Some(PUNJAB)).await;
+        add_finding(
+            &f,
+            &f.product_id,
+            "punjab_restricted_supply",
+            true,
+            "2021-03-25",
+        )
+        .await;
+        let after: (i64, String, Option<String>) = sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,\
+             regulatory_state_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&historical)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(after, frozen, "a finalized Sale was reinterpreted");
+        let (status, document) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{historical}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        assert_eq!(document["status"], "posted");
+        assert_eq!(h1_entries(&f, &historical).await[0].status, "finalized");
+
+        // A Sale posted now, at the Punjab premises, is judged under the posting lock against the
+        // findings as they stand then — not against the draft's — and freezes that answer.
+        sqlx::query(
+            "UPDATE product_regulatory_classifications SET applies=0 \
+             WHERE product_id=? AND scheme='punjab_restricted_supply'",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, item) = simple_prescription(&f, 20).await;
+        let fresh = prepared_sale(&f, &item, &professional, 1).await;
+        prepare_and_confirm(&f, &fresh).await;
+        let (status, posted) = post_confirmed(&f, &fresh).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let (version, central, state): (i64, String, String) = sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,\
+             regulatory_state_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&fresh)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 1, "the central snapshot changed version");
+        assert!(!central.contains("punjab"), "{central}");
+        assert!(!central.contains("premises"), "{central}");
+        assert_eq!(
+            state,
+            "{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"does_not_apply\"}"
+        );
+        // The two answers are independent: the central one says this drug is in Schedule H1, the
+        // State one says the Punjab restriction does not reach it. Two Sales of the same product
+        // at the same store hold different State answers, because the premises differed.
+        assert!(central.contains("\"schedule_h1\":\"applies\""), "{central}");
+        assert_ne!(Some(state.as_str()), frozen.2.as_deref());
+        assert_eq!(
+            central, frozen.1,
+            "the central answer moved with the State one"
+        );
+
+        // Neither frozen answer can be edited after posting, by any hand. A rewritten State answer
+        // meets the coherence guard first — it would no longer match the premises and the findings
+        // — and everything else meets the posted-document guard.
+        for (statement, guard) in [
+            (
+                "UPDATE sale_lines SET regulatory_state_snapshot=\
+                 '{\"premises_state_code\":\"03\",\"punjab_restricted_supply\":\"not_applicable\"}' \
+                 WHERE sale_document_id=?",
+                "regulatory_snapshot_incoherent",
+            ),
+            (
+                "UPDATE sale_lines SET regulatory_state_snapshot=NULL WHERE sale_document_id=?",
+                "sale_document_is_posted",
+            ),
+            (
+                "UPDATE sale_lines SET regulatory_schemes_snapshot=\
+                 '{\"schedule_h1\":\"does_not_apply\"}' WHERE sale_document_id=?",
+                "sale_document_is_posted",
+            ),
+            (
+                "UPDATE sale_lines SET regulatory_snapshot_version=2 WHERE sale_document_id=?",
+                "sale_document_is_posted",
+            ),
+        ] {
+            for sale in [&fresh, &historical] {
+                let error = sqlx::query(statement)
+                    .bind(sale)
+                    .execute(&f.pool)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(guard), "{statement}: {error}");
+            }
+        }
+        let still: (i64, String, String) = sqlx::query_as(
+            "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot,\
+             regulatory_state_snapshot FROM sale_lines WHERE sale_document_id=?",
+        )
+        .bind(&fresh)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(still, (version, central, state));
+
+        // Independence the other way about: a product the owner has placed within the Punjab
+        // restriction, with no central Schedule H1 finding of any kind, is a State matter alone.
+        let (other, _, _) = second_product(&f, "Punjab-restricted general item").await;
+        make_medicine(&f, &other).await;
+        add_finding(&f, &other, "punjab_restricted_supply", true, "2021-03-25").await;
+        let (status, view) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/products/{other}/regulatory"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let text = view.to_string();
+        assert!(text.contains("punjab_restricted_supply"), "{view}");
+        assert!(!text.contains("\"schedule_h1\":\"applies\""), "{view}");
     }
 }

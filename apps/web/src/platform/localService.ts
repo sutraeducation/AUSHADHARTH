@@ -215,10 +215,13 @@ export function safeErrorMessage(code?: string): string {
     // Phase 1M-A: the Drugs Rules gate.
     case "regulatory_classification_unresolved": return "A medicine on this bill has no recorded schedule position, so it cannot be sold yet. An owner can record it on the product.";
     case "regulated_sale_workflow_not_available": return "A line on this bill needs a statutory register this version cannot keep yet. Remove it to post the rest.";
-    // Phase 1M-B: Schedule H sells on a prescription; H1 and X stay refused until their own records exist.
-    case "schedule_h1_register_not_available": return "Schedule H1 dispensing requires the H1 register workflow, which is not yet available.";
+    // Phase 1M-B: Schedule H sells on a prescription; X stays refused until its own record exists.
+    // Phase 1M-C: Schedule H1 sells with its separate H1 working entry; three boundaries stay refused.
+    case "schedule_h1_ndps_workflow_not_available": return "This Schedule H1 drug is, or may be, within the NDPS Act, and AUSHADHARTH does not support that combined workflow (an unsupported NDPS-intersection workflow).";
+    case "state_restricted_drug_workflow_not_available": return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
+    case "state_regulatory_position_unresolved": return "This medicine's position under the Punjab drug-control boundary is not recorded, or the store's premises State is not recorded.";
     case "schedule_x_workflow_not_available": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
-    case "prescription_requirements_incomplete": return "This Schedule H sale is missing prescription requirements.";
+    case "prescription_requirements_incomplete": return "This prescription sale is missing prescription requirements.";
     case "prescription_record_election_unresolved": return "The pharmacy's rule 65(3)(2) prescription-supply record election is not recorded. The owner records it in Drug Compliance.";
     case "prescription_record_prepared": return "This sale's prescription-supply entry is prepared, so the sale cannot be changed. Void the entry to change it; its serial is not reused.";
     case "prescription_record_state_conflict": return "This prescription-supply entry can no longer be changed that way.";
