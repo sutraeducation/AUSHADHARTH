@@ -17,6 +17,8 @@ import { businessToday } from "../platform/businessDate";
 import { LocalServiceError } from "../platform/localService";
 import { CatalogDialog } from "../products/CatalogDialog";
 import { listParties } from "../parties/partyApi";
+import { listReferences } from "../reference/referenceApi";
+import { ScrollableTable, StatusBadge } from "../components/Ui";
 import { newIdempotencyKey } from "../inventory/inventoryApi";
 import {
   basisPointsToPercentText,
@@ -367,6 +369,7 @@ function LineDialog({ draft, line, onClose, onSaved, onSavedAndContinue }: {
     expiresOn: line?.newBatchExpiresOn ?? "",
     mrp: line?.newBatchMrpPaise == null ? "" : paiseToRupees(line.newBatchMrpPaise)
   });
+  const [manufacturerCompanyId, setManufacturerCompanyId] = useState(line?.manufacturerCompanyId ?? "");
   const [quantity, setQuantity] = useState(line ? String(line.quantityPacks) : "");
   const [rate, setRate] = useState(line ? paiseToRupees(line.ratePerPackPaise) : "");
   const [notice, setNotice] = useState<string | null>(null);
@@ -385,6 +388,26 @@ function LineDialog({ draft, line, onClose, onSaved, onSavedAndContinue }: {
     () => (batches.data ?? []).filter((batch: Batch) => batch.status === "active" || batch.id === line?.batchId),
     [batches.data, line?.batchId]
   );
+  /**
+   * Rule 65(21)(b)(v) asks who MADE what arrived. A product may record several manufacturers over
+   * time, and no sort order can say which one filled this carton, so the choice is the operator's.
+   * With one recorded maker there is nothing to choose and the receipt freezes it by itself.
+   */
+  const manufacturers = useMemo(
+    () => (product.data?.companyRoles ?? []).filter((role) => role.role === "manufacturer" && role.status === "active"),
+    [product.data]
+  );
+  const companies = useQuery({
+    queryKey: ["reference", "companies", "active"],
+    queryFn: () => listReferences("companies", "", "active"),
+    enabled: manufacturers.length > 1,
+    staleTime: 60_000,
+    retry: false
+  });
+  const companyName = (companyId: string) => {
+    const record = companies.data?.find((company) => company.id === companyId);
+    return record && record.kind === "companies" ? record.attributes.displayName : companyId;
+  };
 
   /**
    * A supplier invoice arrives with many lines, and reopening the dialog for each one costs a
@@ -401,6 +424,7 @@ function LineDialog({ draft, line, onClose, onSaved, onSavedAndContinue }: {
       // batch, quantity and rate are specific to the line just saved and must not carry over.
       setBatchId("");
       setNewBatch({ number: "", expiresOn: "", mrp: "" });
+      setManufacturerCompanyId("");
       setQuantity("");
       setRate("");
       setKeepOpen(false);
@@ -432,6 +456,7 @@ function LineDialog({ draft, line, onClose, onSaved, onSavedAndContinue }: {
       productPackId: packId,
       // Mutually exclusive by construction: the unselected mode is sent as null, never omitted, so
       // switching modes on an existing line clears the other side on the server too.
+      manufacturerCompanyId: manufacturerCompanyId || null,
       batchId: batchMode === "existing" ? batchId : null,
       newBatchNumber: batchMode === "new" ? newBatch.number.trim() : null,
       newBatchExpiresOn: batchMode === "new" ? newBatch.expiresOn || null : null,
@@ -491,6 +516,15 @@ function LineDialog({ draft, line, onClose, onSaved, onSavedAndContinue }: {
               <small>Printed retail price. Not the purchase rate.</small>
             </div>
           </>}
+
+      {manufacturers.length > 1 && <div className="field" data-testid="line-manufacturer-field">
+        <label htmlFor="line-manufacturer">Manufacturer received</label>
+        <select id="line-manufacturer" value={manufacturerCompanyId} onChange={(event) => setManufacturerCompanyId(event.target.value)}>
+          <option value="">Not recorded</option>
+          {manufacturers.map((role) => <option key={role.id} value={role.companyId}>{companyName(role.companyId)}</option>)}
+        </select>
+        <small>This product records more than one manufacturer. Choose the one that made the stock on this invoice, or leave it unrecorded — AUSHADHARTH will not guess.</small>
+      </div>}
 
       <div className="field">
         <label htmlFor="line-quantity">Quantity (Pack)<span aria-hidden="true"> *</span></label>
@@ -598,13 +632,14 @@ function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; re
   return <>
     <header className="page-header">
       <div>
-        <p className="eyebrow"><Link to="/app/purchases">Purchases</Link> · {draft ? "DRAFT" : "POSTED"}</p>
+        <p className="eyebrow"><Link to="/app/purchases">Purchases</Link></p>
         <h1>{purchase.supplierInvoiceNumber}</h1>
         <p>{shownSupplier} · Invoice dated {purchase.invoiceDate}</p>
       </div>
       <div className="page-header__actions">
+        <StatusBadge tone={draft ? "draft" : "posted"}>{draft ? "Draft" : "Posted"}</StatusBadge>
+        <StatusBadge tone="neutral">Read-only</StatusBadge>
         {!draft && canReturn && <Link className="button button--secondary" to={`/app/purchases/${purchase.id}/return`}>Return Items</Link>}
-        <span className="read-only-note">{draft ? "Read-only access" : "Posted · read-only"}</span>
       </div>
     </header>
 
@@ -629,11 +664,13 @@ function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; re
       {!draft && <p className="panel-note">These are the facts as they stood when this purchase was posted. Later changes to the supplier or store profile do not alter this document.</p>}
     </section>
 
+    {!draft && <ReceiptProvenance purchase={purchase} />}
+
     <section className="master-panel" aria-labelledby="posted-lines-title">
       <h2 id="posted-lines-title">Lines</h2>
       {/* An unposted document carries no tax at all, so its tax columns are absent rather than
           filled with zeros that would read as "no GST applies to this purchase". */}
-      <div className="table-scroll"><table className="data-table">
+      <ScrollableTable><table className="data-table">
         <thead><tr>
           <th scope="col">#</th><th scope="col">Product</th><th scope="col">Batch</th>
           {!draft && <th scope="col">HSN</th>}
@@ -654,7 +691,7 @@ function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; re
             <td data-label="Line total" className="numeric">{paiseToAmountText(line.lineTotalPaise)}</td>
           </>}
         </tr>)}</tbody>
-      </table></div>
+      </table></ScrollableTable>
       {draft && <p className="panel-note">{DRAFT_TAX_NOTE}</p>}
     </section>
 
@@ -676,6 +713,54 @@ function PostedDetail({ purchase, readOnlyRole }: { purchase: PurchaseDetail; re
   </>;
 }
 
+/**
+ * Where this stock came from, as the receipt froze it. Rule 65(21)(b) asks a Schedule X register
+ * for the supplier's name and address, the number of the licence they hold, the manufacturer, the
+ * lot and the bill — so a receipt has to be able to say what it was told, years later, without
+ * asking today's masters. A fact nobody recorded is shown as not recorded; nothing is filled in
+ * from the Party as it stands now.
+ */
+function ReceiptProvenance({ purchase }: { purchase: PurchaseDetail }) {
+  const captured = purchase.purchaseProvenanceSnapshotVersion >= 1;
+  if (!captured) {
+    return <section className="master-panel provenance-panel" aria-labelledby="provenance-title" data-testid="receipt-provenance">
+      <div className="provenance-panel__head">
+        <h2 id="provenance-title">Receipt provenance</h2>
+        <StatusBadge tone="neutral">Not captured</StatusBadge>
+      </div>
+      <p className="panel-note" data-testid="provenance-legacy">This purchase was posted before receipt provenance was captured, so this document records no supplier address, licence or manufacturer. Those facts are not reconstructed from the supplier or product as they stand today.</p>
+    </section>;
+  }
+  const address = purchase.supplierAddressState === "recorded"
+    ? [purchase.supplierAddressLine1, purchase.supplierAddressLine2, purchase.supplierAddressCity,
+       purchase.supplierAddressPostalCode, purchase.supplierAddressStateName].filter(Boolean).join(", ")
+    : null;
+  return <section className="master-panel provenance-panel" aria-labelledby="provenance-title" data-testid="receipt-provenance">
+    <div className="provenance-panel__head">
+      <h2 id="provenance-title">Receipt provenance</h2>
+      <StatusBadge tone="posted">Frozen at posting</StatusBadge>
+    </div>
+    <p className="provenance-source">Taken from the supplier and product records as they stood when this receipt was posted, and unchanged since.</p>
+    <dl className="detail-grid">
+      <div><dt>Supplier address</dt><dd data-testid="provenance-address">{address ?? "Not recorded"}</dd></div>
+      <div><dt>Supplier drug licence</dt><dd data-testid="provenance-licence">{purchase.supplierDrugLicenceNumber ?? "Not recorded"}</dd></div>
+      <div><dt>Licence valid upto</dt><dd>{purchase.supplierDrugLicenceValidUpto ?? "Not recorded"}</dd></div>
+      <div><dt>Bill number and date</dt><dd>{purchase.supplierInvoiceNumber} · {purchase.invoiceDate}</dd></div>
+    </dl>
+    <ScrollableTable hint="Scroll sideways for the manufacturer and quantity"><table className="data-table" data-testid="provenance-lines">
+      <thead><tr><th scope="col">#</th><th scope="col">Drug received as</th><th scope="col">Batch / Lot</th><th scope="col">Manufacturer</th><th scope="col" className="numeric">Quantity (Pack)</th></tr></thead>
+      <tbody>{purchase.lines.map((line) => <tr key={line.id}>
+        <td data-label="#">{line.lineNumber}</td>
+        <td data-label="Drug received as">{line.drugDisplayName ?? "Not recorded"}</td>
+        <td data-label="Batch / Lot">{line.batchNumber ?? "Not recorded"}</td>
+        <td data-label="Manufacturer">{line.manufacturerName ?? "Not recorded"}</td>
+        <td data-label="Quantity (Pack)" className="numeric">{line.quantityPacks}</td>
+      </tr>)}</tbody>
+    </table></ScrollableTable>
+    <p className="panel-note">These are the particulars this receipt froze when it was posted, not the supplier, product or batch as they stand today. AUSHADHARTH records the licence particulars it was given; it does not verify them, and this is not a statement that the supplier is licensed.</p>
+  </section>;
+}
+
 function LineTax({ line, treatment }: { line: PurchaseLine; treatment: PurchaseTaxTreatment | null }) {
   if (line.taxTreatmentKind && line.taxTreatmentKind !== "taxable") {
     return <span className="row-subtext">{TAX_KIND_LABELS[line.taxTreatmentKind]}</span>;
@@ -694,14 +779,18 @@ function LineTax({ line, treatment }: { line: PurchaseLine; treatment: PurchaseT
 function LineProductName({ line }: { line: PurchaseLine }) {
   const product = useQuery({ queryKey: ["products", "detail", line.productId], queryFn: () => getProduct(line.productId), staleTime: 60_000, retry: false });
   const pack = product.data?.packs.find((item: ProductPack) => item.id === line.productPackId);
+  // A posted line shows the name the stock was received under. The live master is only for a draft
+  // still being written, or for a purchase posted before provenance was captured.
   return <>
-    <Link to={`/app/products/${line.productId}`}>{product.data?.displayName ?? (product.isError ? "Product unavailable" : "Loading…")}</Link>
+    <Link to={`/app/products/${line.productId}`}>{line.drugDisplayName ?? product.data?.displayName ?? (product.isError ? "Product unavailable" : "Loading…")}</Link>
     {pack && <small className="row-subtext">{packText(pack)}</small>}
   </>;
 }
 
 function BatchCell({ line }: { line: PurchaseLine }) {
-  const batches = useQuery({ queryKey: ["batches", line.productPackId], queryFn: () => listBatches(line.productPackId), enabled: Boolean(line.batchId), staleTime: 60_000, retry: false });
+  const batches = useQuery({ queryKey: ["batches", line.productPackId], queryFn: () => listBatches(line.productPackId), enabled: Boolean(line.batchId) && !line.batchNumber, staleTime: 60_000, retry: false });
+  // The lot this receipt froze, not the lot's master text as it reads today.
+  if (line.batchNumber) return <>{line.batchNumber}</>;
   if (line.newBatchNumber) {
     return <>{line.newBatchNumber}<small className="row-subtext">New batch{line.newBatchExpiresOn ? ` · expires ${line.newBatchExpiresOn}` : ""}</small></>;
   }

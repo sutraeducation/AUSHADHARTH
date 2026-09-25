@@ -6252,3 +6252,158 @@ async fn real_service_keeps_h1_entries_through_backup_and_restore_over_http() {
     }
     reopened.close().await;
 }
+
+/// Phase 1M-D1-A, proofs 36 and 37. Receipt provenance is ordinary data in the ordinary database,
+/// so Phase 1K's whole-database snapshot carries it without a format change — and the guards that
+/// keep it immutable come back with it.
+#[tokio::test]
+async fn real_service_keeps_purchase_provenance_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_purchase_world(service, MAHARASHTRA, "taxable").await;
+
+    // The supplier has an address and a licence on file, and the product has one maker.
+    let address = call(
+        service,
+        "POST",
+        &format!("/api/v1/parties/{}/addresses", world.supplier),
+        Some(json!({
+            "expectedRevision": 1,
+            "addressRole": "billing",
+            "line1": "14 Ware House Road",
+            "city": "Thane",
+            "stateId": MAHARASHTRA,
+            "postalCode": "421302",
+            "isPrimary": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        address.status == 201 || address.status == 200,
+        "{:?}",
+        address.body
+    );
+
+    let draft = create_draft(service, &world, "INV-8801").await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "newBatchNumber": "B-8801",
+            "newBatchExpiresOn": "2028-03-31",
+            "quantityPacks": 10,
+            "ratePerPackPaise": 3_000,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+    let posted = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000008a1",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["purchaseProvenanceSnapshotVersion"], 1);
+    assert_eq!(posted.body["lines"][0]["batchNumber"], "B-8801");
+    let frozen_address = posted.body["supplierAddressLine1"].clone();
+    let frozen_licence = posted.body["supplierDrugLicenceState"].clone();
+    let frozen_drug = posted.body["lines"][0]["drugDisplayName"].clone();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+    let bytes = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &bytes,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    // 36. Every provenance fact came back.
+    let (version, line1, licence_state): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT purchase_provenance_snapshot_version,supplier_address_line1,\
+         supplier_drug_licence_state FROM purchase_documents WHERE id=?",
+    )
+    .bind(&purchase_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("restored purchase");
+    assert_eq!(version, 1);
+    assert_eq!(Value::from(line1), frozen_address);
+    assert_eq!(Value::from(licence_state), frozen_licence);
+    let (drug, batch): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT drug_display_name,batch_number FROM purchase_lines WHERE purchase_document_id=?",
+    )
+    .bind(&purchase_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("restored line");
+    assert_eq!(Value::from(drug), frozen_drug);
+    assert_eq!(batch.as_deref(), Some("B-8801"));
+
+    // 37. And so did the guards that keep it that way.
+    for statement in [
+        "UPDATE purchase_documents SET supplier_address_line1='99 Elsewhere'",
+        "UPDATE purchase_lines SET drug_display_name='Something Else'",
+        "DELETE FROM purchase_lines",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&reopened).await.is_err(),
+            "{statement}"
+        );
+    }
+    reopened.close().await;
+}

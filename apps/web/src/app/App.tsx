@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { DashboardSummarySchema, type DashboardSummary, type UserRole } from "@aushadharth/contracts";
@@ -143,8 +143,83 @@ function EntryAside({ heading, text }: { heading: string; text: string }) {
 function AppShell({ children }: { children: ReactNode }) {
   const auth = useAuth(); const collapsed = useUiPreferences((state) => state.sidebarCollapsed); const toggleSidebar = useUiPreferences((state) => state.toggleSidebar);
   const [menuOpen, setMenuOpen] = useState(false); const menuButton = useRef<HTMLButtonElement>(null); const user = auth.status?.user;
-  useEffect(() => { const close = (event: KeyboardEvent) => { if (event.key === "Escape" && menuOpen) { setMenuOpen(false); menuButton.current?.focus(); } }; window.addEventListener("keydown", close); return () => window.removeEventListener("keydown", close); }, [menuOpen]);
-  return <div className={`app-layout ${collapsed ? "app-layout--collapsed" : ""}`}><aside className="sidebar" aria-label="Primary navigation"><div className="sidebar__brand"><BrandMark compact={collapsed} /></div><nav><NavLink to="/app/dashboard" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><DashboardIcon /><span>Dashboard</span></NavLink><span className="nav-group-label">{collapsed ? "" : "MASTERS"}</span><NavLink to="/app/products" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><ProductIcon /><span>Products</span></NavLink><NavLink to="/app/parties" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><SupplierIcon /><span>Suppliers</span></NavLink><NavLink to="/app/reference" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><ReferenceIcon /><span>Reference Data</span></NavLink><span className="nav-group-label">{collapsed ? "" : "OPERATIONS"}</span><NavLink to="/app/sales" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><SaleIcon /><span>Sales</span></NavLink>{(user?.role === "owner_admin" || user?.role === "pharmacist") && <NavLink to="/app/prescriptions" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><PrescriptionIcon /><span>Prescriptions</span></NavLink>}{(user?.role === "owner_admin" || user?.role === "pharmacist") && <NavLink to="/app/h1-register" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><PrescriptionIcon /><span>H1 Register</span></NavLink>}<NavLink to="/app/purchases" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><PurchaseIcon /><span>Purchases</span></NavLink><NavLink to="/app/returns" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><ReturnIcon /><span>Returns</span></NavLink><NavLink to="/app/inventory" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><InventoryIcon /><span>Inventory</span></NavLink><span className="nav-group-label">{collapsed ? "" : "CONFIGURATION"}</span><NavLink to="/app/settings/store" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><SettingsIcon /><span>Store Profile</span></NavLink><NavLink to="/app/settings/drug-compliance" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><SettingsIcon /><span>Drug Compliance</span></NavLink><NavLink to="/app/settings/data-safety" className={({ isActive }) => `nav-item ${isActive ? "nav-item--active" : ""}`}><DataSafetyIcon /><span>Data Safety</span></NavLink></nav>{!collapsed && <div className="sidebar__next"><span>NEXT MODULES</span><p>Accounting and GST returns remain unavailable until their implementation slices are complete.</p></div>}<button className="sidebar-toggle" type="button" onClick={toggleSidebar} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed}><span aria-hidden="true">{collapsed ? "›" : "‹"}</span><span>{collapsed ? "" : "Collapse"}</span></button></aside><div className="workspace"><header className="topbar"><div><span className="topbar__label">WORKSPACE</span><strong>{auth.status?.storeDisplayName ?? "AUSHADHARTH"}</strong></div><div className="topbar__actions"><ConnectivityStatus /><div className="user-menu"><button ref={menuButton} className="user-button" type="button" onClick={() => setMenuOpen(!menuOpen)} aria-haspopup="menu" aria-expanded={menuOpen}><span className="avatar" aria-hidden="true">{initials(user?.displayName)}</span><span><strong>{user?.displayName}</strong><small>{roleLabel(user?.role)}</small></span><span aria-hidden="true">⌄</span></button>{menuOpen && <div className="user-popover" role="menu"><p><strong>{user?.displayName}</strong><small>{user?.loginIdentifier}</small></p><button role="menuitem" type="button" onClick={() => void auth.logout()}>Sign out</button></div>}</div></div></header><main className="main-content">{children}</main></div></div>;
+  /**
+   * On a phone the navigation is a drawer, closed until it is asked for. It used to be a column of
+   * every route standing above the page, so the first screen of every screen was a menu and the
+   * work was below the fold. The same markup serves both: the sidebar is the drawer, and the
+   * width decides whether it is permanent furniture or something you open.
+   */
+  const [navOpen, setNavOpen] = useState(false);
+  const navToggle = useRef<HTMLButtonElement>(null); const navClose = useRef<HTMLButtonElement>(null);
+  const location = useLocation();
+  const closeNav = useCallback(() => { setNavOpen(false); navToggle.current?.focus(); }, []);
+  // Choosing a destination is the end of navigating, so arriving closes the drawer.
+  useEffect(() => { setNavOpen(false); }, [location.pathname]);
+  // Focus follows the drawer in, and the page behind it does not scroll under the reader's thumb.
+  useEffect(() => {
+    if (!navOpen) return;
+    navClose.current?.focus();
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [navOpen]);
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (navOpen) { setNavOpen(false); navToggle.current?.focus(); return; }
+      if (menuOpen) { setMenuOpen(false); menuButton.current?.focus(); }
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [menuOpen, navOpen]);
+
+  const link = ({ isActive }: { isActive: boolean }) => `nav-item ${isActive ? "nav-item--active" : ""}`;
+  const dispensing = user?.role === "owner_admin" || user?.role === "pharmacist";
+  return <div className={`app-layout ${collapsed ? "app-layout--collapsed" : ""} ${navOpen ? "app-layout--nav-open" : ""}`}>
+    {navOpen && <button className="nav-backdrop" type="button" tabIndex={-1} aria-hidden="true" onClick={closeNav} />}
+    <aside id="primary-navigation" className={`sidebar ${navOpen ? "sidebar--open" : ""}`} aria-label="Primary navigation">
+      <div className="sidebar__brand">
+        <BrandMark compact={collapsed} />
+        <button ref={navClose} className="nav-drawer-close" type="button" onClick={closeNav} aria-label="Close navigation"><span aria-hidden="true">×</span></button>
+      </div>
+      <nav className="sidebar__nav">
+        <NavLink to="/app/dashboard" className={link}><DashboardIcon /><span>Dashboard</span></NavLink>
+        <span className="nav-group-label">MASTERS</span>
+        <NavLink to="/app/products" className={link}><ProductIcon /><span>Products</span></NavLink>
+        <NavLink to="/app/parties" className={link}><SupplierIcon /><span>Suppliers</span></NavLink>
+        <NavLink to="/app/reference" className={link}><ReferenceIcon /><span>Reference Data</span></NavLink>
+        <span className="nav-group-label">OPERATIONS</span>
+        <NavLink to="/app/sales" className={link}><SaleIcon /><span>Sales</span></NavLink>
+        {dispensing && <NavLink to="/app/prescriptions" className={link}><PrescriptionIcon /><span>Prescriptions</span></NavLink>}
+        {dispensing && <NavLink to="/app/h1-register" className={link}><PrescriptionIcon /><span>H1 Register</span></NavLink>}
+        <NavLink to="/app/purchases" className={link}><PurchaseIcon /><span>Purchases</span></NavLink>
+        <NavLink to="/app/returns" className={link}><ReturnIcon /><span>Returns</span></NavLink>
+        <NavLink to="/app/inventory" className={link}><InventoryIcon /><span>Inventory</span></NavLink>
+        <span className="nav-group-label">CONFIGURATION</span>
+        <NavLink to="/app/settings/store" className={link}><SettingsIcon /><span>Store Profile</span></NavLink>
+        <NavLink to="/app/settings/drug-compliance" className={link}><SettingsIcon /><span>Drug Compliance</span></NavLink>
+        <NavLink to="/app/settings/data-safety" className={link}><DataSafetyIcon /><span>Data Safety</span></NavLink>
+      </nav>
+      {!collapsed && <p className="sidebar__next">Accounting and GST returns arrive in a later slice.</p>}
+      <button className="sidebar-toggle" type="button" onClick={toggleSidebar} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed}><span aria-hidden="true">{collapsed ? "›" : "‹"}</span><span>{collapsed ? "" : "Collapse"}</span></button>
+    </aside>
+    <div className="workspace">
+      <header className="topbar">
+        <button ref={navToggle} className="nav-toggle" type="button" onClick={() => setNavOpen(true)} aria-label="Open navigation" aria-expanded={navOpen} aria-controls="primary-navigation">
+          <span aria-hidden="true">☰</span>
+        </button>
+        <div className="topbar__workspace"><span className="topbar__label">WORKSPACE</span><strong>{auth.status?.storeDisplayName ?? "AUSHADHARTH"}</strong></div>
+        <div className="topbar__actions">
+          <ConnectivityStatus />
+          <div className="user-menu">
+            <button ref={menuButton} className="user-button" type="button" onClick={() => setMenuOpen(!menuOpen)} aria-haspopup="menu" aria-expanded={menuOpen}><span className="avatar" aria-hidden="true">{initials(user?.displayName)}</span><span><strong>{user?.displayName}</strong><small>{roleLabel(user?.role)}</small></span><span aria-hidden="true">⌄</span></button>
+            {menuOpen && <div className="user-popover" role="menu"><p><strong>{user?.displayName}</strong><small>{user?.loginIdentifier}</small></p><button role="menuitem" type="button" onClick={() => void auth.logout()}>Sign out</button></div>}
+          </div>
+        </div>
+      </header>
+      <main className="main-content">{children}</main>
+    </div>
+  </div>;
 }
 
 function ConnectivityStatus() {
@@ -157,7 +232,7 @@ function Dashboard() {
   const auth = useAuth();
   const summary = useQuery<DashboardSummary>({ queryKey: ["dashboard", "summary"], queryFn: async () => DashboardSummarySchema.parse(await localServiceRequest("/api/v1/dashboard/summary")), retry: false });
   useEffect(() => { if (summary.error instanceof LocalServiceError && ["session_expired", "authentication_required"].includes(summary.error.code)) void auth.expireSession(); }, [summary.error]);
-  return <><header className="page-header"><div><p className="eyebrow">OVERVIEW</p><h1>Dashboard</h1><p>Your local pharmacy workspace is ready.</p></div><span className="date-chip">{new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" }).format(new Date())}</span></header><section className="welcome-panel"><div><span className="welcome-kicker">FOUNDATION READY</span><h2>Welcome, {auth.status?.user?.displayName}</h2><p>AUSHADHARTH is running locally. Pharmacy operational figures will appear only after their modules are enabled and real transactions exist.</p></div><div className="shield-mark" aria-hidden="true">✓</div></section>{summary.isPending ? <LoadingState /> : summary.isError ? <ErrorState onRetry={() => void summary.refetch()} /> : <section className="metric-grid" aria-label="Current catalog summary"><Metric label="Active products" value={summary.data.activeProductCount} note="Medicine and pharmacy item identities" /><Metric label="Active packs / SKUs" value={summary.data.activePackCount} note="Configured saleable presentations" /><Metric label="Local service" value="Online" note="Core operations available without internet" success /></section>}<section className="readiness-card"><div><h2>Workspace readiness</h2><p>Foundation services available for the next implementation slices.</p></div><ul><li><StatusDot tone="success" /><span><strong>Local database</strong><small>Store Service-owned SQLite foundation</small></span><b>Ready</b></li><li><StatusDot tone="success" /><span><strong>Secure access</strong><small>Local user and session protection</small></span><b>Ready</b></li><li><StatusDot tone="neutral" /><span><strong>Operational modules</strong><small>Masters, sales, purchase, and stock</small></span><b>Not enabled</b></li></ul></section></>;
+  return <><header className="page-header"><div><p className="eyebrow">OVERVIEW</p><h1>Dashboard</h1><p>Your local pharmacy workspace is ready.</p></div><span className="date-chip">{new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" }).format(new Date())}</span></header><section className="welcome-panel"><div><span className="welcome-kicker">FOUNDATION READY</span><h2>Welcome, {auth.status?.user?.displayName}</h2><p>AUSHADHARTH is running locally. Pharmacy operational figures will appear only after their modules are enabled and real transactions exist.</p></div><div className="shield-mark" aria-hidden="true">✓</div></section>{summary.isPending ? <LoadingState /> : summary.isError ? <ErrorState onRetry={() => void summary.refetch()} /> : <section className="metric-grid" aria-label="Current catalog summary"><Metric label="Active products" value={summary.data.activeProductCount} note="Medicine and pharmacy item identities" /><Metric label="Active packs / SKUs" value={summary.data.activePackCount} note="Configured saleable presentations" /><Metric label="Local service" value="Online" note="Core operations available without internet" success /></section>}<section className="readiness-card"><div><h2>Workspace readiness</h2><p>Foundation services available for the next implementation slices.</p></div><ul><li><StatusDot tone="success" /><span><strong>Local database</strong><small>Store Service-owned SQLite foundation</small></span><b>Ready</b></li><li><StatusDot tone="success" /><span><strong>Secure access</strong><small>Local user and session protection</small></span><b>Ready</b></li><li><StatusDot tone="neutral" /><span><strong>Operational modules</strong><small>Masters, sales, purchase, and stock</small></span><b className="readiness-planned">Planned</b></li></ul></section></>;
 }
 
 function Metric({ label, value, note, success = false }: { label: string; value: number | string; note: string; success?: boolean }) { return <article className="metric-card"><span>{label}</span><strong className={success ? "metric-success" : ""}>{value}</strong><p>{note}</p></article>; }

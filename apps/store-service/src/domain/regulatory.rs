@@ -404,6 +404,34 @@ pub async fn resolve_manufacturer(
     .await
 }
 
+/// Every manufacturer in force for a product on a date, as `(company_id, display_name)`.
+///
+/// `resolve_manufacturer` answers "which one does a Sale record", and takes the latest when a
+/// product has more than one. A receipt cannot do that: rule 65(21)(b)(v) asks who made the goods
+/// that actually arrived, and picking the most recent of two would be a guess about a physical
+/// carton. This returns them all, so the caller can record the only one, ask the operator which it
+/// was, or record that it is not known.
+pub async fn resolve_manufacturer_candidates(
+    connection: &mut PoolConnection<Sqlite>,
+    product_id: &str,
+    business_date: &str,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT company.id,company.display_name \
+         FROM product_company_roles role \
+         JOIN pharmaceutical_companies company ON company.id=role.company_id \
+         WHERE role.product_id=? AND role.role='manufacturer' AND role.status='active' \
+           AND (role.effective_from IS NULL OR role.effective_from<=?) \
+           AND (role.effective_to IS NULL OR role.effective_to>?) \
+         ORDER BY company.display_name, company.id",
+    )
+    .bind(product_id)
+    .bind(business_date)
+    .bind(business_date)
+    .fetch_all(&mut **connection)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

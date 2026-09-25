@@ -106,24 +106,32 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 
 .app-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .18s ease; }
 .app-layout--collapsed { grid-template-columns: 72px minmax(0, 1fr); }
+/* A collapsed rail has no room for a group heading; the drawer and the full sidebar do. */
+.app-layout--collapsed .nav-group-label { display: none; }
 .sidebar { position: sticky; top: 0; display: flex; flex-direction: column; height: 100vh; padding: 20px 14px 14px; color: white; background: var(--primary-950); overflow: hidden; }
 .sidebar__brand { min-height: 55px; padding: 5px; white-space: nowrap; }
 .sidebar .brand-mark, .sidebar .brand-mark small { color: white; }
 .sidebar .brand-mark__symbol { color: var(--primary-950); background: #bfe4d3; }
-.sidebar nav { margin-top: 22px; }
+.sidebar__nav { display: block; margin-top: 22px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .nav-item { display: flex; align-items: center; gap: 12px; min-height: 43px; padding: 9px 12px; border-radius: 8px; color: #bcd0c7; text-decoration: none; font-size: .84rem; font-weight: 650; white-space: nowrap; }
 .nav-item svg { flex: 0 0 auto; width: 18px; fill: currentColor; }
 .nav-item:hover { color: white; background: #183f33; }
 .nav-item--active { color: white; background: #1d5644; box-shadow: inset 3px 0 #78c4a3; }
-.sidebar__next { margin: 28px 9px 0; padding-top: 22px; border-top: 1px solid #244a3e; }
-.sidebar__next span { color: #79988b; font-size: .61rem; font-weight: 800; letter-spacing: .11em; }
-.sidebar__next p { color: #91aa9f; font-size: .69rem; line-height: 1.5; }
+.sidebar__next { flex: 0 0 auto; margin: 16px 9px 0; padding-top: 14px; border-top: 1px solid #244a3e; color: #91aa9f; font-size: .68rem; line-height: 1.45; }
 .sidebar-toggle { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; margin-top: auto; border: 1px solid #315448; border-radius: 7px; color: #c2d3cc; background: transparent; cursor: pointer; white-space: nowrap; }
 .workspace { min-width: 0; }
+
+/* Phase U1. On a phone the navigation is a drawer: closed on arrival, over the page rather than
+   above it, and dismissed by the backdrop, by Escape or by going somewhere. On a wide screen none
+   of this applies and the sidebar is ordinary furniture. */
+.nav-toggle { display: none; align-items: center; justify-content: center; width: 40px; height: 40px; margin-right: 4px; border: 1px solid var(--line); border-radius: 9px; color: var(--primary-950); background: white; font-size: 1.05rem; cursor: pointer; }
+.nav-toggle:focus-visible { outline: 2px solid var(--primary-700); outline-offset: 2px; }
+.nav-drawer-close { display: none; align-items: center; justify-content: center; width: 36px; height: 36px; border: 1px solid #315448; border-radius: 9px; color: #dcebe4; background: transparent; font-size: 1.2rem; line-height: 1; cursor: pointer; }
+.nav-backdrop { display: none; position: fixed; z-index: 30; inset: 0; width: 100%; height: 100%; border: 0; padding: 0; background: rgb(8 24 18 / 52%); }
 .topbar { position: sticky; z-index: 5; top: 0; display: flex; align-items: center; justify-content: space-between; min-height: 68px; padding: 10px 28px; border-bottom: 1px solid var(--line); background: rgb(255 255 255 / 96%); backdrop-filter: blur(8px); }
-.topbar > div:first-child { display: flex; flex-direction: column; }
+.topbar__workspace { display: flex; flex-direction: column; min-width: 0; margin-right: auto; }
 .topbar__label { color: var(--ink-500); font-size: .59rem; font-weight: 800; letter-spacing: .12em; }
-.topbar > div:first-child strong { margin-top: 3px; font-size: .86rem; }
+.topbar__workspace strong { margin-top: 3px; font-size: .86rem; }
 .topbar__actions { display: flex; align-items: center; gap: 18px; }
 .connectivity { display: flex; align-items: center; gap: 14px; color: var(--ink-500); font-size: .69rem; }
 .connectivity > span { display: flex; align-items: center; gap: 6px; }
@@ -141,7 +149,9 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .user-popover p small { color: var(--ink-500); font-size: .68rem; }
 .user-popover button { width: 100%; padding: 9px; border: 0; border-radius: 6px; color: var(--danger-700); background: transparent; text-align: left; cursor: pointer; }
 .main-content { max-width: 1300px; margin: auto; padding: 28px; }
-.page-header { display: flex; align-items: end; justify-content: space-between; margin-bottom: 22px; }
+.page-header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px 16px; margin-bottom: 22px; }
+.page-header > div:first-child { min-width: 0; }
+.page-header h1, .page-header .eyebrow { overflow-wrap: anywhere; }
 .page-header h1 { margin: 4px 0; color: var(--primary-950); font-size: 1.75rem; letter-spacing: -.03em; }
 .page-header p:last-child { margin: 0; color: var(--ink-500); font-size: .82rem; }
 .date-chip { padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink-700); background: white; font-size: .72rem; }
@@ -192,7 +202,12 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .filter-field select, .field select { min-height: 37px; padding: 8px 30px 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: white; color: var(--ink-900); }
 /* Positioned so the scroller is the containing block for its absolutely positioned .sr-only
    captions; otherwise they escape the horizontal clip and widen the whole page on narrow screens. */
+.table-scroll-shell { position: relative; display: grid; gap: 6px; min-width: 0; }
 .table-scroll { position: relative; overflow-x: auto; }
+/* The fade is the cue that a column continues past the edge; it is removed once the reader has
+   scrolled to the end, so it never claims there is more when there is not. */
+.table-scroll[data-overflowing="true"][data-at-end="false"] { mask-image: linear-gradient(to right, black calc(100% - 34px), transparent); }
+.table-scroll__hint { display: flex; align-items: center; gap: 5px; margin: 0; color: var(--ink-500); font-size: .68rem; font-weight: 650; }
 .data-table { width: 100%; border-collapse: collapse; font-size: .73rem; }
 .data-table th { padding: 10px 14px; border-bottom: 1px solid var(--line); background: #f6f8f7; color: var(--ink-500); font-size: .62rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; white-space: nowrap; }
 .data-table td { max-width: 270px; padding: 11px 14px; border-bottom: 1px solid #edf1ef; line-height: 1.4; }
@@ -303,14 +318,28 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 @media (max-width: 590px) {
   .entry-page { padding: 16px; }
   .launch-card, .entry-card, .form-card { padding: 25px; }
+  /* The page owns the screen; the navigation waits in a drawer until it is asked for. */
   .app-layout, .app-layout--collapsed { display: block; }
-  .sidebar { position: static; width: 100%; height: auto; flex-direction: row; align-items: center; padding: 8px 14px; }
-  .sidebar__brand { min-height: auto; }
-  .sidebar nav { margin: 0 0 0 auto; }
+  .sidebar { position: fixed; z-index: 40; top: 0; left: 0; width: min(82vw, 300px); height: 100dvh; padding: 14px 12px; transform: translateX(-102%); transition: transform .18s ease; }
+  .sidebar--open { transform: translateX(0); box-shadow: 0 0 40px rgb(6 20 15 / 45%); }
+  .app-layout--collapsed .sidebar { width: min(82vw, 300px); }
+  .sidebar .brand-mark > span:last-child, .sidebar .nav-item span, .sidebar__next { display: revert; }
+  .app-layout--collapsed .nav-group-label { display: revert; }
+  .sidebar__brand { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: auto; }
+  .sidebar__nav { margin-top: 14px; }
   .sidebar-toggle { display: none; }
-  .topbar { padding: 8px 14px; }
-  .topbar > div:first-child { display: none; }
-  .topbar__actions { width: 100%; justify-content: space-between; }
+  .nav-toggle, .nav-drawer-close { display: inline-flex; }
+  .nav-backdrop { display: block; }
+  .topbar { gap: 10px; padding: 8px 14px; }
+  .topbar__workspace { min-width: 0; }
+  .topbar__workspace strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar__label { display: none; }
+  .topbar__actions { gap: 10px; }
+  .connectivity > span { white-space: nowrap; }
+  .user-button > span:nth-child(2) { display: none; }
+  .page-header { align-items: start; }
+  .page-header__actions { width: 100%; }
+  .page-header__actions .button, .page-header__actions .read-only-note { flex: 1 1 auto; text-align: center; }
   .main-content { padding: 18px; }
   .reference-landing { grid-template-columns: 1fr; }
   .master-form { grid-template-columns: 1fr; }
@@ -465,6 +494,15 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .pos-prescription .pos-warning { margin: 0; font-size: .72rem; }
 .panel-callout ul { margin: 4px 0; padding-left: 18px; overflow-wrap: anywhere; }
 
+/* Phase U1. Receipt provenance is a different KIND of fact from the document beside it: it was
+   frozen once and cannot move. The tint and the rule down its left say "history" quietly; nothing
+   here is a warning, because a complete receipt is the ordinary case. */
+.provenance-panel { border-left: 3px solid var(--primary-200, #cfe6db); background: linear-gradient(to bottom, var(--surface-soft), white 120px); }
+.provenance-panel__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.provenance-panel__head h2 { margin: 0; }
+.provenance-panel .detail-grid dt { display: flex; align-items: center; gap: 6px; }
+.provenance-source { margin: 0; color: var(--ink-500); font-size: .7rem; }
+
 /* Phase 1M-B: the rule 65(3)(1) entry, laid out as the leaf the pharmacist signs and keeps. */
 .record-page { display: grid; gap: 16px; }
 .record-leaf { display: grid; gap: 12px; }
@@ -503,6 +541,24 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
   .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "prescription" "customer"; }
   .pos-summary { position: static; }
 }
+/* On the shop's monitor the amount payable and the posting action are what the cashier looks at
+   last and needs first, so the summary column keeps its own scroll against a tall bill. */
+@media (min-width: 901px) {
+  .pos-summary { top: 12px; gap: 8px; max-height: calc(100vh - 100px); overflow-y: auto; }
+  /* The amount payable and the action that takes it are what the counter reaches for, so the
+     column spends its height on them rather than on padding around the notes. */
+  .pos-summary .inline-notice { padding: 8px 10px; font-size: .7rem; }
+  .pos-summary .field { margin: 0; }
+  .pos-summary__note { margin: 2px 0 0; }
+}
+
+/* Phase U1. A document's state, in words, tinted only to group like with like. */
+.status-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border: 1px solid transparent; border-radius: 999px; font-size: .64rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.status-badge--posted { color: var(--primary-900); border-color: var(--primary-200, #cfe6db); background: var(--primary-100); }
+.status-badge--draft { color: #8a5a00; border-color: #f0dcb4; background: #fdf1d8; }
+.status-badge--neutral { color: var(--ink-700); border-color: var(--line); background: var(--surface-soft); }
+.status-badge--void { color: var(--danger-700); border-color: #f0cfcf; background: var(--danger-100); }
+.readiness-planned { color: var(--ink-500); font-weight: 700; }
 
 /* Phase 1I returns. A stock status is a fact the reader must not have to decode, so each one is
    named in words and coloured by what it means for selling. */

@@ -54,7 +54,9 @@ function line(overrides: Partial<PurchaseLine> = {}): PurchaseLine {
     quantityPacks: 10, ratePerPackPaise: 3_000, quantityAtoms: 100, taxableValuePaise: 30_000,
     hsnCodeId: null, hsnCode: null, taxCategoryId: null, taxTreatmentKind: null, taxRateVersionId: null,
     cgstBasisPoints: 0, sgstBasisPoints: 0, igstBasisPoints: 0, cessBasisPoints: 0,
-    cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, lineTotalPaise: 0, ...overrides
+    cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, lineTotalPaise: 0,
+    drugDisplayName: null, batchNumber: null, manufacturerCompanyId: null, manufacturerName: null,
+    manufacturerState: null, ...overrides
   };
 }
 
@@ -67,7 +69,13 @@ function purchase(overrides: Partial<PurchaseDetail> = {}): PurchaseDetail {
     storeNormalizedGstin: null, storePlaceOfSupplyStateId: null, storeStateCode: null, taxTreatment: null,
     taxableValuePaise: 0, cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, grandTotalPaise: 0,
     createdByUserId: IDs.user, createdAtUtc: "2026-09-10T05:00:00Z", updatedAtUtc: "2026-09-10T05:00:00Z",
-    postedByUserId: null, postedAtUtc: null, lines: [line()], ...overrides
+    postedByUserId: null, postedAtUtc: null,
+    purchaseProvenanceSnapshotVersion: 0, supplierAddressState: null, supplierAddressId: null,
+    supplierAddressLine1: null, supplierAddressLine2: null, supplierAddressCity: null,
+    supplierAddressPostalCode: null, supplierAddressCountryCode: null, supplierAddressStateId: null,
+    supplierAddressStateName: null, supplierAddressStateCode: null, supplierDrugLicenceState: null,
+    supplierDrugLicenceNumber: null, supplierDrugLicenceValidUpto: null,
+    lines: [line()], ...overrides
   };
 }
 
@@ -87,6 +95,36 @@ function postedPurchase(overrides: Partial<PurchaseDetail> = {}): PurchaseDetail
     })],
     ...overrides
   });
+}
+
+/** A posted receipt that froze where its stock came from: Phase 1M-D1-A provenance, version 1. */
+function receiptWithProvenance(overrides: Partial<PurchaseDetail> = {}): PurchaseDetail {
+  const posted = postedPurchase();
+  return {
+    ...posted,
+    purchaseProvenanceSnapshotVersion: 1,
+    supplierAddressState: "recorded",
+    supplierAddressId: IDs.supplier,
+    supplierAddressLine1: "14 Ware House Road",
+    supplierAddressCity: "Thane",
+    supplierAddressPostalCode: "421302",
+    supplierAddressCountryCode: "IN",
+    supplierAddressStateId: IDs.store,
+    supplierAddressStateName: "Maharashtra",
+    supplierAddressStateCode: "27",
+    supplierDrugLicenceState: "recorded",
+    supplierDrugLicenceNumber: "20B-MH-9911 / 21B-MH-9912",
+    supplierDrugLicenceValidUpto: "2027-12-31",
+    lines: posted.lines.map((entry) => ({
+      ...entry,
+      drugDisplayName: "Crocin 500 mg Tablet",
+      batchNumber: "B-2601",
+      manufacturerCompanyId: IDs.store,
+      manufacturerName: "Meridian Laboratories",
+      manufacturerState: "recorded" as const
+    })),
+    ...overrides
+  };
 }
 
 function response(body: unknown, status = 200) { return { ok: status >= 200 && status < 300, status, json: async () => body }; }
@@ -506,7 +544,8 @@ describe("Posting a purchase", () => {
     fireEvent.click(confirm);
 
     await waitFor(() => expect(writes(app).filter((write) => write.path.endsWith("/post"))).toHaveLength(1));
-    expect(await screen.findByText("Posted · read-only")).toBeInTheDocument();
+    expect(await screen.findByText("Posted")).toBeInTheDocument();
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
   });
 
   it("replaces the editor with the posted document once posting succeeds", async () => {
@@ -515,7 +554,8 @@ describe("Posting a purchase", () => {
     const dialog = await screen.findByRole("dialog", { name: "Post Purchase" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Post Purchase" }));
 
-    expect(await screen.findByText("Posted · read-only")).toBeInTheDocument();
+    expect(await screen.findByText("Posted")).toBeInTheDocument();
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Add Line" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit Header" })).not.toBeInTheDocument();
   });
@@ -575,6 +615,73 @@ describe("Posted purchase detail", () => {
     await waitFor(() => expect(screen.getAllByText(/Sharma Medicals/).length).toBeGreaterThan(0));
     expect(document.body.textContent).not.toContain(IDs.supplier);
     expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-/);
+  });
+
+  it("shows the receipt provenance it froze, and never today's master in its place", async () => {
+    renderApp(`/app/purchases/${IDs.purchase}`, purchaseService({ documents: [receiptWithProvenance()] }));
+    const panel = await screen.findByTestId("receipt-provenance");
+    expect(within(panel).getByTestId("provenance-address")).toHaveTextContent("14 Ware House Road, Thane, 421302, Maharashtra");
+    expect(within(panel).getByTestId("provenance-licence")).toHaveTextContent("20B-MH-9911 / 21B-MH-9912");
+    expect(within(panel).getByText("2027-12-31")).toBeInTheDocument();
+    const lines = within(panel).getByTestId("provenance-lines");
+    expect(within(lines).getByText("Crocin 500 mg Tablet")).toBeInTheDocument();
+    expect(within(lines).getByText("B-2601")).toBeInTheDocument();
+    expect(within(lines).getByText("Meridian Laboratories")).toBeInTheDocument();
+    // The page records what it was given; it does not vouch for the licence.
+    expect(within(panel).getByText(/does not verify them/)).toBeInTheDocument();
+    expect(panel.textContent ?? "").not.toMatch(/duly licensed|licence verified|Schedule X/i);
+  });
+
+  it("marks receipt provenance as frozen at posting, without claiming the licence was checked", async () => {
+    renderApp(`/app/purchases/${IDs.purchase}`, purchaseService({ documents: [receiptWithProvenance()] }));
+    const panel = await screen.findByTestId("receipt-provenance");
+    expect(within(panel).getByText("Frozen at posting")).toBeInTheDocument();
+    expect(within(panel).getByText(/as they stood when this receipt was posted/)).toBeInTheDocument();
+    // The badge says what happened, not that anybody verified anything.
+    expect(panel.textContent ?? "").not.toMatch(/verified|approved|duly licensed|selected by/i);
+    // The document's own state is said in words, not by colour alone.
+    expect(screen.getByText("Posted")).toBeInTheDocument();
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+  });
+
+  it("offers a scroll affordance only when a table really is wider than its screen", async () => {
+    renderApp(`/app/purchases/${IDs.purchase}`, purchaseService({ documents: [receiptWithProvenance()] }));
+    await screen.findByTestId("receipt-provenance");
+    // jsdom lays nothing out, so no table overflows and no hint is claimed.
+    expect(screen.queryAllByTestId("table-scroll-hint")).toHaveLength(0);
+    const scrollers = document.querySelectorAll(".table-scroll");
+    expect(scrollers.length).toBeGreaterThanOrEqual(2);
+    for (const scroller of Array.from(scrollers)) {
+      expect(scroller).toHaveAttribute("data-overflowing", "false");
+    }
+  });
+
+  it("says plainly that a receipt posted before provenance has none, rather than filling it in", async () => {
+    renderApp(`/app/purchases/${IDs.purchase}`, purchaseService({ documents: [postedPurchase()] }));
+    const panel = await screen.findByTestId("receipt-provenance");
+    expect(within(panel).getByTestId("provenance-legacy")).toHaveTextContent(/posted before receipt provenance was captured/);
+    expect(within(panel).queryByTestId("provenance-lines")).not.toBeInTheDocument();
+  });
+
+  it("shows a fact nobody recorded as not recorded, on the document and on its lines", async () => {
+    const receipt = receiptWithProvenance({
+      supplierAddressState: "not_recorded", supplierAddressId: null, supplierAddressLine1: null,
+      supplierAddressCity: null, supplierAddressPostalCode: null, supplierAddressCountryCode: null,
+      supplierAddressStateId: null, supplierAddressStateName: null, supplierAddressStateCode: null,
+      supplierDrugLicenceState: "not_recorded", supplierDrugLicenceNumber: null, supplierDrugLicenceValidUpto: null
+    });
+    renderApp(`/app/purchases/${IDs.purchase}`, purchaseService({
+      documents: [{
+        ...receipt,
+        lines: receipt.lines.map((entry) => ({ ...entry, manufacturerState: "not_recorded" as const, manufacturerCompanyId: null, manufacturerName: null }))
+      }]
+    }));
+    const panel = await screen.findByTestId("receipt-provenance");
+    expect(within(panel).getByTestId("provenance-address")).toHaveTextContent("Not recorded");
+    expect(within(panel).getByTestId("provenance-licence")).toHaveTextContent("Not recorded");
+    expect(within(within(panel).getByTestId("provenance-lines")).getAllByText("Not recorded").length).toBeGreaterThan(0);
+    // The drug and its lot were there to freeze, so they are not "not recorded".
+    expect(within(panel).getByText("Crocin 500 mg Tablet")).toBeInTheDocument();
   });
 
   it("shows a read-only draft no tax figure and no snapshot it does not have", async () => {

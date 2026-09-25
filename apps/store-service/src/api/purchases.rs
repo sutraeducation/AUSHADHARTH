@@ -28,7 +28,7 @@ use super::reference_masters::ReferenceState;
 use crate::domain::{
     catalog::{CatalogValidationIssue, required_text, validate_date, validate_uuid_v7},
     money::{self, LineAmounts, MoneyError, RateComponents, TaxTreatment},
-    taxation,
+    regulatory, taxation,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -328,6 +328,10 @@ struct LineRequest {
     new_batch_mrp_paise: Option<i64>,
     quantity_packs: i64,
     rate_per_pack_paise: i64,
+    /// Phase 1M-D1-A: which manufacturer of this product made what arrived. Optional, because an
+    /// ordinary purchase of a product with one maker needs no choice, and a product with none
+    /// cannot offer one.
+    manufacturer_company_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +380,20 @@ struct PurchaseHeaderResponse {
     updated_at_utc: String,
     posted_by_user_id: Option<String>,
     posted_at_utc: Option<String>,
+    purchase_provenance_snapshot_version: i64,
+    supplier_address_state: Option<String>,
+    supplier_address_id: Option<String>,
+    supplier_address_line1: Option<String>,
+    supplier_address_line2: Option<String>,
+    supplier_address_city: Option<String>,
+    supplier_address_postal_code: Option<String>,
+    supplier_address_country_code: Option<String>,
+    supplier_address_state_id: Option<String>,
+    supplier_address_state_name: Option<String>,
+    supplier_address_state_code: Option<String>,
+    supplier_drug_licence_state: Option<String>,
+    supplier_drug_licence_number: Option<String>,
+    supplier_drug_licence_valid_upto: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -408,6 +426,11 @@ struct PurchaseLineResponse {
     igst_paise: i64,
     cess_paise: i64,
     line_total_paise: i64,
+    drug_display_name: Option<String>,
+    batch_number: Option<String>,
+    manufacturer_company_id: Option<String>,
+    manufacturer_name: Option<String>,
+    manufacturer_state: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -424,13 +447,18 @@ const HEADER_COLUMNS: &str = "id,store_id,supplier_party_id,supplier_invoice_num
      supplier_state_code,store_gst_registration_status,store_normalized_gstin,\
      store_place_of_supply_state_id,store_state_code,tax_treatment,taxable_value_paise,cgst_paise,\
      sgst_paise,igst_paise,cess_paise,grand_total_paise,created_by_user_id,created_at_utc,\
-     updated_at_utc,posted_by_user_id,posted_at_utc";
+     updated_at_utc,posted_by_user_id,posted_at_utc,purchase_provenance_snapshot_version,\
+     supplier_address_state,supplier_address_id,supplier_address_line1,supplier_address_line2,\
+     supplier_address_city,supplier_address_postal_code,supplier_address_country_code,\
+     supplier_address_state_id,supplier_address_state_name,supplier_address_state_code,\
+     supplier_drug_licence_state,supplier_drug_licence_number,supplier_drug_licence_valid_upto";
 
 const LINE_COLUMNS: &str = "id,purchase_document_id,line_number,product_id,product_pack_id,batch_id,\
      new_batch_number,new_batch_expires_on,new_batch_mrp_paise,quantity_packs,rate_per_pack_paise,\
      quantity_atoms,taxable_value_paise,hsn_code_id,hsn_code,tax_category_id,tax_treatment_kind,\
      tax_rate_version_id,cgst_basis_points,sgst_basis_points,igst_basis_points,cess_basis_points,\
-     cgst_paise,sgst_paise,igst_paise,cess_paise,line_total_paise";
+     cgst_paise,sgst_paise,igst_paise,cess_paise,line_total_paise,drug_display_name,batch_number,\
+     manufacturer_company_id,manufacturer_name,manufacturer_state";
 
 pub fn routes() -> Router<ReferenceState> {
     Router::new()
@@ -709,7 +737,8 @@ async fn update_line(
     sqlx::query(
         "UPDATE purchase_lines SET product_id=?,product_pack_id=?,batch_id=?,new_batch_number=?,\
          new_batch_expires_on=?,new_batch_mrp_paise=?,quantity_packs=?,rate_per_pack_paise=?,\
-         quantity_atoms=?,taxable_value_paise=?,updated_at_utc=? WHERE id=?",
+         quantity_atoms=?,taxable_value_paise=?,manufacturer_company_id=?,updated_at_utc=? \
+         WHERE id=?",
     )
     .bind(&prepared.product_id)
     .bind(&prepared.product_pack_id)
@@ -721,6 +750,7 @@ async fn update_line(
     .bind(prepared.rate_per_pack_paise)
     .bind(prepared.quantity_atoms)
     .bind(prepared.taxable_value_paise)
+    .bind(&prepared.manufacturer_company_id)
     .bind(&now)
     .bind(&line_id)
     .execute(&mut *transaction)
@@ -799,6 +829,7 @@ struct PreparedLine {
     rate_per_pack_paise: i64,
     quantity_atoms: i64,
     taxable_value_paise: i64,
+    manufacturer_company_id: Option<String>,
 }
 
 async fn prepare_line(
@@ -872,6 +903,32 @@ async fn prepare_line(
         None => None,
     };
 
+    // A chosen manufacturer must be a manufacturer OF THIS PRODUCT. A company that makes something
+    // else, or that only markets this one, is refused here rather than written into history.
+    let manufacturer_company_id = match request.manufacturer_company_id.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => {
+            let company =
+                validate_uuid_v7(value, "manufacturerCompanyId").map_err(validation_issue)?;
+            let known: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM product_company_roles WHERE product_id=? AND company_id=? \
+                 AND role='manufacturer' AND status='active' LIMIT 1",
+            )
+            .bind(&product_id)
+            .bind(&company)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_database_error)?;
+            if known.is_none() {
+                return Err(validation_of(
+                    "manufacturerCompanyId",
+                    "that company is not a recorded manufacturer of this product",
+                ));
+            }
+            Some(company)
+        }
+        _ => None,
+    };
+
     let taxable_value_paise =
         money::taxable_value_paise(request.quantity_packs, request.rate_per_pack_paise)?;
     let quantity_atoms = money::quantity_atoms(request.quantity_packs, base_quantity_atoms)?;
@@ -889,6 +946,7 @@ async fn prepare_line(
         rate_per_pack_paise: request.rate_per_pack_paise,
         quantity_atoms,
         taxable_value_paise,
+        manufacturer_company_id,
     })
 }
 
@@ -1049,6 +1107,48 @@ async fn post_within_transaction(
     // The treatment is decided here, from two persisted State codes.
     let treatment = TaxTreatment::from_state_codes(&store_state_code, &supplier_state_code);
 
+    // Phase 1M-D1-A: the supplier's address and licence as they stand INSIDE this transaction.
+    // Read here, under the same lock as everything else the posting freezes, so an edit racing the
+    // posting either lands wholly before it or wholly after it.
+    let address = sqlx::query_as::<_, SupplierAddressSource>(
+        "SELECT address.id,address.line1,address.line2,address.city,address.postal_code,\
+         address.country_code,address.state_id,state.display_name AS state_name,state.state_code \
+         FROM party_addresses address \
+         LEFT JOIN state_codes state ON state.id=address.state_id \
+         WHERE address.party_id=? AND address.status='active' \
+         ORDER BY address.is_primary DESC, \
+                  CASE address.address_role WHEN 'billing' THEN 0 ELSE 1 END, address.id \
+         LIMIT 1",
+    )
+    .bind(&supplier_id)
+    .fetch_optional(&mut **connection)
+    .await
+    .map_err(map_database_error)?;
+    let address_state = if address.is_some() {
+        "recorded"
+    } else {
+        "not_recorded"
+    };
+    let licence = sqlx::query_as::<_, SupplierLicenceSource>(
+        "SELECT drug_licence_number,drug_licence_valid_upto FROM parties WHERE id=?",
+    )
+    .bind(&supplier_id)
+    .fetch_optional(&mut **connection)
+    .await
+    .map_err(map_database_error)?
+    .filter(|source| {
+        source
+            .drug_licence_number
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|number| !number.is_empty())
+    });
+    let licence_state = if licence.is_some() {
+        "recorded"
+    } else {
+        "not_recorded"
+    };
+
     let mut computed = Vec::with_capacity(lines.len());
     for line in &lines {
         computed.push(resolve_and_compute(connection, line, &invoice_date, treatment).await?);
@@ -1072,6 +1172,51 @@ async fn post_within_transaction(
             (None, Some(number)) => Some(create_batch(connection, line, number, &now).await?),
             (None, None) => None,
         };
+        // The name under which this drug was received, the lot that arrived, and who made it.
+        let drug_display_name: String =
+            sqlx::query_scalar("SELECT display_name FROM products WHERE id=?")
+                .bind(&line.product_id)
+                .fetch_optional(&mut **connection)
+                .await
+                .map_err(map_database_error)?
+                .ok_or(PurchaseError::NotFound)?;
+        let batch_number: Option<String> = match batch_id.as_deref() {
+            Some(batch) => Some(
+                sqlx::query_scalar("SELECT batch_number FROM product_batches WHERE id=?")
+                    .bind(batch)
+                    .fetch_optional(&mut **connection)
+                    .await
+                    .map_err(map_database_error)?
+                    .ok_or(PurchaseError::NotFound)?,
+            ),
+            None => None,
+        };
+        // One maker in force is the fact. Several, with no choice made, is not a fact about this
+        // carton, and neither is none at all: both are recorded as "not recorded" rather than
+        // settled by the database's sort order.
+        let candidates = regulatory::resolve_manufacturer_candidates(
+            connection,
+            &line.product_id,
+            &invoice_date,
+        )
+        .await
+        .map_err(map_database_error)?;
+        let manufacturer = match line.manufacturer_company_id.as_deref() {
+            Some(chosen) => candidates
+                .iter()
+                .find(|(company, _)| company == chosen)
+                .cloned(),
+            None => match candidates.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+        };
+        let manufacturer_state = if manufacturer.is_some() {
+            "recorded"
+        } else {
+            "not_recorded"
+        };
+
         sqlx::query(
             // The proposed-batch fields are draft scaffolding. Once posting has materialised the
             // lot, batch_id is the authoritative identity, so the proposal is cleared — which also
@@ -1081,7 +1226,9 @@ async fn post_within_transaction(
              new_batch_mrp_paise=NULL,hsn_code_id=?,hsn_code=?,tax_category_id=?,\
              tax_treatment_kind=?,tax_rate_version_id=?,cgst_basis_points=?,sgst_basis_points=?,\
              igst_basis_points=?,cess_basis_points=?,cgst_paise=?,sgst_paise=?,igst_paise=?,\
-             cess_paise=?,line_total_paise=?,updated_at_utc=? WHERE id=?",
+             cess_paise=?,line_total_paise=?,drug_display_name=?,batch_number=?,\
+             manufacturer_company_id=?,manufacturer_name=?,manufacturer_state=?,updated_at_utc=? \
+             WHERE id=?",
         )
         .bind(&batch_id)
         .bind(&entry.hsn_code_id)
@@ -1098,6 +1245,11 @@ async fn post_within_transaction(
         .bind(entry.amounts.igst_paise)
         .bind(entry.amounts.cess_paise)
         .bind(entry.amounts.line_total_paise)
+        .bind(&drug_display_name)
+        .bind(&batch_number)
+        .bind(manufacturer.as_ref().map(|(company, _)| company))
+        .bind(manufacturer.as_ref().map(|(_, name)| name))
+        .bind(manufacturer_state)
         .bind(&now)
         .bind(&line.id)
         .execute(&mut **connection)
@@ -1134,7 +1286,13 @@ async fn post_within_transaction(
          store_normalized_gstin=?,store_place_of_supply_state_id=?,store_state_code=?,\
          tax_treatment=?,taxable_value_paise=?,cgst_paise=?,sgst_paise=?,igst_paise=?,cess_paise=?,\
          grand_total_paise=?,posted_by_user_id=?,posted_at_utc=?,posting_idempotency_key=?,\
-         posting_fingerprint=?,updated_at_utc=? WHERE id=? AND revision=? AND status='draft'",
+         posting_fingerprint=?,purchase_provenance_snapshot_version=1,supplier_address_state=?,\
+         supplier_address_id=?,supplier_address_line1=?,supplier_address_line2=?,\
+         supplier_address_city=?,supplier_address_postal_code=?,supplier_address_country_code=?,\
+         supplier_address_state_id=?,supplier_address_state_name=?,supplier_address_state_code=?,\
+         supplier_drug_licence_state=?,supplier_drug_licence_number=?,\
+         supplier_drug_licence_valid_upto=?,updated_at_utc=? \
+         WHERE id=? AND revision=? AND status='draft'",
     )
     .bind(next)
     .bind(&supplier_name)
@@ -1158,6 +1316,39 @@ async fn post_within_transaction(
     .bind(&now)
     .bind(idempotency_key)
     .bind(&fingerprint)
+    .bind(address_state)
+    .bind(address.as_ref().map(|source| &source.id))
+    .bind(address.as_ref().map(|source| &source.line1))
+    .bind(address.as_ref().and_then(|source| source.line2.as_ref()))
+    .bind(address.as_ref().and_then(|source| source.city.as_ref()))
+    .bind(
+        address
+            .as_ref()
+            .and_then(|source| source.postal_code.as_ref()),
+    )
+    .bind(address.as_ref().map(|source| &source.country_code))
+    .bind(address.as_ref().and_then(|source| source.state_id.as_ref()))
+    .bind(
+        address
+            .as_ref()
+            .and_then(|source| source.state_name.as_ref()),
+    )
+    .bind(
+        address
+            .as_ref()
+            .and_then(|source| source.state_code.as_ref()),
+    )
+    .bind(licence_state)
+    .bind(
+        licence
+            .as_ref()
+            .and_then(|source| source.drug_licence_number.as_ref()),
+    )
+    .bind(
+        licence
+            .as_ref()
+            .and_then(|source| source.drug_licence_valid_upto.as_ref()),
+    )
     .bind(&now)
     .bind(id)
     .bind(revision)
@@ -1178,6 +1369,9 @@ async fn post_within_transaction(
             "taxTreatment": treatment.as_str(),
             "grandTotalPaise": totals.line_total_paise,
             "lineCount": lines.len(),
+            "provenanceVersion": 1,
+            "supplierAddress": address_state,
+            "supplierDrugLicence": licence_state,
         })
         .to_string(),
     )
@@ -1373,6 +1567,27 @@ struct SupplierTaxSource {
     status: String,
 }
 
+/// The supplier's address as it stands at posting: which row it came from, and the text to freeze.
+#[derive(Debug, FromRow)]
+struct SupplierAddressSource {
+    id: String,
+    line1: String,
+    line2: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    country_code: String,
+    state_id: Option<String>,
+    state_name: Option<String>,
+    state_code: Option<String>,
+}
+
+/// The supplier's drug licence exactly as the Party master records it. Never parsed.
+#[derive(Debug, FromRow)]
+struct SupplierLicenceSource {
+    drug_licence_number: Option<String>,
+    drug_licence_valid_upto: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct DraftLine {
     id: String,
@@ -1385,6 +1600,7 @@ struct DraftLine {
     quantity_packs: i64,
     rate_per_pack_paise: i64,
     quantity_atoms: i64,
+    manufacturer_company_id: Option<String>,
 }
 
 async fn load_lines(
@@ -1393,8 +1609,9 @@ async fn load_lines(
 ) -> Result<Vec<DraftLine>, PurchaseError> {
     sqlx::query_as::<_, DraftLine>(
         "SELECT id,product_id,product_pack_id,batch_id,new_batch_number,new_batch_expires_on,\
-         new_batch_mrp_paise,quantity_packs,rate_per_pack_paise,quantity_atoms \
-         FROM purchase_lines WHERE purchase_document_id=? ORDER BY line_number",
+         new_batch_mrp_paise,quantity_packs,rate_per_pack_paise,quantity_atoms,\
+         manufacturer_company_id FROM purchase_lines WHERE purchase_document_id=? \
+         ORDER BY line_number",
     )
     .bind(document_id)
     .fetch_all(&mut **connection)
@@ -1496,8 +1713,8 @@ async fn insert_line(
     sqlx::query(
         "INSERT INTO purchase_lines (id,purchase_document_id,line_number,product_id,product_pack_id,\
          batch_id,new_batch_number,new_batch_expires_on,new_batch_mrp_paise,quantity_packs,\
-         rate_per_pack_paise,quantity_atoms,taxable_value_paise,created_at_utc,updated_at_utc) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         rate_per_pack_paise,quantity_atoms,taxable_value_paise,manufacturer_company_id,\
+         created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(id)
     .bind(document_id)
@@ -1512,6 +1729,7 @@ async fn insert_line(
     .bind(line.rate_per_pack_paise)
     .bind(line.quantity_atoms)
     .bind(line.taxable_value_paise)
+    .bind(&line.manufacturer_company_id)
     .bind(now)
     .bind(now)
     .execute(&mut **transaction)
@@ -2908,5 +3126,669 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, body)
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Phase 1M-D1-A — immutable receipt provenance.
+    //
+    // Rule 65(21)(b) asks a Schedule X register what came in: from whom, at what address, under
+    // which licence, made by whom, in which lot, against which bill. None of that may be read back
+    // from a master that has moved on since, so these proofs are about one thing — that a posted
+    // receipt can still say what it was told, and says "not recorded" where it was told nothing.
+    // -------------------------------------------------------------------------------------
+
+    /// The supplier gains an address to be frozen.
+    async fn give_supplier_an_address(f: &Fixture, line1: &str) -> String {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO party_addresses (id,party_id,address_role,line1,line2,city,state_id,\
+             postal_code,is_primary,created_at_utc,updated_at_utc) \
+             VALUES (?,?,'billing',?,'Warehouse Lane','Thane',?,'421302',1,\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&id)
+        .bind(&f.supplier_id)
+        .bind(line1)
+        .bind(MAHARASHTRA)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The supplier's drug licence as the Party master records it: free text, never parsed.
+    async fn give_supplier_a_licence(f: &Fixture, number: &str, valid_upto: Option<&str>) {
+        sqlx::query(
+            "UPDATE parties SET drug_licence_number=?,drug_licence_valid_upto=? WHERE id=?",
+        )
+        .bind(number)
+        .bind(valid_upto)
+        .bind(&f.supplier_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A company that makes `product`, in force from 2020 unless told otherwise.
+    async fn give_product_a_manufacturer(f: &Fixture, product: &str, name: &str) -> String {
+        let company = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO pharmaceutical_companies (id,display_name,normalized_search_name,\
+             created_at_utc,updated_at_utc) VALUES (?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&company)
+        .bind(name)
+        .bind(name.to_lowercase())
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_company_roles (id,product_id,company_id,role,effective_from,\
+             created_at_utc,updated_at_utc) VALUES (?,?,?,'manufacturer','2020-01-01',\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(product)
+        .bind(&company)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        company
+    }
+
+    /// A line that proposes the lot it arrived in, so posting creates the batch and freezes its
+    /// number. `line_body` alone records no lot at all.
+    fn lot_line_body(revision: i64, f: &Fixture, batch: &str) -> Value {
+        let mut body = line_body(revision, &f.product_id, &f.pack_id, 5, 8000);
+        body["newBatchNumber"] = json!(batch);
+        body["newBatchExpiresOn"] = json!("2028-03-31");
+        body
+    }
+
+    async fn draft_with_lot(f: &Fixture, invoice: &str, batch: &str) -> String {
+        let (status, created) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/purchases",
+            draft_body(&f.supplier_id, invoice),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/purchases/{id}/lines"),
+            lot_line_body(1, f, batch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+        id
+    }
+
+    /// The posted receipt, read back from the service.
+    async fn posted_receipt(f: &Fixture, invoice: &str) -> Value {
+        let id = draft_with_lot(f, invoice, &format!("B-{invoice}")).await;
+        let (status, posted) = post_draft(f, &id, 2, &Uuid::now_v7().to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        posted
+    }
+
+    /// D1-A 1–9, 40. A receipt posted now freezes its own provenance: who supplied it and from
+    /// where, under which licence, what the drug was called, which lot arrived, who made it, the
+    /// bill it came on and how much of it — and says so at version 1. The ordinary purchase path
+    /// is unchanged around it.
+    #[tokio::test]
+    async fn d1a_a_receipt_freezes_the_particulars_of_what_arrived() {
+        let f = fixture().await;
+        let address = give_supplier_an_address(&f, "14 Ware House Road").await;
+        give_supplier_a_licence(&f, "20B-MH-9911 / 21B-MH-9912", Some("2027-12-31")).await;
+        let company = give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+
+        let posted = posted_receipt(&f, "INV-9001").await;
+        // 9. The document says which architecture captured it.
+        assert_eq!(posted["purchaseProvenanceSnapshotVersion"], 1);
+        // 1, 2. The supplier and the address the goods came from.
+        assert_eq!(posted["supplierDisplayName"], "Sharma Medicals");
+        assert_eq!(posted["supplierAddressState"], "recorded");
+        assert_eq!(posted["supplierAddressId"], address);
+        assert_eq!(posted["supplierAddressLine1"], "14 Ware House Road");
+        assert_eq!(posted["supplierAddressCity"], "Thane");
+        assert_eq!(posted["supplierAddressPostalCode"], "421302");
+        assert_eq!(posted["supplierAddressStateCode"], "27");
+        assert_eq!(posted["supplierAddressStateName"], "Maharashtra");
+        assert_eq!(posted["supplierAddressCountryCode"], "IN");
+        // 3. The licence, verbatim, with no form read out of the number.
+        assert_eq!(posted["supplierDrugLicenceState"], "recorded");
+        assert_eq!(
+            posted["supplierDrugLicenceNumber"],
+            "20B-MH-9911 / 21B-MH-9912"
+        );
+        assert_eq!(posted["supplierDrugLicenceValidUpto"], "2027-12-31");
+        // 7. The bill it arrived on.
+        assert_eq!(posted["supplierInvoiceNumber"], "INV-9001");
+        assert!(posted["invoiceDate"].is_string());
+        // 4, 5, 6, 8. The line's own four facts.
+        let line = &posted["lines"][0];
+        assert_eq!(line["drugDisplayName"], "Azithral 500");
+        assert_eq!(line["batchNumber"], "B-INV-9001");
+        assert_eq!(line["manufacturerState"], "recorded");
+        assert_eq!(line["manufacturerCompanyId"], company);
+        assert_eq!(line["manufacturerName"], "Meridian Laboratories");
+        assert_eq!(line["quantityPacks"], 5);
+        // 40. Nothing about the ordinary path changed: stock moved once, taxed as before.
+        assert_eq!(posted["taxTreatment"], "intra_state");
+        let movements: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_movements")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(movements, 1);
+    }
+
+    /// D1-A 10–18. Every master the receipt read may change afterwards — the party's name, its
+    /// address, the address being archived, the licence and its validity, the product's name, the
+    /// manufacturer role ending or being replaced, the lot's own text — and the receipt says
+    /// exactly what it said before.
+    #[tokio::test]
+    async fn d1a_the_masters_may_change_but_the_receipt_does_not() {
+        let f = fixture().await;
+        let address = give_supplier_an_address(&f, "14 Ware House Road").await;
+        give_supplier_a_licence(&f, "20B-MH-9911", Some("2027-12-31")).await;
+        give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+        let posted = posted_receipt(&f, "INV-9002").await;
+        let id = posted["id"].as_str().unwrap().to_owned();
+
+        for statement in [
+            "UPDATE parties SET display_name='Renamed Medicals',normalized_search_name='renamed' \
+             WHERE id=?1",
+            "UPDATE party_addresses SET line1='99 Somewhere Else' WHERE party_id=?1",
+            "UPDATE party_addresses SET status='archived',\
+             archived_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'),archive_reason='moved' \
+             WHERE party_id=?1",
+            "UPDATE parties SET drug_licence_number='SOMETHING-ELSE' WHERE id=?1",
+            "UPDATE parties SET drug_licence_valid_upto='2020-01-01' WHERE id=?1",
+        ] {
+            sqlx::query(statement)
+                .bind(&f.supplier_id)
+                .execute(&f.pool)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        }
+        sqlx::query("UPDATE products SET display_name='Azithral 500 XR' WHERE id=?")
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        // The maker's role ends, and another company takes it on.
+        sqlx::query(
+            "UPDATE product_company_roles SET effective_to='2026-01-01' WHERE product_id=?",
+        )
+        .bind(&f.product_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        give_product_a_manufacturer(&f, &f.product_id, "Successor Pharma").await;
+        sqlx::query(
+            "UPDATE product_batches SET batch_number='B-CORRECTED' WHERE batch_number='B-INV-9002'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let (status, again) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/purchases/{id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["supplierDisplayName"], "Sharma Medicals");
+        assert_eq!(again["supplierAddressId"], address);
+        assert_eq!(again["supplierAddressLine1"], "14 Ware House Road");
+        assert_eq!(again["supplierDrugLicenceNumber"], "20B-MH-9911");
+        assert_eq!(again["supplierDrugLicenceValidUpto"], "2027-12-31");
+        assert_eq!(again["lines"][0]["drugDisplayName"], "Azithral 500");
+        assert_eq!(again["lines"][0]["batchNumber"], "B-INV-9002");
+        assert_eq!(
+            again["lines"][0]["manufacturerName"],
+            "Meridian Laboratories"
+        );
+        assert_eq!(again["purchaseProvenanceSnapshotVersion"], 1);
+    }
+
+    /// D1-A 19–23. What nobody recorded is recorded as nobody's record. A supplier with no address
+    /// and no licence still posts an ordinary purchase; no licence form is read out of a number; a
+    /// product with two makers and no choice made records none of them; and a product with no
+    /// manufacturer at all is never given one.
+    #[tokio::test]
+    async fn d1a_missing_facts_are_recorded_as_missing_and_never_guessed() {
+        // 19, 20, 23. Nothing on file: the purchase still posts, and says so plainly.
+        let f = fixture().await;
+        let posted = posted_receipt(&f, "INV-9003").await;
+        assert_eq!(posted["status"], "posted");
+        assert_eq!(posted["purchaseProvenanceSnapshotVersion"], 1);
+        assert_eq!(posted["supplierAddressState"], "not_recorded");
+        assert!(posted["supplierAddressLine1"].is_null());
+        assert_eq!(posted["supplierDrugLicenceState"], "not_recorded");
+        assert!(posted["supplierDrugLicenceNumber"].is_null());
+        assert_eq!(posted["lines"][0]["manufacturerState"], "not_recorded");
+        assert!(posted["lines"][0]["manufacturerName"].is_null());
+        assert!(posted["lines"][0]["manufacturerCompanyId"].is_null());
+        // The drug's name and its lot are always available, so they are always frozen.
+        assert_eq!(posted["lines"][0]["drugDisplayName"], "Azithral 500");
+        assert_eq!(posted["lines"][0]["batchNumber"], "B-INV-9003");
+
+        // 21. A licence number beginning "20B" is a string, not a finding that a Form 20B is held.
+        let f = fixture().await;
+        give_supplier_a_licence(&f, "20B-MH-1234", None).await;
+        let posted = posted_receipt(&f, "INV-9004").await;
+        assert_eq!(posted["supplierDrugLicenceNumber"], "20B-MH-1234");
+        assert!(posted["supplierDrugLicenceValidUpto"].is_null());
+        let text = posted.to_string().to_lowercase();
+        for claim in ["licenceform", "licensetype", "duly licensed", "form_20b"] {
+            assert!(!text.contains(claim), "{claim}: {posted}");
+        }
+
+        // 22. Two makers in force and no choice made: neither is written in.
+        let f = fixture().await;
+        let first = give_product_a_manufacturer(&f, &f.product_id, "Alpha Labs").await;
+        give_product_a_manufacturer(&f, &f.product_id, "Beta Labs").await;
+        let posted = posted_receipt(&f, "INV-9005").await;
+        assert_eq!(posted["lines"][0]["manufacturerState"], "not_recorded");
+        assert!(posted["lines"][0]["manufacturerName"].is_null());
+
+        // The operator chooses, and then it is a fact.
+        let id = draft_with_lot(&f, "INV-9006", "B-9006").await;
+        let line_id = {
+            let (_, detail) = request(
+                f.pool.clone(),
+                "GET",
+                &format!("/api/v1/purchases/{id}"),
+                Value::Null,
+            )
+            .await;
+            detail["lines"][0]["id"].as_str().unwrap().to_owned()
+        };
+        let mut body = lot_line_body(2, &f, "B-9006");
+        body["manufacturerCompanyId"] = json!(first);
+        let (status, updated) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/purchase-lines/{line_id}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        let (status, posted) = post_draft(&f, &id, 3, &Uuid::now_v7().to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        assert_eq!(posted["lines"][0]["manufacturerState"], "recorded");
+        assert_eq!(posted["lines"][0]["manufacturerName"], "Alpha Labs");
+    }
+
+    /// D1-A 24–30. The frozen facts cannot be rewritten, erased, forged or misattributed: not
+    /// through the service, not by direct SQL, and not by naming a company that never made this
+    /// product.
+    #[tokio::test]
+    async fn d1a_direct_sql_cannot_forge_or_erase_provenance() {
+        let f = fixture().await;
+        give_supplier_an_address(&f, "14 Ware House Road").await;
+        give_supplier_a_licence(&f, "20B-MH-9911", None).await;
+        give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+        let posted = posted_receipt(&f, "INV-9007").await;
+        let id = posted["id"].as_str().unwrap().to_owned();
+        let line_id = posted["lines"][0]["id"].as_str().unwrap().to_owned();
+
+        // 24, 25, 28. A posted document and its lines refuse every rewrite, including erasure.
+        for statement in [
+            "UPDATE purchase_documents SET supplier_address_line1='99 Elsewhere' WHERE id=?",
+            "UPDATE purchase_documents SET supplier_drug_licence_number='FORGED' WHERE id=?",
+            "UPDATE purchase_documents SET supplier_address_state='not_recorded',\
+             supplier_address_id=NULL,supplier_address_line1=NULL WHERE id=?",
+            "UPDATE purchase_documents SET purchase_provenance_snapshot_version=0 WHERE id=?",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(&id)
+                .execute(&f.pool)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!error.is_empty(), "{statement}");
+            assert!(
+                error.contains("purchase_document_is_posted")
+                    || error.contains("purchase_provenance_incomplete"),
+                "{statement}: {error}"
+            );
+        }
+        for statement in [
+            "UPDATE purchase_lines SET drug_display_name='Something Else' WHERE id=?",
+            "UPDATE purchase_lines SET batch_number='B-FORGED' WHERE id=?",
+            "UPDATE purchase_lines SET manufacturer_name='Someone Else' WHERE id=?",
+            "UPDATE purchase_lines SET manufacturer_state='not_recorded',\
+             manufacturer_company_id=NULL,manufacturer_name=NULL WHERE id=?",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(&line_id)
+                .execute(&f.pool)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!error.is_empty(), "{statement}");
+        }
+        // 26. Deleting a posted receipt or its line is refused as it always was.
+        for (statement, bound) in [
+            ("DELETE FROM purchase_documents WHERE id=?", &id),
+            ("DELETE FROM purchase_lines WHERE id=?", &line_id),
+        ] {
+            let error = sqlx::query(statement)
+                .bind(bound)
+                .execute(&f.pool)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("purchase_document_is_posted"), "{statement}");
+        }
+        // The service refuses the same edits: a posted purchase is not a draft.
+        let (status, refused) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/purchases/{id}"),
+            json!({
+                "expectedRevision": 2,
+                "supplierPartyId": f.supplier_id,
+                "supplierInvoiceNumber": "INV-9007-EDITED",
+                "invoiceDate": "2026-02-01",
+            }),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{refused}");
+
+        // 27. A legacy receipt cannot be dressed up as provenance-aware.
+        let legacy = posted_receipt(&f, "INV-9008").await;
+        let legacy_id = legacy["id"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE purchase_documents SET status='draft' WHERE id=?")
+            .bind(&legacy_id)
+            .execute(&f.pool)
+            .await
+            .unwrap_err();
+
+        // 29. A company that never made this product cannot be written in as its maker, by the
+        //     service or by hand.
+        let stranger = {
+            let (other_product, _) = insert_product(&f.pool, "Other Medicine", 10).await;
+            give_product_a_manufacturer(&f, &other_product, "Stranger Pharma").await
+        };
+        let draft = draft_with_lot(&f, "INV-9009", "B-9009").await;
+        let (_, detail) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/purchases/{draft}"),
+            Value::Null,
+        )
+        .await;
+        let draft_line = detail["lines"][0]["id"].as_str().unwrap().to_owned();
+        let mut body = lot_line_body(2, &f, "B-9009");
+        body["manufacturerCompanyId"] = json!(stranger);
+        let (status, refused) = request(
+            f.pool.clone(),
+            "PUT",
+            &format!("/api/v1/purchase-lines/{draft_line}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        let error = sqlx::query("UPDATE purchase_lines SET manufacturer_company_id=? WHERE id=?")
+            .bind(&stranger)
+            .bind(&draft_line)
+            .execute(&f.pool)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("purchase_provenance_incoherent"), "{error}");
+
+        // 30. A lot number without a lot is refused: provenance cannot claim a batch that is not
+        //     there. A plain draft line names no batch until posting materialises one.
+        let bare = draft_with_line(&f, "INV-9010").await;
+        let (_, bare_detail) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/purchases/{bare}"),
+            Value::Null,
+        )
+        .await;
+        let bare_line = bare_detail["lines"][0]["id"].as_str().unwrap().to_owned();
+        let error = sqlx::query("UPDATE purchase_lines SET batch_number='B-NOWHERE' WHERE id=?")
+            .bind(&bare_line)
+            .execute(&f.pool)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("purchase_provenance_incoherent"), "{error}");
+    }
+
+    /// D1-A 31–34. A master edited at the very moment of posting cannot produce half a snapshot:
+    /// the posting reads every provenance fact inside its own transaction, so the receipt shows
+    /// the masters as they were before the edit or as they were after it, and each frozen fact
+    /// agrees with the others.
+    #[tokio::test]
+    async fn d1a_masters_racing_a_posting_yield_one_coherent_snapshot() {
+        for change in ["address", "licence", "manufacturer", "batch"] {
+            let f = fixture().await;
+            give_supplier_an_address(&f, "14 Ware House Road").await;
+            give_supplier_a_licence(&f, "20B-MH-9911", Some("2027-12-31")).await;
+            give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+            let id = draft_with_lot(&f, "INV-9100", "B-INV-9100").await;
+
+            let pool = f.pool.clone();
+            let product_id = f.product_id.clone();
+            let supplier_id = f.supplier_id.clone();
+            let statement = match change {
+                "address" => {
+                    "UPDATE party_addresses SET line1='99 Somewhere Else' WHERE party_id=?"
+                }
+                "licence" => "UPDATE parties SET drug_licence_number='CHANGED-MID-POST' WHERE id=?",
+                "manufacturer" => {
+                    "UPDATE product_company_roles SET effective_to='2020-06-01' WHERE product_id=?"
+                }
+                _ => {
+                    "UPDATE product_batches SET batch_number='B-RENAMED' \
+                      WHERE product_pack_id IN (SELECT id FROM product_packs WHERE product_id=?)"
+                }
+            };
+            let bound = match change {
+                "address" | "licence" => supplier_id,
+                _ => product_id,
+            };
+            let edit = async move {
+                sqlx::query(statement)
+                    .bind(&bound)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            };
+            let key = Uuid::now_v7().to_string();
+            let (posted, edited) = tokio::join!(post_draft(&f, &id, 2, &key), edit);
+            assert_eq!(posted.0, StatusCode::OK, "{change}: {:?}", posted.1);
+            let _ = edited;
+
+            // Whichever way it settled, the document is internally coherent: a recorded address
+            // carries its text, a recorded licence carries its number, a recorded maker carries
+            // both parts, and every line has a name and a lot.
+            let posted = posted.1;
+            assert_eq!(posted["purchaseProvenanceSnapshotVersion"], 1, "{change}");
+            let address_recorded = posted["supplierAddressState"] == "recorded";
+            assert_eq!(
+                address_recorded,
+                posted["supplierAddressLine1"].is_string(),
+                "{change}: {posted}"
+            );
+            let licence_recorded = posted["supplierDrugLicenceState"] == "recorded";
+            assert_eq!(
+                licence_recorded,
+                posted["supplierDrugLicenceNumber"].is_string(),
+                "{change}: {posted}"
+            );
+            let line = &posted["lines"][0];
+            assert!(line["drugDisplayName"].is_string(), "{change}: {posted}");
+            assert!(line["batchNumber"].is_string(), "{change}: {posted}");
+            assert_eq!(
+                line["manufacturerState"] == "recorded",
+                line["manufacturerName"].is_string(),
+                "{change}: {posted}"
+            );
+            // And the frozen lot text is one of the two the master ever held, never a blend.
+            let frozen = line["batchNumber"].as_str().unwrap();
+            assert!(
+                frozen == "B-INV-9100" || frozen == "B-RENAMED",
+                "{change}: {frozen}"
+            );
+        }
+    }
+
+    /// D1-A 35. Sending stock back to a supplier is a new, appended record. The receipt it came in
+    /// on keeps every particular it froze, and the link back to it survives.
+    #[tokio::test]
+    async fn d1a_a_purchase_return_leaves_the_receipt_untouched() {
+        let f = fixture().await;
+        give_supplier_an_address(&f, "14 Ware House Road").await;
+        give_supplier_a_licence(&f, "20B-MH-9911", None).await;
+        give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+        let posted = posted_receipt(&f, "INV-9200").await;
+        let id = posted["id"].as_str().unwrap().to_owned();
+        let line_id = posted["lines"][0]["id"].as_str().unwrap().to_owned();
+
+        let (status, draft) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/returns",
+            json!({
+                "returnKind": "purchase_return",
+                "originalDocumentId": id,
+                "businessDate": "2026-02-02",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{draft}");
+        let return_id = draft["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/lines"),
+            json!({
+                "expectedRevision": 1,
+                "originalLineId": line_id,
+                "quantity": 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{withline}");
+        let (status, returned) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/post"),
+            json!({
+                "expectedRevision": 2,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "gstRoute": "fresh_supply",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+
+        let (status, again) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/purchases/{id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["lines"][0], posted["lines"][0]);
+        assert_eq!(
+            again["supplierAddressLine1"],
+            posted["supplierAddressLine1"]
+        );
+        assert_eq!(
+            again["supplierDrugLicenceNumber"],
+            posted["supplierDrugLicenceNumber"]
+        );
+        // The return still knows which receipt, line and lot it reverses.
+        let (original_line, quantity): (String, i64) = sqlx::query_as(
+            "SELECT original_purchase_line_id,quantity_atoms FROM return_lines \
+             WHERE original_purchase_line_id IS NOT NULL",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(original_line, line_id);
+        assert_eq!(quantity, 10);
+    }
+
+    /// D1-A, §26 boundary. A drug the owner has placed in Schedule X may be RECEIVED, with all the
+    /// provenance a later register would need — and that is all. Nothing here makes it sellable:
+    /// the Schedule X sale is still refused as an unsupported workflow (proved against the sale
+    /// path itself in `s16_h1_x_and_c_cannot_be_prepared_or_posted`).
+    #[tokio::test]
+    async fn d1a_a_schedule_x_drug_may_be_received_and_is_still_not_sellable() {
+        let f = fixture().await;
+        let dosage_form = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO dosage_forms (id,canonical_code,display_name,created_at_utc,\
+             updated_at_utc) VALUES (?,'tablet','Tablet',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(&dosage_form)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE products SET product_kind='medicine',dosage_form_id=? WHERE id=?")
+            .bind(&dosage_form)
+            .bind(&f.product_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_regulatory_classifications (id,product_id,scheme,applies,\
+             effective_from,source_citation,determined_by_user_id,revision,status,created_at_utc,\
+             updated_at_utc) VALUES (?,?,'schedule_x',1,'2020-01-01','Drugs Rules, 1945, \
+             Schedule X',?,1,'active',strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&f.product_id)
+        .bind(&f.owner_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        give_supplier_an_address(&f, "14 Ware House Road").await;
+        give_supplier_a_licence(&f, "20B-MH-9911", Some("2027-12-31")).await;
+        give_product_a_manufacturer(&f, &f.product_id, "Meridian Laboratories").await;
+
+        let posted = posted_receipt(&f, "INV-9300").await;
+        assert_eq!(posted["purchaseProvenanceSnapshotVersion"], 1);
+        assert_eq!(posted["supplierAddressState"], "recorded");
+        assert_eq!(
+            posted["lines"][0]["manufacturerName"],
+            "Meridian Laboratories"
+        );
+        // Receiving it says nothing about supplying it: no register exists, and none is implied.
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%schedule_x%'",
+        )
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert!(tables.is_empty(), "{tables:?}");
+        let text = posted.to_string().to_lowercase();
+        for claim in [
+            "schedule x",
+            "schedule_x",
+            "h1 register",
+            "drug register",
+            "sellable",
+        ] {
+            assert!(!text.contains(claim), "{claim}: {posted}");
+        }
     }
 }

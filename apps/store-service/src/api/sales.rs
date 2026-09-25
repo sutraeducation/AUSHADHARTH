@@ -16542,6 +16542,25 @@ mod tests {
         );
     }
 
+    /// Phase 1M-D1-A, §26. Receipt provenance changed nothing about supplying a Schedule X drug:
+    /// a line the owner has placed in Schedule X still meets the unsupported-workflow boundary,
+    /// with nothing sold and no register implied. The receipt side may now record where stock came
+    /// from; that is a record of a purchase, not an authority to dispense.
+    #[tokio::test]
+    async fn d1a_schedule_x_remains_unsupported_after_purchase_provenance() {
+        let f = fixture().await;
+        schedule_product(&f, &f.product_id, &["schedule_x"]).await;
+        let id = draft_with_line(&f, "pack", 1, 8000).await;
+        let (status, refused) = post_as_quoted(&f, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "schedule_x_workflow_not_available");
+        assert_nothing_sold(&f, &id).await;
+        let text = refused.to_string().to_lowercase();
+        for word in ["banned", "prohibit", "illegal"] {
+            assert!(!text.contains(word), "{word}: {refused}");
+        }
+    }
+
     /// S-16, S-17, S-18. Schedule H1, Schedule X and Schedule H with C cannot even be prepared:
     /// preparing an entry is never a way round the scheme gate.
     #[tokio::test]

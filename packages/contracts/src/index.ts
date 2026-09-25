@@ -917,6 +917,12 @@ export const PurchaseStatusSchema = z.enum(["draft", "posted"]);
 export const PurchaseTaxTreatmentSchema = z.enum(["intra_state", "inter_state"]);
 export const PurchaseLineTaxKindSchema = z.enum(["taxable", "exempt", "nil_rated", "non_gst"]);
 
+/**
+ * Whether a provenance fact was there to freeze at posting. "not_recorded" is itself a fact about
+ * the master at that moment; it is never a placeholder to be filled in later from today's data.
+ */
+export const ProvenanceFactStateSchema = z.enum(["recorded", "not_recorded"]);
+
 /** Server-owned header facts. Snapshot fields are null until the document is posted. */
 export const PurchaseSchema = z.object({
   id: z.string(),
@@ -947,7 +953,27 @@ export const PurchaseSchema = z.object({
   createdAtUtc: z.string(),
   updatedAtUtc: z.string(),
   postedByUserId: z.string().nullable(),
-  postedAtUtc: z.string().nullable()
+  postedAtUtc: z.string().nullable(),
+  /**
+   * Phase 1M-D1-A. 0 = posted before receipt provenance was captured, so these fields are silent
+   * about facts nobody recorded; 1 = every field below is the fact as it stood at posting, and an
+   * absent fact says so through its own "not_recorded" state.
+   */
+  purchaseProvenanceSnapshotVersion: z.number().int().nonnegative(),
+  supplierAddressState: ProvenanceFactStateSchema.nullable(),
+  supplierAddressId: z.string().nullable(),
+  supplierAddressLine1: z.string().nullable(),
+  supplierAddressLine2: z.string().nullable(),
+  supplierAddressCity: z.string().nullable(),
+  supplierAddressPostalCode: z.string().nullable(),
+  supplierAddressCountryCode: z.string().nullable(),
+  supplierAddressStateId: z.string().nullable(),
+  supplierAddressStateName: z.string().nullable(),
+  supplierAddressStateCode: z.string().nullable(),
+  /** What the Party recorded as the supplier's drug licence, frozen verbatim and never parsed. */
+  supplierDrugLicenceState: ProvenanceFactStateSchema.nullable(),
+  supplierDrugLicenceNumber: z.string().nullable(),
+  supplierDrugLicenceValidUpto: z.string().nullable()
 });
 
 /**
@@ -981,7 +1007,14 @@ export const PurchaseLineSchema = z.object({
   sgstPaise: z.number().int(),
   igstPaise: z.number().int(),
   cessPaise: z.number().int(),
-  lineTotalPaise: z.number().int()
+  lineTotalPaise: z.number().int(),
+  /** The name this drug was received under, frozen: a later rename does not reach back. */
+  drugDisplayName: z.string().nullable(),
+  /** The lot that arrived, as text, beside the batch identity it was frozen from. */
+  batchNumber: z.string().nullable(),
+  manufacturerCompanyId: z.string().nullable(),
+  manufacturerName: z.string().nullable(),
+  manufacturerState: ProvenanceFactStateSchema.nullable()
 });
 
 export const PurchaseDetailSchema = PurchaseSchema.extend({
@@ -1007,6 +1040,11 @@ export const PurchaseLineInputSchema = z.object({
   expectedRevision: z.number().int().positive(),
   productId: z.string(),
   productPackId: z.string(),
+  /**
+   * Which manufacturer of this product made what arrived. Sent only when the operator chooses;
+   * a product with one recorded maker needs no choice, and one with none cannot offer it.
+   */
+  manufacturerCompanyId: z.string().nullable().optional(),
   batchId: z.string().nullable().optional(),
   newBatchNumber: z.string().nullable().optional(),
   newBatchExpiresOn: z.string().nullable().optional(),
@@ -1049,6 +1087,7 @@ export type PurchaseStatus = z.infer<typeof PurchaseStatusSchema>;
 export type PurchaseTaxTreatment = z.infer<typeof PurchaseTaxTreatmentSchema>;
 export type PurchaseLineTaxKind = z.infer<typeof PurchaseLineTaxKindSchema>;
 export type Purchase = z.infer<typeof PurchaseSchema>;
+export type ProvenanceFactState = z.infer<typeof ProvenanceFactStateSchema>;
 export type PurchaseLine = z.infer<typeof PurchaseLineSchema>;
 export type PurchaseDetail = z.infer<typeof PurchaseDetailSchema>;
 export type PurchaseDraftInput = z.infer<typeof PurchaseDraftInputSchema>;

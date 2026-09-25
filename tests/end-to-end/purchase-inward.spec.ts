@@ -69,7 +69,13 @@ function emptyDraft() {
     storeNormalizedGstin: null, storePlaceOfSupplyStateId: null, storeStateCode: null, taxTreatment: null,
     taxableValuePaise: 0, cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, grandTotalPaise: 0,
     createdByUserId: IDs.user, createdAtUtc: "2026-09-10T05:00:00Z", updatedAtUtc: "2026-09-10T05:00:00Z",
-    postedByUserId: null, postedAtUtc: null, lines: [] as Record<string, unknown>[]
+    postedByUserId: null, postedAtUtc: null,
+    purchaseProvenanceSnapshotVersion: 0, supplierAddressState: null, supplierAddressId: null,
+    supplierAddressLine1: null, supplierAddressLine2: null, supplierAddressCity: null,
+    supplierAddressPostalCode: null, supplierAddressCountryCode: null, supplierAddressStateId: null,
+    supplierAddressStateName: null, supplierAddressStateCode: null, supplierDrugLicenceState: null,
+    supplierDrugLicenceNumber: null, supplierDrugLicenceValidUpto: null,
+    lines: [] as Record<string, unknown>[]
   };
 }
 
@@ -87,7 +93,9 @@ function buildLine(documentId: string, number: number, input: LineInput) {
     taxableValuePaise: quantityPacks * ratePerPackPaise,
     hsnCodeId: null, hsnCode: null, taxCategoryId: null, taxTreatmentKind: null, taxRateVersionId: null,
     cgstBasisPoints: 0, sgstBasisPoints: 0, igstBasisPoints: 0, cessBasisPoints: 0,
-    cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, lineTotalPaise: 0
+    cgstPaise: 0, sgstPaise: 0, igstPaise: 0, cessPaise: 0, lineTotalPaise: 0,
+    drugDisplayName: null, batchNumber: null, manufacturerCompanyId: null, manufacturerName: null,
+    manufacturerState: null
   };
 }
 
@@ -140,7 +148,15 @@ async function mockStoreService(page: Page, options: {
       taxTreatment: interState ? "inter_state" : "intra_state",
       taxableValuePaise: sum("taxableValuePaise"), cgstPaise: sum("cgstPaise"), sgstPaise: sum("sgstPaise"),
       igstPaise: sum("igstPaise"), cessPaise: 0, grandTotalPaise: sum("lineTotalPaise"),
-      postedByUserId: IDs.user, postedAtUtc: "2026-09-11T06:30:00Z", lines
+      postedByUserId: IDs.user, postedAtUtc: "2026-09-11T06:30:00Z",
+      purchaseProvenanceSnapshotVersion: 1,
+      supplierAddressState: "not_recorded", supplierDrugLicenceState: "not_recorded",
+      lines: lines.map((each) => ({
+        ...each,
+        drugDisplayName: "Crocin 500 mg Tablet",
+        batchNumber: (each as Record<string, unknown>).batchId ? "B-2601" : null,
+        manufacturerState: "not_recorded"
+      }))
     };
   };
 
@@ -288,7 +304,8 @@ test("an owner records a supplier invoice and posts it as an intra-State purchas
   await expect(dialog.getByText("This cannot be undone")).toBeVisible();
   await dialog.getByRole("button", { name: "Post Purchase" }).click();
 
-  await expect(page.getByText("Posted · read-only")).toBeVisible();
+  await expect(page.getByText("Posted", { exact: true })).toBeVisible();
+  await expect(page.getByText("Read-only", { exact: true })).toBeVisible();
   await expect(page.getByText("CGST + SGST (same State)")).toBeVisible();
   await expect(page.getByText("CGST 6.00%")).toBeVisible();
   await expect(page.getByText("SGST 6.00%")).toBeVisible();

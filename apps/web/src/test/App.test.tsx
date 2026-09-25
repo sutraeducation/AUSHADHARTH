@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -250,5 +250,78 @@ describe("login and authenticated shell", () => {
     const stored = Object.keys(localStorage).map((key) => `${key}:${localStorage.getItem(key)}`).join("|");
     expect(localStorage.getItem("aushadharth-ui-preferences")).toContain("sidebarCollapsed");
     expect(stored).not.toMatch(/password|session|token|Strong-Password/i);
+  });
+});
+
+/**
+ * Phase U1. On a phone the navigation used to stand above the page, so every screen opened on a
+ * menu. It is a drawer now: shut on arrival, opened deliberately, and shut again the moment it has
+ * done its job. These proofs are about that behaviour, which is the same in every viewport — the
+ * width only decides whether the drawer is ever hidden.
+ */
+describe("mobile navigation drawer", () => {
+  beforeEach(() => { localStorage.clear(); });
+
+  async function signedIn() {
+    vi.stubGlobal("fetch", fetchFor({ setupRequired: false, authenticated: true }));
+    renderApp("/app/dashboard");
+    await screen.findByRole("heading", { name: "Dashboard" });
+  }
+
+  it("starts closed, with the page itself the first thing on screen", async () => {
+    await signedIn();
+    const toggle = screen.getByRole("button", { name: "Open navigation" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(document.querySelector(".sidebar")).not.toHaveClass("sidebar--open");
+    expect(document.querySelector(".nav-backdrop")).not.toBeInTheDocument();
+    // The workspace is reachable without opening anything.
+    expect(screen.getByRole("heading", { name: "Dashboard" })).toBeInTheDocument();
+  });
+
+  it("opens on request, names the current route, and closes again", async () => {
+    await signedIn();
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    expect(screen.getByRole("button", { name: "Open navigation" })).toHaveAttribute("aria-expanded", "true");
+    expect(document.querySelector(".sidebar")).toHaveClass("sidebar--open");
+    // The route the reader is on is the one marked current, so the drawer orients rather than lists.
+    expect(screen.getByRole("link", { name: "Dashboard" })).toHaveClass("nav-item--active");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close navigation" }));
+    expect(document.querySelector(".sidebar")).not.toHaveClass("sidebar--open");
+    expect(screen.getByRole("button", { name: "Open navigation" })).toHaveFocus();
+  });
+
+  it("closes when a destination is chosen, because arriving is the end of navigating", async () => {
+    await signedIn();
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    expect(document.querySelector(".sidebar")).toHaveClass("sidebar--open");
+    fireEvent.click(screen.getByRole("link", { name: "Purchases" }));
+    await waitFor(() => expect(document.querySelector(".sidebar")).not.toHaveClass("sidebar--open"));
+  });
+
+  it("closes on Escape and on the backdrop, and returns focus to the control that opened it", async () => {
+    await signedIn();
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(document.querySelector(".sidebar")).not.toHaveClass("sidebar--open"));
+    expect(screen.getByRole("button", { name: "Open navigation" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    fireEvent.click(document.querySelector(".nav-backdrop")!);
+    await waitFor(() => expect(document.querySelector(".sidebar")).not.toHaveClass("sidebar--open"));
+  });
+
+  it("keeps one navigation, not two: the drawer lists the same routes the sidebar does", async () => {
+    await signedIn();
+    const before = screen.getAllByRole("link").map((link) => link.getAttribute("href"));
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const after = screen.getAllByRole("link").map((link) => link.getAttribute("href"));
+    expect(after).toEqual(before);
+  });
+
+  it("says the workspace is planned rather than broken", async () => {
+    await signedIn();
+    expect(screen.getByText("Planned")).toBeInTheDocument();
+    expect(screen.queryByText("Not enabled")).not.toBeInTheDocument();
   });
 });
