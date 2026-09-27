@@ -606,6 +606,12 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .regulatory-gate small { color: var(--ink-700); font-size: .72rem; line-height: 1.5; }
 .regulatory-gate--unresolved, .regulatory-gate--workflow_unavailable { border-color: var(--danger-100); background: #fff3f2; }
 .regulatory-gate--unresolved strong, .regulatory-gate--workflow_unavailable strong { color: var(--danger-700); }
+/* Phase 1M-D1-B. Where the Form 20F paperwork stands. Deliberately quieter than the sale gate
+   above it: this panel is advisory, and must never be mistaken for the thing that permits a sale. */
+.regulatory-authority { display: grid; gap: 4px; margin-bottom: 14px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: var(--radius-md); background: var(--surface-2, #fafafa); }
+.regulatory-authority small { color: var(--ink-700); font-size: .72rem; line-height: 1.5; }
+.regulatory-authority--unresolved strong { color: var(--warning-700); }
+.regulatory-authority--not_established strong { color: var(--ink-700); }
 .regulatory-answer { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .72rem; font-weight: 600; }
 .regulatory-answer--applies { background: var(--danger-100); color: var(--danger-700); }
 .regulatory-answer--does_not_apply { background: #e3f1ea; color: #1f6b47; }

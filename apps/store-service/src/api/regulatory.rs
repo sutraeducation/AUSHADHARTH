@@ -34,6 +34,9 @@ const CAPACITIES: [&str; 2] = ["registered_pharmacist", "competent_person"];
 const LICENCE_FORMS: [&str; 8] = [
     "form_20", "form_20a", "form_20b", "form_20f", "form_20g", "form_21", "form_21a", "form_21b",
 ];
+/// Phase 1M-D1-B. A licence the registrar has not spoken about is `unknown`, never "in force".
+const LEGAL_STATUSES: [&str; 4] = ["in_force", "suspended", "cancelled", "unknown"];
+const VALIDITY_BASES: [&str; 3] = ["perpetual", "fixed_term", "unknown"];
 const ELECTIONS: [&str; 2] = [
     "rule_65_3_prescription_supply",
     "rule_65_4_non_prescription_schedule_c",
@@ -53,6 +56,12 @@ enum RegulatoryError {
     /// An archived record is read-only; restore it first.
     Archived,
     Conflict,
+    /// A validity basis and an end date that cannot both be true.
+    ValidityIncoherent,
+    /// Drug coverage that does not rest on this store's own active Form 20F, or names a dead product.
+    CoverageIncoherent,
+    /// Two active coverage rows would answer the same product on the same day.
+    CoveragePeriodOverlap,
     Internal,
 }
 
@@ -137,6 +146,27 @@ impl IntoResponse for RegulatoryError {
                 StatusCode::CONFLICT,
                 simple("record_conflict", "That record is already recorded."),
             ),
+            Self::ValidityIncoherent => (
+                StatusCode::CONFLICT,
+                simple(
+                    "licence_validity_basis_incoherent",
+                    "A fixed-term licence needs an expiry date and a perpetual licence must not have one.",
+                ),
+            ),
+            Self::CoverageIncoherent => (
+                StatusCode::CONFLICT,
+                simple(
+                    "licence_drug_coverage_incoherent",
+                    "Drug coverage must name an active product and this store's own active Form 20F.",
+                ),
+            ),
+            Self::CoveragePeriodOverlap => (
+                StatusCode::CONFLICT,
+                simple(
+                    "licence_drug_coverage_period_overlaps",
+                    "This product already has Form 20F coverage over part of that period.",
+                ),
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 simple(
@@ -155,6 +185,15 @@ fn map_database_error(error: sqlx::Error) -> RegulatoryError {
         || text.contains("record_election_period_overlaps")
     {
         return RegulatoryError::PeriodOverlap;
+    }
+    if text.contains("licence_drug_coverage_period_overlaps") {
+        return RegulatoryError::CoveragePeriodOverlap;
+    }
+    if text.contains("licence_validity_basis_incoherent") {
+        return RegulatoryError::ValidityIncoherent;
+    }
+    if text.contains("licence_drug_coverage_incoherent") {
+        return RegulatoryError::CoverageIncoherent;
     }
     if text.contains("UNIQUE constraint failed") {
         return RegulatoryError::Conflict;
@@ -196,6 +235,60 @@ fn validate_date(value: &str, field: &str) -> Result<String, RegulatoryError> {
         return Err(validation(field, "must be a real calendar date"));
     }
     Ok(trimmed.to_owned())
+}
+
+/// A licence's standing, checked for coherence before it reaches the database.
+///
+/// The Form 20F of rule 61(3) carries no expiry of its own — it stands until it is suspended or
+/// cancelled — while some other forms are granted for a term. So the owner says which of the two a
+/// licence is, and the two answers demand different dates: a fixed term without its end date is not
+/// a licence that never expires, and a perpetual licence with an expiry date is a contradiction
+/// somebody needs to look at. Neither is quietly repaired here; both are refused, and the triggers
+/// in migration 0025 refuse them again for anything that does not come through this door.
+fn validate_authority(
+    legal_status: &str,
+    validity_basis: &str,
+    valid_from: Option<&str>,
+    valid_upto: Option<&str>,
+) -> Result<(String, String), RegulatoryError> {
+    let legal_status = legal_status.trim().to_ascii_lowercase();
+    if !LEGAL_STATUSES.contains(&legal_status.as_str()) {
+        return Err(validation(
+            "legalStatus",
+            "must be in_force, suspended, cancelled or unknown",
+        ));
+    }
+    let validity_basis = validity_basis.trim().to_ascii_lowercase();
+    if !VALIDITY_BASES.contains(&validity_basis.as_str()) {
+        return Err(validation(
+            "validityBasis",
+            "must be perpetual, fixed_term or unknown",
+        ));
+    }
+    match (validity_basis.as_str(), valid_upto) {
+        ("fixed_term", None) => {
+            return Err(validation(
+                "validUpto",
+                "a fixed-term licence must carry the date it runs to",
+            ));
+        }
+        ("perpetual", Some(_)) => {
+            return Err(validation(
+                "validUpto",
+                "a perpetual licence has no expiry date; record it as fixed_term if it does",
+            ));
+        }
+        _ => {}
+    }
+    if let (Some(start), Some(end)) = (valid_from, valid_upto)
+        && end <= start
+    {
+        return Err(validation(
+            "validUpto",
+            "must be after the date the licence runs from",
+        ));
+    }
+    Ok((legal_status, validity_basis))
 }
 
 async fn require_admin(
@@ -302,6 +395,50 @@ struct ProductRegulatoryResponse {
     sale_gate_scheme: Option<String>,
     alcohol_percent_vv_hundredths: Option<i64>,
     attributes_revision: Option<i64>,
+    /// Phase 1M-D1-B — ADVISORY. Whether this store's Form 20F reaches this product on
+    /// `resolvedOn`. It tells the owner where the paperwork stands; it authorises nothing. The
+    /// Schedule X sale workflow does not exist yet and refuses regardless of what this says.
+    form_20f_authority: Form20fAuthorityView,
+}
+
+/// A Form 20F answer, flattened for the wire. The state and the gap travel as stable codes so the
+/// screen never has to read meaning out of a sentence.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Form20fAuthorityView {
+    state: String,
+    gap: Option<String>,
+    licence_id: Option<String>,
+    licence_number: Option<String>,
+    coverage_id: Option<String>,
+}
+
+impl From<crate::domain::regulatory::Form20fAuthority> for Form20fAuthorityView {
+    fn from(answer: crate::domain::regulatory::Form20fAuthority) -> Self {
+        use crate::domain::regulatory::Form20fAuthority as Answer;
+        let state = answer.code().to_owned();
+        let gap = answer.gap().map(|gap| gap.code().to_owned());
+        match answer {
+            Answer::Established {
+                licence_id,
+                licence_number,
+                coverage_id,
+            } => Self {
+                state,
+                gap,
+                licence_id: Some(licence_id),
+                licence_number: Some(licence_number),
+                coverage_id: Some(coverage_id),
+            },
+            _ => Self {
+                state,
+                gap,
+                licence_id: None,
+                licence_number: None,
+                coverage_id: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +535,21 @@ async fn get_product_regulatory(
             .map_err(map_database_error)?,
         None => None,
     };
+    // Phase 1M-D1-B: the same store's Form 20F, read for this product on the same date.
+    let form_20f_authority: Form20fAuthorityView = match store_id.as_deref() {
+        Some(store) => {
+            let (licences, coverage) =
+                crate::domain::regulatory::load_form_20f_authority(&mut connection, store, &id)
+                    .await
+                    .map_err(map_database_error)?;
+            crate::domain::regulatory::resolve_form_20f_authority(&licences, &coverage, &id, &as_of)
+                .into()
+        }
+        None => crate::domain::regulatory::Form20fAuthority::Unresolved {
+            reason: crate::domain::regulatory::Form20fGap::NoLicenceRecorded,
+        }
+        .into(),
+    };
     let state_answer = crate::domain::regulatory::resolve_state_for_product(
         &mut connection,
         &id,
@@ -481,6 +633,7 @@ async fn get_product_regulatory(
         sale_gate_scheme,
         alcohol_percent_vv_hundredths: attributes.as_ref().and_then(|row| row.0),
         attributes_revision: attributes.map(|row| row.1),
+        form_20f_authority,
     }))
 }
 
@@ -1332,6 +1485,9 @@ struct ComplianceLicenceResponse {
     valid_from: Option<String>,
     valid_upto: Option<String>,
     display_licence_id: Option<String>,
+    /// Phase 1M-D1-B. Whether the licence stands, and on what footing it runs.
+    legal_status: String,
+    validity_basis: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1343,6 +1499,22 @@ struct ComplianceLicenceRequest {
     valid_from: Option<String>,
     valid_upto: Option<String>,
     display_licence_id: Option<String>,
+    /// Omitted means `unknown`: recording a licence is not the same as knowing it is in force.
+    legal_status: Option<String>,
+    validity_basis: Option<String>,
+    reason: Option<String>,
+}
+
+/// What the owner says about a licence's standing. Kept apart from the licence's identity, because
+/// a suspension changes none of the numbers printed on the certificate.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LicenceAuthorityRequest {
+    expected_revision: i64,
+    legal_status: String,
+    validity_basis: String,
+    valid_from: Option<String>,
+    valid_upto: Option<String>,
     reason: Option<String>,
 }
 
@@ -1377,6 +1549,8 @@ struct DrugComplianceResponse {
     compliance_licences: Vec<ComplianceLicenceResponse>,
     record_elections: Vec<RecordElectionResponse>,
     professionals: Vec<ProfessionalResponse>,
+    /// Phase 1M-D1-B. The drugs each Form 20F names, as the owner read them off the licence.
+    drug_coverage: Vec<DrugCoverageResponse>,
 }
 
 async fn get_drug_compliance(
@@ -1386,7 +1560,7 @@ async fn get_drug_compliance(
     let actor = require_reader(&state, &headers).await?;
     let compliance_licences: Vec<ComplianceLicenceResponse> = sqlx::query_as(
         "SELECT id,revision,status,licence_form,licence_number,issuing_authority,valid_from,\
-         valid_upto,display_licence_id FROM store_compliance_licences ORDER BY licence_form",
+         valid_upto,display_licence_id,legal_status,validity_basis FROM store_compliance_licences ORDER BY licence_form",
     )
     .fetch_all(&state.pool)
     .await
@@ -1406,9 +1580,16 @@ async fn get_drug_compliance(
     .fetch_all(&state.pool)
     .await
     .map_err(map_database_error)?;
+    let drug_coverage: Vec<DrugCoverageResponse> = sqlx::query_as(&format!(
+        "{COVERAGE_SELECT} ORDER BY product.display_name, coverage.effective_from DESC"
+    ))
+    .fetch_all(&state.pool)
+    .await
+    .map_err(map_database_error)?;
     Ok(Json(DrugComplianceResponse {
         compliance_licences,
         record_elections,
+        drug_coverage,
         professionals: professionals
             .into_iter()
             .map(|mut row| {
@@ -1470,6 +1651,12 @@ async fn create_compliance_licence(
         _ => None,
     };
     let reason = optional_text(request.reason.as_deref(), "reason", 500).map_err(issue)?;
+    let (legal_status, validity_basis) = validate_authority(
+        request.legal_status.as_deref().unwrap_or("unknown"),
+        request.validity_basis.as_deref().unwrap_or("unknown"),
+        valid_from.as_deref(),
+        valid_upto.as_deref(),
+    )?;
     let store_id = current_store(&state).await?;
 
     let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
@@ -1478,7 +1665,8 @@ async fn create_compliance_licence(
     sqlx::query(
         "INSERT INTO store_compliance_licences (id,store_id,licence_form,licence_number,\
          normalized_licence_number,issuing_authority,valid_from,valid_upto,display_licence_id,\
-         revision,status,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,1,'active',?,?)",
+         legal_status,validity_basis,revision,status,created_at_utc,updated_at_utc) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,1,'active',?,?)",
     )
     .bind(&id)
     .bind(&store_id)
@@ -1489,6 +1677,8 @@ async fn create_compliance_licence(
     .bind(&valid_from)
     .bind(&valid_upto)
     .bind(&display_licence_id)
+    .bind(&legal_status)
+    .bind(&validity_basis)
     .bind(&now)
     .bind(&now)
     .execute(&mut *transaction)
@@ -1503,7 +1693,11 @@ async fn create_compliance_licence(
             entity_revision: 1,
             action: "created",
             reason: reason.as_deref(),
-            payload: serde_json::json!({ "licenceForm": licence_form }),
+            payload: serde_json::json!({
+                "licenceForm": licence_form,
+                "legalStatus": legal_status,
+                "validityBasis": validity_basis,
+            }),
         },
         &actor.id,
     )
@@ -1512,7 +1706,7 @@ async fn create_compliance_licence(
 
     let created: ComplianceLicenceResponse = sqlx::query_as(
         "SELECT id,revision,status,licence_form,licence_number,issuing_authority,valid_from,\
-         valid_upto,display_licence_id FROM store_compliance_licences WHERE id=?",
+         valid_upto,display_licence_id,legal_status,validity_basis FROM store_compliance_licences WHERE id=?",
     )
     .bind(&id)
     .fetch_one(&state.pool)
@@ -1565,6 +1759,417 @@ async fn archive_compliance_licence(
         &mut transaction,
         AuditEvent {
             entity_type: "store_compliance_licence",
+            entity_id: &id,
+            entity_revision: revision + 1,
+            action: "archived",
+            reason: Some(&reason),
+            payload: serde_json::json!({}),
+        },
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The standing of a licence already on file, restated.
+///
+/// Separate from creating the licence on purpose. A licence is recorded once; its standing changes
+/// when a registrar changes it, and each such change is its own audited revision rather than an
+/// edit that quietly overwrites what the store believed last month.
+async fn update_licence_authority(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LicenceAuthorityRequest>,
+) -> Result<Json<ComplianceLicenceResponse>, RegulatoryError> {
+    let actor = require_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    let valid_from = match request.valid_from.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(validate_date(value, "validFrom")?),
+        _ => None,
+    };
+    let valid_upto = match request.valid_upto.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(validate_date(value, "validUpto")?),
+        _ => None,
+    };
+    let (legal_status, validity_basis) = validate_authority(
+        &request.legal_status,
+        &request.validity_basis,
+        valid_from.as_deref(),
+        valid_upto.as_deref(),
+    )?;
+    let reason = optional_text(request.reason.as_deref(), "reason", 500).map_err(issue)?;
+
+    let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
+    let current: Option<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT revision,status,legal_status,validity_basis FROM store_compliance_licences \
+         WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (revision, status, status_before, basis_before) =
+        current.ok_or(RegulatoryError::NotFound)?;
+    if status == "archived" {
+        return Err(RegulatoryError::Archived);
+    }
+    if revision != request.expected_revision {
+        return Err(RegulatoryError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+
+    let now = database_now(&mut transaction).await?;
+    sqlx::query(
+        "UPDATE store_compliance_licences SET legal_status=?,validity_basis=?,valid_from=?,\
+         valid_upto=?,revision=?,updated_at_utc=? WHERE id=?",
+    )
+    .bind(&legal_status)
+    .bind(&validity_basis)
+    .bind(&valid_from)
+    .bind(&valid_upto)
+    .bind(revision + 1)
+    .bind(&now)
+    .bind(&id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    record_event(
+        &mut transaction,
+        AuditEvent {
+            entity_type: "store_compliance_licence",
+            entity_id: &id,
+            entity_revision: revision + 1,
+            action: "updated",
+            reason: reason.as_deref(),
+            payload: serde_json::json!({
+                "legalStatusBefore": status_before,
+                "legalStatus": legal_status,
+                "validityBasisBefore": basis_before,
+                "validityBasis": validity_basis,
+                "validFrom": valid_from,
+                "validUpto": valid_upto,
+            }),
+        },
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+
+    let updated: ComplianceLicenceResponse = sqlx::query_as(
+        "SELECT id,revision,status,licence_form,licence_number,issuing_authority,valid_from,\
+         valid_upto,display_licence_id,legal_status,validity_basis FROM store_compliance_licences \
+         WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    Ok(Json(updated))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which drugs a Form 20F actually names
+// ---------------------------------------------------------------------------------------------
+
+const COVERAGE_SELECT: &str = "SELECT coverage.id,coverage.revision,coverage.status,\
+     coverage.licence_id,licence.licence_number,coverage.product_id,\
+     product.display_name AS product_display_name,coverage.effective_from,coverage.effective_to,\
+     coverage.source_citation,coverage.reason,coverage.recorded_by_user_id,\
+     coverage.created_at_utc,coverage.updated_at_utc \
+     FROM store_licence_drug_coverage coverage \
+     JOIN store_compliance_licences licence ON licence.id=coverage.licence_id \
+     JOIN products product ON product.id=coverage.product_id";
+
+#[derive(Debug, Serialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DrugCoverageResponse {
+    id: String,
+    revision: i64,
+    status: String,
+    licence_id: String,
+    licence_number: String,
+    product_id: String,
+    product_display_name: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    source_citation: String,
+    reason: Option<String>,
+    recorded_by_user_id: String,
+    created_at_utc: String,
+    updated_at_utc: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateDrugCoverageRequest {
+    licence_id: String,
+    product_id: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    source_citation: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseDrugCoverageRequest {
+    expected_revision: i64,
+    effective_to: String,
+    reason: String,
+}
+
+/// One drug written onto one Form 20F, from a date.
+///
+/// Item 2 of Form 20F is "Names of drugs": the licence covers what is written on it and nothing
+/// else. So coverage is recorded drug by drug, from the owner's reading of the licence, with the
+/// citation that says where they read it. Nothing here is inferred from a schedule classification —
+/// a product being inside Schedule X says what the law calls it, not what this store may sell.
+async fn create_drug_coverage(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDrugCoverageRequest>,
+) -> Result<(StatusCode, Json<DrugCoverageResponse>), RegulatoryError> {
+    let actor = require_admin(&state, &headers).await?;
+    validate_uuid_v7(&request.licence_id, "licenceId").map_err(issue)?;
+    validate_uuid_v7(&request.product_id, "productId").map_err(issue)?;
+    let effective_from = validate_date(&request.effective_from, "effectiveFrom")?;
+    let effective_to = match request.effective_to.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(validate_date(value, "effectiveTo")?),
+        _ => None,
+    };
+    if let Some(end) = effective_to.as_deref()
+        && end <= effective_from.as_str()
+    {
+        return Err(validation("effectiveTo", "must be after the start date"));
+    }
+    let source_citation =
+        required_text(&request.source_citation, "sourceCitation", 300).map_err(issue)?;
+    let reason = optional_text(request.reason.as_deref(), "reason", 300).map_err(issue)?;
+    let store_id = current_store(&state).await?;
+
+    let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
+    // Refused by name rather than by trigger, so the owner is told which of the two is wrong.
+    let licence: Option<(String, String)> = sqlx::query_as(
+        "SELECT licence_form,status FROM store_compliance_licences WHERE id=? AND store_id=?",
+    )
+    .bind(&request.licence_id)
+    .bind(&store_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (licence_form, licence_status) = licence.ok_or(RegulatoryError::NotFound)?;
+    if licence_form != "form_20f" {
+        // Rule 61(3) issues Form 20G to a WHOLESALER. It is not retail authority and cannot be
+        // made into retail authority by writing drugs against it here.
+        return Err(validation(
+            "licenceId",
+            "retail Schedule X authority is Form 20F; no other licence form covers a retail sale",
+        ));
+    }
+    if licence_status != "active" {
+        return Err(RegulatoryError::Archived);
+    }
+    let product_exists: Option<String> =
+        sqlx::query_scalar("SELECT status FROM products WHERE id=?")
+            .bind(&request.product_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(map_database_error)?;
+    if product_exists.as_deref() != Some("active") {
+        return Err(validation("productId", "must be an active product"));
+    }
+
+    let now = database_now(&mut transaction).await?;
+    let id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO store_licence_drug_coverage (id,store_id,licence_id,product_id,\
+         effective_from,effective_to,source_citation,reason,recorded_by_user_id,revision,status,\
+         created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,1,'active',?,?)",
+    )
+    .bind(&id)
+    .bind(&store_id)
+    .bind(&request.licence_id)
+    .bind(&request.product_id)
+    .bind(&effective_from)
+    .bind(&effective_to)
+    .bind(&source_citation)
+    .bind(&reason)
+    .bind(&actor.id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    record_event(
+        &mut transaction,
+        AuditEvent {
+            entity_type: "store_licence_drug_coverage",
+            entity_id: &id,
+            entity_revision: 1,
+            action: "created",
+            reason: reason.as_deref(),
+            payload: serde_json::json!({
+                "licenceId": request.licence_id,
+                "productId": request.product_id,
+                "effectiveFrom": effective_from,
+                "effectiveTo": effective_to,
+                "sourceCitation": source_citation,
+            }),
+        },
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+
+    let created: DrugCoverageResponse =
+        sqlx::query_as(&format!("{COVERAGE_SELECT} WHERE coverage.id=?"))
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(map_database_error)?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Coverage that has come to an end — the drug struck off the licence, the endorsement withdrawn.
+/// The row keeps answering for the days it governed; only its end date moves.
+async fn close_drug_coverage(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<CloseDrugCoverageRequest>,
+) -> Result<Json<DrugCoverageResponse>, RegulatoryError> {
+    let actor = require_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    let reason = required_text(&request.reason, "reason", 300).map_err(issue)?;
+    let effective_to = validate_date(&request.effective_to, "effectiveTo")?;
+
+    let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
+    let current: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT revision,status,effective_from,effective_to FROM store_licence_drug_coverage \
+         WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    let (revision, status, effective_from, current_to) =
+        current.ok_or(RegulatoryError::NotFound)?;
+    if status == "archived" {
+        return Err(RegulatoryError::Archived);
+    }
+    if revision != request.expected_revision {
+        return Err(RegulatoryError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+    if effective_to.as_str() <= effective_from.as_str() {
+        return Err(validation(
+            "effectiveTo",
+            "must be after the date the coverage started",
+        ));
+    }
+    if let Some(existing) = current_to.as_deref()
+        && effective_to.as_str() >= existing
+    {
+        return Err(validation(
+            "effectiveTo",
+            "must shorten the coverage; it already ends on or before that date",
+        ));
+    }
+
+    let now = database_now(&mut transaction).await?;
+    sqlx::query(
+        "UPDATE store_licence_drug_coverage SET effective_to=?,revision=?,updated_at_utc=? \
+         WHERE id=?",
+    )
+    .bind(&effective_to)
+    .bind(revision + 1)
+    .bind(&now)
+    .bind(&id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    record_event(
+        &mut transaction,
+        AuditEvent {
+            entity_type: "store_licence_drug_coverage",
+            entity_id: &id,
+            entity_revision: revision + 1,
+            action: "updated",
+            reason: Some(&reason),
+            payload: serde_json::json!({
+                "effectiveToBefore": current_to,
+                "effectiveTo": effective_to,
+            }),
+        },
+        &actor.id,
+    )
+    .await?;
+    transaction.commit().await.map_err(map_database_error)?;
+
+    let updated: DrugCoverageResponse =
+        sqlx::query_as(&format!("{COVERAGE_SELECT} WHERE coverage.id=?"))
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(map_database_error)?;
+    Ok(Json(updated))
+}
+
+/// Coverage entered in error is withdrawn, not closed. Closing it would leave it answering "yes"
+/// for the days before the correction, which for a row that was never true is the wrong answer.
+async fn archive_drug_coverage(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ArchiveRequest>,
+) -> Result<StatusCode, RegulatoryError> {
+    let actor = require_admin(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(issue)?;
+    let reason = required_text(&request.reason, "reason", 500).map_err(issue)?;
+
+    let mut transaction = state.pool.begin().await.map_err(map_database_error)?;
+    let current: Option<(i64, String)> =
+        sqlx::query_as("SELECT revision,status FROM store_licence_drug_coverage WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(map_database_error)?;
+    let (revision, status) = current.ok_or(RegulatoryError::NotFound)?;
+    if status == "archived" {
+        return Err(RegulatoryError::Archived);
+    }
+    if revision != request.expected_revision {
+        return Err(RegulatoryError::Revision {
+            expected: request.expected_revision,
+            current: revision,
+        });
+    }
+    let now = database_now(&mut transaction).await?;
+    sqlx::query(
+        "UPDATE store_licence_drug_coverage SET status='archived',archived_at_utc=?,\
+         archive_reason=?,revision=?,updated_at_utc=? WHERE id=?",
+    )
+    .bind(&now)
+    .bind(&reason)
+    .bind(revision + 1)
+    .bind(&now)
+    .bind(&id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    record_event(
+        &mut transaction,
+        AuditEvent {
+            entity_type: "store_licence_drug_coverage",
             entity_id: &id,
             entity_revision: revision + 1,
             action: "archived",
@@ -1716,6 +2321,22 @@ pub fn routes() -> Router<ReferenceState> {
         .route(
             "/api/v1/store/compliance-licences/{id}/archive",
             post(archive_compliance_licence),
+        )
+        .route(
+            "/api/v1/store/compliance-licences/{id}/authority",
+            put(update_licence_authority),
+        )
+        .route(
+            "/api/v1/store/licence-drug-coverage",
+            post(create_drug_coverage),
+        )
+        .route(
+            "/api/v1/store/licence-drug-coverage/{id}/close",
+            post(close_drug_coverage),
+        )
+        .route(
+            "/api/v1/store/licence-drug-coverage/{id}/archive",
+            post(archive_drug_coverage),
         )
         .route(
             "/api/v1/store/record-elections",

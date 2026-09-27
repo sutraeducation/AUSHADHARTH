@@ -2,29 +2,42 @@ import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   LicenceFormSchema,
+  LicenceLegalStatusSchema,
+  LicenceValidityBasisSchema,
   ProfessionalCapacitySchema,
   RecordElectionKindSchema,
+  type ComplianceLicence,
+  type LicenceDrugCoverage,
   type LicenceForm,
+  type LicenceLegalStatus,
+  type LicenceValidityBasis,
   type ProfessionalCapacity,
   type RecordElectionKind,
   type RecordElectionMethod,
   type StoreProfessional
 } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
+import { ScrollableTable } from "../components/Ui";
 import { LocalServiceError } from "../platform/localService";
 import { CatalogDialog } from "../products/CatalogDialog";
+import { listProducts } from "../products/productApi";
 import { PrescribersPanel } from "../prescriptions/Prescriptions";
 import {
   CAPACITY_LABELS,
   ELECTION_LABELS,
+  LEGAL_STATUS_LABELS,
   LICENCE_FORM_LABELS,
   METHODS_FOR,
   METHOD_LABELS,
+  VALIDITY_BASIS_LABELS,
   archiveProfessional,
+  closeDrugCoverage,
   createComplianceLicence,
+  createDrugCoverage,
   createProfessional,
   createRecordElection,
-  getDrugCompliance
+  getDrugCompliance,
+  updateLicenceAuthority
 } from "./regulatoryApi";
 
 /**
@@ -46,8 +59,12 @@ export function DrugCompliancePage() {
   const queryClient = useQueryClient();
   const compliance = useQuery({ queryKey: ["drug-compliance"], queryFn: getDrugCompliance, retry: false });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["drug-compliance"] });
-  const [dialog, setDialog] = useState<"professional" | "licence" | RecordElectionKind | null>(null);
+  const [dialog, setDialog] = useState<"professional" | "licence" | "coverage" | RecordElectionKind | null>(null);
   const [archiving, setArchiving] = useState<StoreProfessional | null>(null);
+  const [authority, setAuthority] = useState<ComplianceLicence | null>(null);
+  const [closingCoverage, setClosingCoverage] = useState<LicenceDrugCoverage | null>(null);
+  const form20fLicences = (compliance.data?.complianceLicences ?? [])
+    .filter((licence) => licence.licenceForm === "form_20f" && licence.status === "active");
 
   return <div className="page-stack">
     <header className="page-header">
@@ -96,15 +113,42 @@ export function DrugCompliancePage() {
           </div>
           {compliance.data.complianceLicences.length === 0
             ? <p className="panel-note">No licence form is asserted.</p>
-            : <div className="table-scroll"><table className="data-table">
-                <thead><tr><th scope="col">Form</th><th scope="col">Number</th><th scope="col">Valid</th><th scope="col">Status</th></tr></thead>
-                <tbody>{compliance.data.complianceLicences.map((licence) => <tr key={licence.id}>
+            : <ScrollableTable><table className="data-table">
+                <thead><tr><th scope="col">Form</th><th scope="col">Number</th><th scope="col">Standing</th><th scope="col">Runs</th><th scope="col">Status</th>{canMutate && <th scope="col"><span className="visually-hidden">Actions</span></th>}</tr></thead>
+                <tbody>{compliance.data.complianceLicences.map((licence) => <tr key={licence.id} data-testid={`licence-${licence.id}`}>
                   <td>{LICENCE_FORM_LABELS[licence.licenceForm]}</td>
                   <td>{licence.licenceNumber}{licence.issuingAuthority && <small>{licence.issuingAuthority}</small>}</td>
-                  <td>{licence.validFrom ?? "—"} to {licence.validUpto ?? "—"}</td>
+                  <td><span className={`regulatory-answer regulatory-answer--${licence.legalStatus === "in_force" ? "does_not_apply" : licence.legalStatus === "unknown" ? "unknown" : "applies"}`}>{LEGAL_STATUS_LABELS[licence.legalStatus]}</span></td>
+                  <td>{VALIDITY_BASIS_LABELS[licence.validityBasis]}<small>{runsFrom(licence.validFrom, licence.validUpto)}</small></td>
                   <td><span className={`status-badge status-badge--${licence.status}`}>{licence.status === "active" ? "Active" : "Archived"}</span></td>
+                  {canMutate && <td className="table-actions">{licence.status === "active" && <button className="button button--secondary" type="button" onClick={() => setAuthority(licence)}>Standing</button>}</td>}
                 </tr>)}</tbody>
-              </table></div>}
+              </table></ScrollableTable>}
+        </section>
+
+        <section className="master-panel" aria-labelledby="drug-coverage-title" data-testid="drug-coverage">
+          <div className="panel-header">
+            <div>
+              <h2 id="drug-coverage-title">Schedule X Drug Coverage</h2>
+              <p>Item 2 of Form 20F is "Names of drugs": the licence covers the drugs written on it and no others. Record each drug from the certificate or its endorsement. A drug being within Schedule X is what the law calls it, and says nothing about what this pharmacy is licensed to supply.</p>
+            </div>
+            {canMutate && form20fLicences.length > 0 && <button className="button button--secondary" type="button" onClick={() => setDialog("coverage")}>Add Drug</button>}
+          </div>
+          {form20fLicences.length === 0
+            ? <p className="panel-note">No Form 20F is recorded, so there is no retail Schedule X licence to write drugs onto.</p>
+            : compliance.data.drugCoverage.length === 0
+            ? <p className="panel-note">No drug is recorded against this pharmacy's Form 20F.</p>
+            : <ScrollableTable><table className="data-table">
+                <thead><tr><th scope="col">Drug</th><th scope="col">Licence</th><th scope="col">In force</th><th scope="col">Authority</th><th scope="col">Status</th>{canMutate && <th scope="col"><span className="visually-hidden">Actions</span></th>}</tr></thead>
+                <tbody>{compliance.data.drugCoverage.map((row) => <tr key={row.id} data-testid={`coverage-${row.id}`}>
+                  <td>{row.productDisplayName}</td>
+                  <td>{row.licenceNumber}</td>
+                  <td>{row.effectiveFrom} to {row.effectiveTo ? `${row.effectiveTo} (exclusive)` : "further notice"}</td>
+                  <td><span className="regulatory-source">{row.sourceCitation}</span>{row.reason && <small>{row.reason}</small>}</td>
+                  <td><span className={`status-badge status-badge--${row.status}`}>{row.status === "active" ? "Active" : "Archived"}</span></td>
+                  {canMutate && <td className="table-actions">{row.status === "active" && row.effectiveTo === null && <button className="button button--secondary" type="button" onClick={() => setClosingCoverage(row)}>End</button>}</td>}
+                </tr>)}</tbody>
+              </table></ScrollableTable>}
         </section>
 
         {RecordElectionKindSchema.options.map((election) => {
@@ -136,9 +180,148 @@ export function DrugCompliancePage() {
 
     {dialog === "professional" && <ProfessionalDialog onClose={() => setDialog(null)} onSaved={() => { setDialog(null); refresh(); }} />}
     {dialog === "licence" && <LicenceFormDialog onClose={() => setDialog(null)} onSaved={() => { setDialog(null); refresh(); }} />}
-    {dialog && dialog !== "professional" && dialog !== "licence" && <ElectionDialog election={dialog} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); refresh(); }} />}
+    {dialog && dialog !== "professional" && dialog !== "licence" && dialog !== "coverage" && <ElectionDialog election={dialog} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); refresh(); }} />}
     {archiving && <ArchiveProfessionalDialog person={archiving} onClose={() => setArchiving(null)} onSaved={() => { setArchiving(null); refresh(); }} />}
+    {authority && <LicenceAuthorityDialog licence={authority} onClose={() => setAuthority(null)} onSaved={() => { setAuthority(null); refresh(); }} />}
+    {dialog === "coverage" && <DrugCoverageDialog licences={form20fLicences} onClose={() => setDialog(null)} onSaved={() => { setDialog(null); refresh(); }} />}
+    {closingCoverage && <CloseCoverageDialog coverage={closingCoverage} onClose={() => setClosingCoverage(null)} onSaved={() => { setClosingCoverage(null); refresh(); }} />}
   </div>;
+}
+
+/** The dates a licence runs between, said plainly, with "not recorded" where nothing was. */
+function runsFrom(validFrom: string | null, validUpto: string | null): string {
+  if (!validFrom && !validUpto) return "No dates recorded";
+  return `${validFrom ?? "start not recorded"} to ${validUpto ?? "no end date"}`;
+}
+
+/**
+ * A licence's standing, restated.
+ *
+ * The two answers are asked separately because they are separate facts, and the form refuses the
+ * two combinations that cannot both be true rather than quietly fixing them: a fixed term needs
+ * the date it runs to, and a perpetual licence — which is what a Form 20F is — has none.
+ */
+function LicenceAuthorityDialog({ licence, onClose, onSaved }: { licence: ComplianceLicence; onClose: () => void; onSaved: () => void }) {
+  const [legalStatus, setLegalStatus] = useState<LicenceLegalStatus>(licence.legalStatus);
+  const [validityBasis, setValidityBasis] = useState<LicenceValidityBasis>(licence.validityBasis);
+  const [validFrom, setValidFrom] = useState(licence.validFrom ?? "");
+  const [validUpto, setValidUpto] = useState(licence.validUpto ?? "");
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: () => updateLicenceAuthority(licence.id, {
+      expectedRevision: licence.revision,
+      legalStatus,
+      validityBasis,
+      validFrom: validFrom || null,
+      validUpto: validityBasis === "fixed_term" ? validUpto || null : null,
+      reason: reason || null
+    }),
+    onSuccess: onSaved,
+    onError: (caught) => setError(describe(caught))
+  });
+  const ready = validityBasis !== "fixed_term" || validUpto !== "";
+  const submit = (event: FormEvent) => { event.preventDefault(); setError(null); if (ready) mutation.mutate(); };
+  return <CatalogDialog title="Licence Standing" description={`${LICENCE_FORM_LABELS[licence.licenceForm]} — ${licence.licenceNumber}. Record what the certificate and any later order say. Leaving this unrecorded is itself an answer: the software treats an unrecorded licence as no authority at all.`} onClose={onClose}>
+    <form className="master-form" onSubmit={submit}>
+      <div className="field">
+        <label htmlFor="licence-legal-status">Legal status</label>
+        <select id="licence-legal-status" value={legalStatus} onChange={(event) => setLegalStatus(event.target.value as LicenceLegalStatus)}>
+          {LicenceLegalStatusSchema.options.map((option) => <option key={option} value={option}>{LEGAL_STATUS_LABELS[option]}</option>)}
+        </select>
+      </div>
+      <div className="field">
+        <label htmlFor="licence-validity-basis">Validity basis</label>
+        <select id="licence-validity-basis" value={validityBasis} onChange={(event) => setValidityBasis(event.target.value as LicenceValidityBasis)}>
+          {LicenceValidityBasisSchema.options.map((option) => <option key={option} value={option}>{VALIDITY_BASIS_LABELS[option]}</option>)}
+        </select>
+        <small>A licence in Form 20F is granted without an expiry: it stands until it is suspended or cancelled.</small>
+      </div>
+      <div className="field"><label htmlFor="licence-authority-from">Valid from (optional)</label><input id="licence-authority-from" type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></div>
+      {validityBasis === "fixed_term" && <div className="field">
+        <label htmlFor="licence-authority-upto">Valid up to</label>
+        <input id="licence-authority-upto" type="date" value={validUpto} onChange={(event) => setValidUpto(event.target.value)} required />
+      </div>}
+      <div className="field"><label htmlFor="licence-authority-reason">Reason (optional)</label><input id="licence-authority-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder="e.g. Order of the Licensing Authority dated…" maxLength={500} /></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="dialog-actions">
+        <button className="button button--secondary" type="button" onClick={onClose}>Cancel</button>
+        <button className="button button--primary" type="submit" disabled={!ready || mutation.isPending}>Save Standing</button>
+      </div>
+    </form>
+  </CatalogDialog>;
+}
+
+/** One drug written onto the Form 20F, from the date the licence or its endorsement says. */
+function DrugCoverageDialog({ licences, onClose, onSaved }: { licences: ComplianceLicence[]; onClose: () => void; onSaved: () => void }) {
+  const [licenceId, setLicenceId] = useState(licences.length === 1 ? licences[0]!.id : "");
+  const [search, setSearch] = useState("");
+  const [productId, setProductId] = useState("");
+  const [effectiveFrom, setEffectiveFrom] = useState("");
+  const [sourceCitation, setSourceCitation] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const products = useQuery({
+    queryKey: ["products", "coverage", search],
+    queryFn: () => listProducts(search, "active"),
+    retry: false
+  });
+  const mutation = useMutation({
+    mutationFn: () => createDrugCoverage({ licenceId, productId, effectiveFrom, effectiveTo: null, sourceCitation }),
+    onSuccess: onSaved,
+    onError: (caught) => setError(describe(caught))
+  });
+  const ready = licenceId !== "" && productId !== "" && effectiveFrom !== "" && sourceCitation.trim() !== "";
+  const submit = (event: FormEvent) => { event.preventDefault(); setError(null); if (ready) mutation.mutate(); };
+  return <CatalogDialog title="Add Drug to Form 20F" description="Record a drug that this pharmacy's Form 20F names, with the date it took effect and where you read it. Nothing is inferred from the product's schedule classification." onClose={onClose}>
+    <form className="master-form" onSubmit={submit}>
+      <div className="field">
+        <label htmlFor="coverage-licence">Form 20F</label>
+        <select id="coverage-licence" value={licenceId} onChange={(event) => setLicenceId(event.target.value)} required>
+          <option value="">Choose a licence</option>
+          {licences.map((licence) => <option key={licence.id} value={licence.id}>{licence.licenceNumber}</option>)}
+        </select>
+      </div>
+      <div className="field"><label htmlFor="coverage-search">Find a drug</label><input id="coverage-search" value={search} onChange={(event) => { setSearch(event.target.value); setProductId(""); }} placeholder="Type part of the product name" /></div>
+      <div className="field">
+        <label htmlFor="coverage-product">Drug</label>
+        <select id="coverage-product" value={productId} onChange={(event) => setProductId(event.target.value)} required>
+          <option value="">{products.isPending ? "Loading products…" : "Choose a drug"}</option>
+          {(products.data ?? []).map((product) => <option key={product.id} value={product.id}>{product.displayName}</option>)}
+        </select>
+      </div>
+      <div className="field"><label htmlFor="coverage-from">In force from</label><input id="coverage-from" type="date" value={effectiveFrom} onChange={(event) => setEffectiveFrom(event.target.value)} required /></div>
+      <div className="field"><label htmlFor="coverage-citation">Where this was read</label><input id="coverage-citation" value={sourceCitation} onChange={(event) => setSourceCitation(event.target.value)} required maxLength={300} placeholder="e.g. Form 20F item 2, names of drugs" /></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="dialog-actions">
+        <button className="button button--secondary" type="button" onClick={onClose}>Cancel</button>
+        <button className="button button--primary" type="submit" disabled={!ready || mutation.isPending}>Add Drug</button>
+      </div>
+    </form>
+  </CatalogDialog>;
+}
+
+function CloseCoverageDialog({ coverage, onClose, onSaved }: { coverage: LicenceDrugCoverage; onClose: () => void; onSaved: () => void }) {
+  const [effectiveTo, setEffectiveTo] = useState("");
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: () => closeDrugCoverage(coverage.id, { expectedRevision: coverage.revision, effectiveTo, reason }),
+    onSuccess: onSaved,
+    onError: (caught) => setError(describe(caught))
+  });
+  const ready = effectiveTo !== "" && reason.trim() !== "";
+  const submit = (event: FormEvent) => { event.preventDefault(); setError(null); if (ready) mutation.mutate(); };
+  return <CatalogDialog title="End Drug Coverage" description={`${coverage.productDisplayName} on ${coverage.licenceNumber}. The coverage keeps answering for every day it governed; it stops on the date you give, which is not itself covered.`} onClose={onClose}>
+    <form className="master-form" onSubmit={submit}>
+      <div className="field"><label htmlFor="coverage-to">Covered up to (exclusive)</label><input id="coverage-to" type="date" value={effectiveTo} onChange={(event) => setEffectiveTo(event.target.value)} required /></div>
+      <div className="field"><label htmlFor="coverage-reason">Reason</label><input id="coverage-reason" value={reason} onChange={(event) => setReason(event.target.value)} required maxLength={300} placeholder="e.g. Struck off the licence on renewal" /></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="dialog-actions">
+        <button className="button button--secondary" type="button" onClick={onClose}>Cancel</button>
+        <button className="button button--primary" type="submit" disabled={!ready || mutation.isPending}>End Coverage</button>
+      </div>
+    </form>
+  </CatalogDialog>;
 }
 
 function ProfessionalDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
@@ -296,6 +479,10 @@ function describe(caught: unknown): string {
   if (caught instanceof LocalServiceError) {
     if (caught.code === "authorization_denied") return "Only an owner can change drug compliance facts.";
     if (caught.code === "regulatory_period_overlaps") return "An election is already in force over part of that period.";
+    if (caught.code === "licence_drug_coverage_period_overlaps") return "This drug already has Form 20F coverage over part of that period.";
+    if (caught.code === "licence_validity_basis_incoherent") return "A fixed-term licence needs an expiry date, and a perpetual licence must not have one.";
+    if (caught.code === "licence_drug_coverage_incoherent") return "Coverage must name an active drug and this pharmacy's own active Form 20F.";
+    if (caught.code === "revision_conflict") return "This record changed after it was read. Reload and try again.";
     if (caught.code === "record_conflict") return "That is already recorded.";
     return caught.message;
   }

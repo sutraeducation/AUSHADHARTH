@@ -432,6 +432,268 @@ pub async fn resolve_manufacturer_candidates(
     .await
 }
 
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-D1-B — Form 20F retail authority.
+//
+// Rule 61(3) issues the retail Schedule X licence in Form 20F, and item 2 of the Form is "Names of
+// drugs": the licence covers the drugs written on it, not Schedule X at large. So the question a
+// later Schedule X workflow will ask is never "does this pharmacy hold a Form 20F", but "does this
+// pharmacy's Form 20F cover THIS drug on THIS date, and is that licence in force".
+//
+// Two independent facts, both owner-recorded, both of which must be established:
+//   A. the licence is a Form 20F whose legal status is in force, and whose validity basis is
+//      coherent and not spent on the date asked about;
+//   B. an active coverage row names this product on that date.
+//
+// Everything else is `NotEstablished`. That includes "the owner never said" — an unknown licence
+// status is not a licence in force, and no amount of paperwork elsewhere makes it one.
+// ---------------------------------------------------------------------------------------------
+
+/// Why a Form 20F authority does or does not reach a product on a date.
+///
+/// The three states are kept apart on purpose: a fail-closed gate treats the last two the same
+/// way, but a person reading the screen needs to know whether the licence is suspended, whether
+/// nobody has recorded its status, or whether the licence is fine and this drug is simply not on
+/// it. Collapsing them to a boolean would throw away the only information that tells the owner
+/// what to do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Form20fAuthority {
+    /// A Form 20F in force on the date, with active coverage naming this product.
+    Established {
+        licence_id: String,
+        licence_number: String,
+        coverage_id: String,
+    },
+    /// Every fact was recorded and they do not add up to authority on that date.
+    NotEstablished { reason: Form20fGap },
+    /// Nobody has recorded what is needed to answer at all.
+    Unresolved { reason: Form20fGap },
+}
+
+/// The specific thing that is missing or in the way. Named, because "no" is not an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form20fGap {
+    /// No Form 20F has been recorded for this store at all.
+    NoLicenceRecorded,
+    /// A Form 20F exists but nobody recorded whether it is in force.
+    LicenceStatusUnknown,
+    /// The licence is recorded as suspended.
+    LicenceSuspended,
+    /// The licence is recorded as cancelled.
+    LicenceCancelled,
+    /// A fixed-term licence whose term had not begun, or had ended, on the date asked about.
+    LicenceNotInForceOnDate,
+    /// Nobody recorded whether the licence runs perpetually or to a date.
+    ValidityBasisUnknown,
+    /// The licence is in force; this product is not among the drugs it names on that date.
+    ProductNotCovered,
+}
+
+impl Form20fAuthority {
+    /// The one question a later gate may ask. Anything short of established is a refusal.
+    pub fn is_established(&self) -> bool {
+        matches!(self, Self::Established { .. })
+    }
+
+    /// The gap, for a screen that has to tell the owner what to do next.
+    pub fn gap(&self) -> Option<Form20fGap> {
+        match self {
+            Self::Established { .. } => None,
+            Self::NotEstablished { reason } | Self::Unresolved { reason } => Some(*reason),
+        }
+    }
+
+    /// A stable wire name, so the UI never reads meaning out of prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Established { .. } => "established",
+            Self::NotEstablished { .. } => "not_established",
+            Self::Unresolved { .. } => "unresolved",
+        }
+    }
+}
+
+impl Form20fGap {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoLicenceRecorded => "no_licence_recorded",
+            Self::LicenceStatusUnknown => "licence_status_unknown",
+            Self::LicenceSuspended => "licence_suspended",
+            Self::LicenceCancelled => "licence_cancelled",
+            Self::LicenceNotInForceOnDate => "licence_not_in_force_on_date",
+            Self::ValidityBasisUnknown => "validity_basis_unknown",
+            Self::ProductNotCovered => "product_not_covered",
+        }
+    }
+}
+
+/// One Form 20F as the store recorded it, for the resolver to judge.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Form20fLicence {
+    pub id: String,
+    pub licence_number: String,
+    pub legal_status: String,
+    pub validity_basis: String,
+    pub valid_from: Option<String>,
+    pub valid_upto: Option<String>,
+}
+
+/// One coverage row as the store recorded it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DrugCoverage {
+    pub id: String,
+    pub licence_id: String,
+    pub product_id: String,
+    pub effective_from: String,
+    pub effective_to: Option<String>,
+}
+
+/// Whether a licence is one a retail Schedule X supply could ever rest on, on this date.
+///
+/// `valid_from` is honoured where the store recorded one, because a licence does not authorise the
+/// day before it was granted. `valid_upto` only ends a term the owner has called fixed: a perpetual
+/// licence has no end, and an unknown basis is not an authority at all.
+fn licence_gap(licence: &Form20fLicence, business_date: &str) -> Option<Form20fGap> {
+    match licence.legal_status.as_str() {
+        "suspended" => return Some(Form20fGap::LicenceSuspended),
+        "cancelled" => return Some(Form20fGap::LicenceCancelled),
+        "unknown" => return Some(Form20fGap::LicenceStatusUnknown),
+        "in_force" => {}
+        _ => return Some(Form20fGap::LicenceStatusUnknown),
+    }
+    match licence.validity_basis.as_str() {
+        "perpetual" => {}
+        "fixed_term" => match licence.valid_upto.as_deref() {
+            // A fixed term with no end date is an incoherent record, not an endless licence.
+            None => return Some(Form20fGap::ValidityBasisUnknown),
+            Some(end) if business_date > end => {
+                return Some(Form20fGap::LicenceNotInForceOnDate);
+            }
+            Some(_) => {}
+        },
+        _ => return Some(Form20fGap::ValidityBasisUnknown),
+    }
+    if let Some(start) = licence.valid_from.as_deref()
+        && business_date < start
+    {
+        return Some(Form20fGap::LicenceNotInForceOnDate);
+    }
+    None
+}
+
+/// Does the store's Form 20F authority reach `product_id` on `business_date`?
+///
+/// Pure, so the boundary cases are testable without a database: the caller supplies the store's
+/// Form 20F licences and the coverage rows, both already scoped to that store.
+pub fn resolve_form_20f_authority(
+    licences: &[Form20fLicence],
+    coverage: &[DrugCoverage],
+    product_id: &str,
+    business_date: &str,
+) -> Form20fAuthority {
+    if licences.is_empty() {
+        return Form20fAuthority::Unresolved {
+            reason: Form20fGap::NoLicenceRecorded,
+        };
+    }
+
+    // A store may hold more than one Form 20F over time. Authority exists if ANY of them is in
+    // force on the date and carries coverage for the product; the gap reported when none does is
+    // the most actionable one, in the order below.
+    let mut best_gap = Form20fGap::LicenceStatusUnknown;
+    let mut saw_usable_licence = false;
+    for licence in licences {
+        match licence_gap(licence, business_date) {
+            Some(gap) => {
+                best_gap = worse_of(best_gap, gap);
+            }
+            None => {
+                saw_usable_licence = true;
+                if let Some(covering) = coverage.iter().find(|row| {
+                    row.licence_id == licence.id
+                        && row.product_id == product_id
+                        && row.effective_from.as_str() <= business_date
+                        && row
+                            .effective_to
+                            .as_deref()
+                            .is_none_or(|end| business_date < end)
+                }) {
+                    return Form20fAuthority::Established {
+                        licence_id: licence.id.clone(),
+                        licence_number: licence.licence_number.clone(),
+                        coverage_id: covering.id.clone(),
+                    };
+                }
+            }
+        }
+    }
+
+    if saw_usable_licence {
+        // The licence is fine; this drug is simply not written on it for that date.
+        return Form20fAuthority::NotEstablished {
+            reason: Form20fGap::ProductNotCovered,
+        };
+    }
+    match best_gap {
+        // "Nobody said" is unresolved; a recorded suspension or cancellation is an answer.
+        Form20fGap::LicenceStatusUnknown | Form20fGap::ValidityBasisUnknown => {
+            Form20fAuthority::Unresolved { reason: best_gap }
+        }
+        reason => Form20fAuthority::NotEstablished { reason },
+    }
+}
+
+/// Which gap a reader should be told about when several licences each fail differently: a definite
+/// answer beats a missing one, so "suspended" is reported over "nobody recorded the status".
+fn worse_of(current: Form20fGap, candidate: Form20fGap) -> Form20fGap {
+    fn rank(gap: Form20fGap) -> u8 {
+        match gap {
+            Form20fGap::LicenceStatusUnknown => 0,
+            Form20fGap::ValidityBasisUnknown => 1,
+            Form20fGap::NoLicenceRecorded => 2,
+            Form20fGap::LicenceNotInForceOnDate => 3,
+            Form20fGap::LicenceSuspended => 4,
+            Form20fGap::LicenceCancelled => 5,
+            Form20fGap::ProductNotCovered => 6,
+        }
+    }
+    if rank(candidate) > rank(current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// The store's Form 20F licences and coverage, read for one product.
+///
+/// Both reads are store-scoped in SQL. Nothing here trusts a caller-supplied store.
+pub async fn load_form_20f_authority(
+    connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
+    product_id: &str,
+) -> Result<(Vec<Form20fLicence>, Vec<DrugCoverage>), sqlx::Error> {
+    let licences = sqlx::query_as::<_, Form20fLicence>(
+        "SELECT id,licence_number,legal_status,validity_basis,valid_from,valid_upto \
+         FROM store_compliance_licences \
+         WHERE store_id=? AND licence_form='form_20f' AND status='active' \
+         ORDER BY created_at_utc, id",
+    )
+    .bind(store_id)
+    .fetch_all(&mut **connection)
+    .await?;
+    let coverage = sqlx::query_as::<_, DrugCoverage>(
+        "SELECT id,licence_id,product_id,effective_from,effective_to \
+         FROM store_licence_drug_coverage \
+         WHERE store_id=? AND product_id=? AND status='active' \
+         ORDER BY effective_from, id",
+    )
+    .bind(store_id)
+    .bind(product_id)
+    .fetch_all(&mut **connection)
+    .await?;
+    Ok((licences, coverage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +1029,192 @@ mod tests {
             ResolvedRegulatory::unknown().answer("schedule_z"),
             Resolution::Unknown
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 1M-D1-B — Form 20F authority.
+    // -----------------------------------------------------------------------------------------
+
+    fn licence(
+        status: &str,
+        basis: &str,
+        from: Option<&str>,
+        upto: Option<&str>,
+    ) -> Form20fLicence {
+        Form20fLicence {
+            id: "licence-1".to_owned(),
+            licence_number: "MH-MUM-20F-4471".to_owned(),
+            legal_status: status.to_owned(),
+            validity_basis: basis.to_owned(),
+            valid_from: from.map(str::to_owned),
+            valid_upto: upto.map(str::to_owned),
+        }
+    }
+
+    fn coverage(product: &str, from: &str, to: Option<&str>) -> DrugCoverage {
+        DrugCoverage {
+            id: format!("coverage-{product}-{from}"),
+            licence_id: "licence-1".to_owned(),
+            product_id: product.to_owned(),
+            effective_from: from.to_owned(),
+            effective_to: to.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_perpetual_licence_in_force_with_coverage_is_the_only_established_case() {
+        let licences = [licence("in_force", "perpetual", Some("2024-04-01"), None)];
+        let rows = [coverage("alprazolam", "2024-04-01", None)];
+        let answer = resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-09-25");
+        assert!(answer.is_established(), "{answer:?}");
+        assert_eq!(answer.code(), "established");
+        assert_eq!(answer.gap(), None);
+    }
+
+    #[test]
+    fn a_fixed_term_licence_authorises_only_inside_its_term() {
+        let licences = [licence(
+            "in_force",
+            "fixed_term",
+            Some("2024-04-01"),
+            Some("2026-03-31"),
+        )];
+        let rows = [coverage("alprazolam", "2024-04-01", None)];
+        // The last day of the term still authorises; the day after does not.
+        assert!(
+            resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-03-31")
+                .is_established()
+        );
+        let expired = resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-04-01");
+        assert!(!expired.is_established());
+        assert_eq!(expired.gap(), Some(Form20fGap::LicenceNotInForceOnDate));
+        // And a date before the licence began is not authority either.
+        let early = resolve_form_20f_authority(&licences, &rows, "alprazolam", "2024-03-31");
+        assert_eq!(early.gap(), Some(Form20fGap::LicenceNotInForceOnDate));
+    }
+
+    #[test]
+    fn nothing_recorded_is_unresolved_and_never_authority() {
+        // No licence at all.
+        let nothing = resolve_form_20f_authority(&[], &[], "alprazolam", "2026-09-25");
+        assert_eq!(nothing.code(), "unresolved");
+        assert_eq!(nothing.gap(), Some(Form20fGap::NoLicenceRecorded));
+        // A licence whose status nobody recorded.
+        let unknown = [licence("unknown", "unknown", None, None)];
+        let rows = [coverage("alprazolam", "2020-01-01", None)];
+        let answer = resolve_form_20f_authority(&unknown, &rows, "alprazolam", "2026-09-25");
+        assert!(!answer.is_established());
+        assert_eq!(answer.code(), "unresolved");
+        assert_eq!(answer.gap(), Some(Form20fGap::LicenceStatusUnknown));
+        // In force, but nobody said whether it runs perpetually or to a date.
+        let basis = [licence("in_force", "unknown", None, None)];
+        let answer = resolve_form_20f_authority(&basis, &rows, "alprazolam", "2026-09-25");
+        assert_eq!(answer.gap(), Some(Form20fGap::ValidityBasisUnknown));
+        // A fixed term with no end date is incoherent, not endless.
+        let incoherent = [licence("in_force", "fixed_term", None, None)];
+        let answer = resolve_form_20f_authority(&incoherent, &rows, "alprazolam", "2026-09-25");
+        assert_eq!(answer.gap(), Some(Form20fGap::ValidityBasisUnknown));
+    }
+
+    #[test]
+    fn a_suspended_or_cancelled_licence_is_an_answer_not_a_gap() {
+        let rows = [coverage("alprazolam", "2020-01-01", None)];
+        for (status, expected) in [
+            ("suspended", Form20fGap::LicenceSuspended),
+            ("cancelled", Form20fGap::LicenceCancelled),
+        ] {
+            let licences = [licence(status, "perpetual", None, None)];
+            let answer = resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-09-25");
+            assert!(!answer.is_established(), "{status}");
+            assert_eq!(answer.code(), "not_established", "{status}");
+            assert_eq!(answer.gap(), Some(expected), "{status}");
+        }
+    }
+
+    #[test]
+    fn coverage_is_effective_dated_and_covers_only_its_own_product() {
+        let licences = [licence("in_force", "perpetual", None, None)];
+        let rows = [coverage("alprazolam", "2026-01-01", Some("2026-07-01"))];
+        // Before it starts, on its first day, on its last day, and after it ends.
+        assert_eq!(
+            resolve_form_20f_authority(&licences, &rows, "alprazolam", "2025-12-31").gap(),
+            Some(Form20fGap::ProductNotCovered)
+        );
+        assert!(
+            resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-01-01")
+                .is_established()
+        );
+        assert!(
+            resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-06-30")
+                .is_established()
+        );
+        assert_eq!(
+            resolve_form_20f_authority(&licences, &rows, "alprazolam", "2026-07-01").gap(),
+            Some(Form20fGap::ProductNotCovered),
+            "an ended coverage does not reach its own end date"
+        );
+        // Another drug on the same licence is not covered by this row.
+        assert_eq!(
+            resolve_form_20f_authority(&licences, &rows, "methylphenidate", "2026-03-01").gap(),
+            Some(Form20fGap::ProductNotCovered)
+        );
+        // A licence with no coverage at all covers nothing.
+        assert_eq!(
+            resolve_form_20f_authority(&licences, &[], "alprazolam", "2026-03-01").gap(),
+            Some(Form20fGap::ProductNotCovered)
+        );
+    }
+
+    #[test]
+    fn coverage_written_on_another_licence_does_not_ride_on_this_one() {
+        // The store holds one usable licence; the coverage row names a different licence id, as a
+        // row copied from a cancelled licence would.
+        let licences = [licence("in_force", "perpetual", None, None)];
+        let foreign = [DrugCoverage {
+            id: "coverage-foreign".to_owned(),
+            licence_id: "licence-elsewhere".to_owned(),
+            product_id: "alprazolam".to_owned(),
+            effective_from: "2020-01-01".to_owned(),
+            effective_to: None,
+        }];
+        let answer = resolve_form_20f_authority(&licences, &foreign, "alprazolam", "2026-09-25");
+        assert!(!answer.is_established());
+        assert_eq!(answer.gap(), Some(Form20fGap::ProductNotCovered));
+    }
+
+    #[test]
+    fn one_usable_licence_among_several_is_enough_and_the_gap_reported_is_the_actionable_one() {
+        // A cancelled licence and a live one: the live one answers.
+        let cancelled = Form20fLicence {
+            id: "licence-old".to_owned(),
+            licence_number: "OLD".to_owned(),
+            legal_status: "cancelled".to_owned(),
+            validity_basis: "perpetual".to_owned(),
+            valid_from: None,
+            valid_upto: None,
+        };
+        let live = licence("in_force", "perpetual", None, None);
+        let rows = [coverage("alprazolam", "2020-01-01", None)];
+        let answer = resolve_form_20f_authority(
+            &[cancelled.clone(), live],
+            &rows,
+            "alprazolam",
+            "2026-09-25",
+        );
+        assert!(answer.is_established(), "{answer:?}");
+
+        // With only unusable licences, the definite answer is reported over the silent one.
+        let silent = Form20fLicence {
+            id: "licence-silent".to_owned(),
+            licence_number: "SILENT".to_owned(),
+            legal_status: "unknown".to_owned(),
+            validity_basis: "unknown".to_owned(),
+            valid_from: None,
+            valid_upto: None,
+        };
+        let answer =
+            resolve_form_20f_authority(&[silent, cancelled], &rows, "alprazolam", "2026-09-25");
+        assert_eq!(answer.gap(), Some(Form20fGap::LicenceCancelled));
+        assert_eq!(answer.code(), "not_established");
     }
 }

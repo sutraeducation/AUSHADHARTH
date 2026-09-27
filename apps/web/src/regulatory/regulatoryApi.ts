@@ -4,8 +4,16 @@ import {
   RegulatoryClassificationSchema,
   StoreProfessionalSchema,
   ComplianceLicenceSchema,
+  LicenceDrugCoverageSchema,
   RecordElectionSchema,
+  type CloseLicenceDrugCoverageRequest,
+  type CreateLicenceDrugCoverageRequest,
   type CreateRegulatoryClassificationRequest,
+  type Form20fAuthorityState,
+  type Form20fGap,
+  type LicenceLegalStatus,
+  type LicenceValidityBasis,
+  type UpdateLicenceAuthorityRequest,
   type DrugCompliance,
   type LicenceForm,
   type ProductRegulatory,
@@ -151,6 +159,47 @@ export async function archiveComplianceLicence(id: string, input: { expectedRevi
   });
 }
 
+/**
+ * Phase 1M-D1-B. What the owner says about a licence's standing, kept apart from the licence's
+ * own particulars: a suspension changes none of the numbers on the certificate.
+ */
+export async function updateLicenceAuthority(id: string, input: UpdateLicenceAuthorityRequest) {
+  return ComplianceLicenceSchema.parse(
+    await localServiceRequest(`/api/v1/store/compliance-licences/${id}/authority`, {
+      method: "PUT",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+/** One drug written onto one Form 20F, from a date. Item 2 of the Form is "Names of drugs". */
+export async function createDrugCoverage(input: CreateLicenceDrugCoverageRequest) {
+  return LicenceDrugCoverageSchema.parse(
+    await localServiceRequest("/api/v1/store/licence-drug-coverage", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+/** The drug struck off the licence: the row keeps answering for the days it governed. */
+export async function closeDrugCoverage(id: string, input: CloseLicenceDrugCoverageRequest) {
+  return LicenceDrugCoverageSchema.parse(
+    await localServiceRequest(`/api/v1/store/licence-drug-coverage/${id}/close`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+/** Coverage entered in error: it stops answering for any date at all. */
+export async function archiveDrugCoverage(id: string, input: { expectedRevision: number; reason: string }) {
+  await localServiceRequest(`/api/v1/store/licence-drug-coverage/${id}/archive`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
 export interface RecordElectionInput {
   election: RecordElectionKind;
   method: RecordElectionMethod;
@@ -220,6 +269,40 @@ export const METHOD_LABELS: Record<RecordElectionMethod, string> = {
 export const METHODS_FOR: Record<RecordElectionKind, RecordElectionMethod[]> = {
   rule_65_3_prescription_supply: ["prescription_register", "cash_or_credit_memo_book"],
   rule_65_4_non_prescription_schedule_c: ["register", "cash_or_credit_memo_book"]
+};
+
+/**
+ * Phase 1M-D1-B. `unknown` is spelled out rather than shown as a blank, because a blank on a
+ * compliance screen reads as "nothing to do here" — which is the opposite of what it means.
+ */
+export const LEGAL_STATUS_LABELS: Record<LicenceLegalStatus, string> = {
+  in_force: "In force",
+  suspended: "Suspended",
+  cancelled: "Cancelled",
+  unknown: "Not recorded"
+};
+
+export const VALIDITY_BASIS_LABELS: Record<LicenceValidityBasis, string> = {
+  perpetual: "Perpetual — no expiry",
+  fixed_term: "Fixed term",
+  unknown: "Not recorded"
+};
+
+export const AUTHORITY_STATE_LABELS: Record<Form20fAuthorityState, string> = {
+  established: "Form 20F covers this drug",
+  not_established: "Form 20F does not cover this drug",
+  unresolved: "Form 20F authority not established"
+};
+
+/** What to do next, for each way the answer can fall short. "No" is not an instruction. */
+export const AUTHORITY_GAP_LABELS: Record<Form20fGap, string> = {
+  no_licence_recorded: "No Form 20F is recorded for this pharmacy.",
+  licence_status_unknown: "A Form 20F is on file, but nobody has recorded whether it is in force.",
+  licence_suspended: "The Form 20F is recorded as suspended.",
+  licence_cancelled: "The Form 20F is recorded as cancelled.",
+  licence_not_in_force_on_date: "The Form 20F's term does not cover this date.",
+  validity_basis_unknown: "Nobody has recorded whether the Form 20F runs perpetually or to a date.",
+  product_not_covered: "The Form 20F is in force, and this drug is not among the drugs recorded on it for this date."
 };
 
 export const CAPACITY_LABELS: Record<ProfessionalCapacity, string> = {

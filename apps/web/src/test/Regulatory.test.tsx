@@ -22,7 +22,9 @@ const IDs = {
   pack: "01997c00-0000-7000-8000-000000000005",
   form: "01997c00-0000-7000-8000-000000000006",
   user: "01997c00-0000-7000-8000-000000000030",
-  finding: "01997c00-0000-7000-8000-000000000040"
+  finding: "01997c00-0000-7000-8000-000000000040",
+  licence: "01997c00-0000-7000-8000-000000000050",
+  coverage: "01997c00-0000-7000-8000-000000000060"
 };
 const system = { status: "ok", apiVersion: "v1", applicationVersion: "0.0.0", compatibility: { minimumWebVersion: "0.0.0", maximumWebMajorVersion: 0 } };
 const stamp = { createdAtUtc: "2026-01-01T00:00:00Z", updatedAtUtc: "2026-01-01T00:00:00Z", archivedAtUtc: null, archiveReason: null };
@@ -35,6 +37,16 @@ function product(): ProductDetail {
     hsnCodeId: null, taxCategoryId: null, revision: 1, status: "active", ...stamp,
     companyRoles: [], composition: [],
     packs: [{ id: IDs.pack, productId: IDs.product, containerUnitId: IDs.strip, baseQuantityAtoms: 10, containedPackId: null, containedPackCount: null, skuCode: null, skuStoreId: IDs.store, displayLabel: "Strip of 10", revision: 1, status: "active", ...stamp }]
+  };
+}
+
+/** Phase 1M-D1-B. A Form 20F on file, with nothing yet said about whether it stands. */
+function licence(overrides: Record<string, unknown> = {}) {
+  return {
+    id: IDs.licence, revision: 1, status: "active", licenceForm: "form_20f",
+    licenceNumber: "MH-PUNE-20F-4471", issuingAuthority: "FDA Maharashtra",
+    validFrom: null, validUpto: null, displayLicenceId: null,
+    legalStatus: "unknown", validityBasis: "unknown", ...overrides
   };
 }
 
@@ -66,11 +78,22 @@ function service(options: Options = {}) {
       writes.push({ path: url.pathname, body });
       return response({ id: IDs.finding, revision: 1, status: "active", ...body, effectiveTo: body.effectiveTo ?? null, reason: body.reason ?? null, determinedByUserId: IDs.user, createdAtUtc: stamp.createdAtUtc, updatedAtUtc: stamp.updatedAtUtc }, 201);
     }
+    if (url.pathname === "/api/v1/products") return response([product()]);
     if (/^\/api\/v1\/products\/[^/]+$/.test(url.pathname)) return response(product());
+    if (/\/compliance-licences\/[^/]+\/authority$/.test(url.pathname) && method === "PUT") {
+      if (role !== "owner_admin") return failure("authorization_denied", 403);
+      writes.push({ path: url.pathname, body });
+      return response({ ...licence(), ...body, revision: 2 });
+    }
+    if (url.pathname === "/api/v1/store/licence-drug-coverage" && method === "POST") {
+      if (role !== "owner_admin") return failure("authorization_denied", 403);
+      writes.push({ path: url.pathname, body });
+      return response({ id: IDs.coverage, revision: 1, status: "active", licenceNumber: "MH-PUNE-20F-4471", productDisplayName: product().displayName, effectiveTo: null, reason: null, recordedByUserId: IDs.user, createdAtUtc: stamp.createdAtUtc, updatedAtUtc: stamp.updatedAtUtc, ...body }, 201);
+    }
     if (/\/packs\/[^/]+\/(batches|barcodes)$/.test(url.pathname)) return response([]);
     if (/\/packs\/[^/]+\/policy$/.test(url.pathname)) return response(null, 204);
     if (url.pathname === "/api/v1/store/drug-compliance") {
-      return response({ complianceLicences: [], recordElections: [], professionals: [], ...options.compliance });
+      return response({ complianceLicences: [], recordElections: [], professionals: [], drugCoverage: [], ...options.compliance });
     }
     if (url.pathname === "/api/v1/store/record-elections" && method === "POST") {
       writes.push({ path: url.pathname, body });
@@ -230,5 +253,136 @@ describe("Drug Compliance settings", () => {
     expect(within(dialog).getByRole("button", { name: "Add Professional" })).toBeDisabled();
     fireEvent.change(within(dialog).getByLabelText("Capacity"), { target: { value: "competent_person" } });
     expect(within(dialog).getByRole("button", { name: "Add Professional" })).toBeEnabled();
+  });
+});
+
+/**
+ * Phase 1M-D1-B — Form 20F standing and the drugs it names.
+ *
+ * The attack here is a screen that reads silence as authority: a licence nobody has vouched for
+ * shown as though it were in force, a drug's Schedule X classification mistaken for permission to
+ * supply it, or an advisory panel that a counter could take for a green light.
+ */
+describe("Form 20F authority", () => {
+  it("says in words that a recorded licence is not a licence in force", async () => {
+    renderApp("/app/settings/drug-compliance", service({ compliance: { complianceLicences: [licence()] } }));
+    await screen.findByRole("region", { name: "Professionals" });
+    const forms = within(screen.getByRole("region", { name: "Licence Forms" }));
+    // Not a blank, and not "Active" borrowed from the row's own archive status.
+    expect(forms.getAllByText("Not recorded")).toHaveLength(2);
+    expect(forms.queryByText("In force")).not.toBeInTheDocument();
+    expect(forms.getByText("No dates recorded")).toBeInTheDocument();
+  });
+
+  it("will not record a fixed term without the date it runs to", async () => {
+    const double = renderApp("/app/settings/drug-compliance", service({ compliance: { complianceLicences: [licence()] } }));
+    await screen.findByRole("region", { name: "Professionals" });
+    fireEvent.click(screen.getByRole("button", { name: "Standing" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Legal status"), { target: { value: "in_force" } });
+    fireEvent.change(within(dialog).getByLabelText("Validity basis"), { target: { value: "fixed_term" } });
+    expect(within(dialog).getByRole("button", { name: "Save Standing" })).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText("Valid up to"), { target: { value: "2030-03-31" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Standing" }));
+    await waitFor(() => expect(double.writes).toHaveLength(1));
+    expect(double.writes[0].body).toMatchObject({
+      expectedRevision: 1, legalStatus: "in_force", validityBasis: "fixed_term", validUpto: "2030-03-31"
+    });
+  });
+
+  it("does not carry an expiry date onto a perpetual licence", async () => {
+    const double = renderApp("/app/settings/drug-compliance", service({
+      compliance: { complianceLicences: [licence({ validUpto: "2030-03-31", validityBasis: "fixed_term", legalStatus: "in_force" })] }
+    }));
+    await screen.findByRole("region", { name: "Professionals" });
+    fireEvent.click(screen.getByRole("button", { name: "Standing" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Validity basis"), { target: { value: "perpetual" } });
+    // The date field is gone, and the date goes with it rather than being sent regardless.
+    expect(within(dialog).queryByLabelText("Valid up to")).not.toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save Standing" }));
+    await waitFor(() => expect(double.writes).toHaveLength(1));
+    expect(double.writes[0].body).toMatchObject({ validityBasis: "perpetual", validUpto: null });
+  });
+
+  it("offers no drug coverage at all until a Form 20F is recorded", async () => {
+    renderApp("/app/settings/drug-compliance");
+    await screen.findByRole("region", { name: "Professionals" });
+    const coverage = within(screen.getByRole("region", { name: "Schedule X Drug Coverage" }));
+    expect(coverage.getByText(/No Form 20F is recorded/)).toBeInTheDocument();
+    expect(coverage.queryByRole("button", { name: "Add Drug" })).not.toBeInTheDocument();
+  });
+
+  it("sends a drug written onto the licence with the citation the owner typed", async () => {
+    const double = renderApp("/app/settings/drug-compliance", service({
+      compliance: { complianceLicences: [licence({ legalStatus: "in_force", validityBasis: "perpetual" })] }
+    }));
+    await screen.findByRole("region", { name: "Professionals" });
+    fireEvent.click(screen.getByRole("button", { name: "Add Drug" }));
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByRole("option", { name: "Schedule H1 Alprazolam 0.5 mg" });
+    fireEvent.change(within(dialog).getByLabelText("Drug"), { target: { value: IDs.product } });
+    fireEvent.change(within(dialog).getByLabelText("In force from"), { target: { value: "2026-04-01" } });
+    // Nothing is sent until the owner says where they read it.
+    expect(within(dialog).getByRole("button", { name: "Add Drug" })).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText("Where this was read"), { target: { value: "Form 20F item 2, names of drugs" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add Drug" }));
+    await waitFor(() => expect(double.writes).toHaveLength(1));
+    expect(double.writes[0].body).toMatchObject({
+      licenceId: IDs.licence,
+      productId: IDs.product,
+      effectiveFrom: "2026-04-01",
+      sourceCitation: "Form 20F item 2, names of drugs"
+    });
+  });
+
+  it("gives a cashier no way to change the licence standing or its drugs", async () => {
+    renderApp("/app/settings/drug-compliance", service({
+      role: "cashier",
+      compliance: { complianceLicences: [licence({ legalStatus: "in_force", validityBasis: "perpetual" })] }
+    }));
+    await screen.findByRole("region", { name: "Professionals" });
+    expect(screen.queryByRole("button", { name: "Standing" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Drug" })).not.toBeInTheDocument();
+  });
+
+  it("shows the product's Form 20F position as advice, never as permission", async () => {
+    renderApp(`/app/products/${IDs.product}`);
+    await awaitGate();
+    const advice = within(screen.getByTestId("form-20f-authority"));
+    expect(advice.getByText("Form 20F authority not established")).toBeInTheDocument();
+    expect(advice.getByText("No Form 20F is recorded for this pharmacy.")).toBeInTheDocument();
+    expect(advice.getByText(/Advisory only.*does not permit a sale/)).toBeInTheDocument();
+  });
+
+  it("distinguishes a cancelled licence from one nobody has spoken about", async () => {
+    for (const [gap, words] of [
+      ["licence_cancelled", "The Form 20F is recorded as cancelled."],
+      ["licence_status_unknown", "A Form 20F is on file, but nobody has recorded whether it is in force."],
+      ["product_not_covered", "The Form 20F is in force, and this drug is not among the drugs recorded on it for this date."]
+    ] as const) {
+      renderApp(`/app/products/${IDs.product}`, service({
+        regulatory: { form20fAuthority: { state: gap === "licence_status_unknown" ? "unresolved" : "not_established", gap, licenceId: null, licenceNumber: null, coverageId: null } }
+      }));
+      await awaitGate();
+      expect(within(screen.getByTestId("form-20f-authority")).getByText(words)).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it("names the licence a covered drug rests on, and still refuses to authorise the sale", async () => {
+    renderApp(`/app/products/${IDs.product}`, service({
+      regulatory: {
+        saleGate: "workflow_unavailable",
+        saleGateScheme: "schedule_x",
+        form20fAuthority: { state: "established", gap: null, licenceId: IDs.licence, licenceNumber: "MH-PUNE-20F-4471", coverageId: IDs.coverage }
+      }
+    }));
+    await awaitGate();
+    const advice = within(screen.getByTestId("form-20f-authority"));
+    expect(advice.getByText("Form 20F covers this drug")).toBeInTheDocument();
+    expect(advice.getByText(/MH-PUNE-20F-4471/)).toBeInTheDocument();
+    // The gate above it is unmoved: established authority is not a workflow.
+    expect(within(panel()).getByText("Regulated sale — workflow not yet available")).toBeInTheDocument();
   });
 });

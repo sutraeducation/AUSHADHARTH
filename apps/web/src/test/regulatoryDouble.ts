@@ -17,6 +17,15 @@ export function unclassifiedRegulatory(productId: string, productKind: string) {
     saleGate: productKind === "medicine" ? "unresolved" : "clear",
     saleGateScheme: null,
     alcoholPercentVvHundredths: null,
-    attributesRevision: null
+    attributesRevision: null,
+    // Phase 1M-D1-B. An untouched pharmacy has recorded no Form 20F, so there is nothing to
+    // resolve — which is a different answer from "this drug is not covered".
+    form20fAuthority: {
+      state: "unresolved",
+      gap: "no_licence_recorded",
+      licenceId: null,
+      licenceNumber: null,
+      coverageId: null
+    }
   };
 }

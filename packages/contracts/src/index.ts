@@ -2638,6 +2638,37 @@ export const RegulatoryClassificationSchema = z.object({
   updatedAtUtc: z.string()
 });
 
+/**
+ * Phase 1M-D1-B. Whether the store's Form 20F reaches a product on a date.
+ *
+ * Three states, not two. A fail-closed gate treats `not_established` and `unresolved` alike, but a
+ * person reading the screen needs to know whether the licence is cancelled or whether nobody has
+ * said — the first is an answer, the second is a task.
+ */
+export const Form20fAuthorityStateSchema = z.enum([
+  "established",
+  "not_established",
+  "unresolved"
+]);
+
+export const Form20fGapSchema = z.enum([
+  "no_licence_recorded",
+  "licence_status_unknown",
+  "licence_suspended",
+  "licence_cancelled",
+  "licence_not_in_force_on_date",
+  "validity_basis_unknown",
+  "product_not_covered"
+]);
+
+export const Form20fAuthoritySchema = z.object({
+  state: Form20fAuthorityStateSchema,
+  gap: Form20fGapSchema.nullable(),
+  licenceId: z.string().nullable(),
+  licenceNumber: z.string().nullable(),
+  coverageId: z.string().nullable()
+});
+
 export const ProductRegulatorySchema = z.object({
   productId: z.string(),
   productKind: z.string(),
@@ -2648,7 +2679,13 @@ export const ProductRegulatorySchema = z.object({
   saleGateScheme: RegulatorySchemeSchema.nullable(),
   /** Hundredths of one per cent v/v. A label fact; it classifies nothing by itself. */
   alcoholPercentVvHundredths: z.number().int().nullable(),
-  attributesRevision: z.number().int().nullable()
+  attributesRevision: z.number().int().nullable(),
+  /**
+   * ADVISORY. Where the Form 20F paperwork stands for this product on `resolvedOn`. It authorises
+   * nothing: the Schedule X sale workflow does not exist, and the counter refuses those lines
+   * whatever this says.
+   */
+  form20fAuthority: Form20fAuthoritySchema
 });
 
 export const CreateRegulatoryClassificationRequestSchema = z.object({
@@ -2692,6 +2729,20 @@ export const LicenceFormSchema = z.enum([
   "form_21b"
 ]);
 
+/**
+ * Phase 1M-D1-B. A Form 20F stands until it is suspended or cancelled; `unknown` is what the
+ * software says before anyone has told it which.
+ */
+export const LicenceLegalStatusSchema = z.enum([
+  "in_force",
+  "suspended",
+  "cancelled",
+  "unknown"
+]);
+
+/** Whether a licence runs without an end, to a stated date, or on a footing nobody has recorded. */
+export const LicenceValidityBasisSchema = z.enum(["perpetual", "fixed_term", "unknown"]);
+
 export const ComplianceLicenceSchema = z.object({
   id: z.string(),
   revision: z.number().int().positive(),
@@ -2701,7 +2752,63 @@ export const ComplianceLicenceSchema = z.object({
   issuingAuthority: z.string().nullable(),
   validFrom: z.string().nullable(),
   validUpto: z.string().nullable(),
-  displayLicenceId: z.string().nullable()
+  displayLicenceId: z.string().nullable(),
+  /**
+   * Phase 1M-D1-B. Whether the licence stands, and on what footing it runs.
+   *
+   * Both begin — and stay — `unknown` until somebody reads the certificate and says. That is not a
+   * gap in the data to be filled with a sensible guess: a licence nobody has vouched for is not a
+   * licence in force, and the screen says so in those words.
+   */
+  legalStatus: LicenceLegalStatusSchema,
+  validityBasis: LicenceValidityBasisSchema
+});
+
+export const UpdateLicenceAuthorityRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  legalStatus: LicenceLegalStatusSchema,
+  validityBasis: LicenceValidityBasisSchema,
+  validFrom: z.string().nullable().optional(),
+  validUpto: z.string().nullable().optional(),
+  reason: z.string().nullable().optional()
+});
+
+/**
+ * Item 2 of Form 20F is "Names of drugs": a retail Schedule X licence covers the drugs written on
+ * it and no others. So coverage is recorded drug by drug, effective-dated, with the citation that
+ * says where the owner read it — never derived from a product's schedule classification, which
+ * says what the law calls the drug, not what this pharmacy may supply.
+ */
+export const LicenceDrugCoverageSchema = z.object({
+  id: z.string(),
+  revision: z.number().int().positive(),
+  status: z.enum(["active", "archived"]),
+  licenceId: z.string(),
+  licenceNumber: z.string(),
+  productId: z.string(),
+  productDisplayName: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable(),
+  recordedByUserId: z.string(),
+  createdAtUtc: z.string(),
+  updatedAtUtc: z.string()
+});
+
+export const CreateLicenceDrugCoverageRequestSchema = z.object({
+  licenceId: z.string(),
+  productId: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable().optional(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable().optional()
+});
+
+export const CloseLicenceDrugCoverageRequestSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  effectiveTo: z.string(),
+  reason: z.string()
 });
 
 /** Rule 65(3)(2) and rule 65(4)(2): two separate elections, each made once, in writing. */
@@ -2731,7 +2838,8 @@ export const RecordElectionSchema = z.object({
 export const DrugComplianceSchema = z.object({
   complianceLicences: z.array(ComplianceLicenceSchema),
   recordElections: z.array(RecordElectionSchema),
-  professionals: z.array(StoreProfessionalSchema)
+  professionals: z.array(StoreProfessionalSchema),
+  drugCoverage: z.array(LicenceDrugCoverageSchema)
 });
 
 export type RegulatoryScheme = z.infer<typeof RegulatorySchemeSchema>;
@@ -2744,6 +2852,15 @@ export type ProfessionalCapacity = z.infer<typeof ProfessionalCapacitySchema>;
 export type StoreProfessional = z.infer<typeof StoreProfessionalSchema>;
 export type LicenceForm = z.infer<typeof LicenceFormSchema>;
 export type ComplianceLicence = z.infer<typeof ComplianceLicenceSchema>;
+export type LicenceLegalStatus = z.infer<typeof LicenceLegalStatusSchema>;
+export type LicenceValidityBasis = z.infer<typeof LicenceValidityBasisSchema>;
+export type UpdateLicenceAuthorityRequest = z.infer<typeof UpdateLicenceAuthorityRequestSchema>;
+export type LicenceDrugCoverage = z.infer<typeof LicenceDrugCoverageSchema>;
+export type CreateLicenceDrugCoverageRequest = z.infer<typeof CreateLicenceDrugCoverageRequestSchema>;
+export type CloseLicenceDrugCoverageRequest = z.infer<typeof CloseLicenceDrugCoverageRequestSchema>;
+export type Form20fAuthorityState = z.infer<typeof Form20fAuthorityStateSchema>;
+export type Form20fGap = z.infer<typeof Form20fGapSchema>;
+export type Form20fAuthority = z.infer<typeof Form20fAuthoritySchema>;
 export type RecordElectionKind = z.infer<typeof RecordElectionKindSchema>;
 export type RecordElectionMethod = z.infer<typeof RecordElectionMethodSchema>;
 export type RecordElection = z.infer<typeof RecordElectionSchema>;

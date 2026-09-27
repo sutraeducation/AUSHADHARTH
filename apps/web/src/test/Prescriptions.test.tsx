@@ -148,7 +148,7 @@ function service(options: Options = {}) {
       });
     }
     if (url.pathname === `/api/v1/sale-lines/${IDs.line}/prescription`) return response(null, 204);
-    if (url.pathname === "/api/v1/store/drug-compliance") return response({ complianceLicences: [], recordElections: [], professionals: [] });
+    if (url.pathname === "/api/v1/store/drug-compliance") return response({ complianceLicences: [], recordElections: [], professionals: [], drugCoverage: [] });
     if (url.pathname === `/api/v1/prescription-supply-records/${IDs.record}`) {
       if (!dispenser) return failure("authorization_denied", 403);
       return response(entry());

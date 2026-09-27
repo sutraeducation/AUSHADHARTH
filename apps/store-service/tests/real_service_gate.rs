@@ -6407,3 +6407,870 @@ async fn real_service_keeps_purchase_provenance_through_backup_and_restore_over_
     }
     reopened.close().await;
 }
+
+// -------------------------------------------------------------------------------------------
+// Phase 1M-D1-B — Form 20F store authority and per-product drug coverage.
+// -------------------------------------------------------------------------------------------
+
+/// Records a Form 20F for the store and returns its id and revision.
+async fn form_20f_over_http(service: &Service, world: &SaleWorld, number: &str) -> (String, i64) {
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/store/compliance-licences",
+        Some(json!({
+            "licenceForm": "form_20f",
+            "licenceNumber": number,
+            "issuingAuthority": "FDA Maharashtra",
+            "validFrom": "2024-04-01",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    // A licence on file is a licence on file. Nothing about recording it says it is in force.
+    assert_eq!(created.body["legalStatus"], "unknown");
+    assert_eq!(created.body["validityBasis"], "unknown");
+    (
+        created.body["id"].as_str().expect("licence id").to_owned(),
+        created.body["revision"].as_i64().expect("revision"),
+    )
+}
+
+async fn set_authority_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    licence: &str,
+    revision: i64,
+    body: Value,
+) -> Reply {
+    let mut payload = body;
+    payload["expectedRevision"] = json!(revision);
+    call(
+        service,
+        "PUT",
+        &format!("/api/v1/store/compliance-licences/{licence}/authority"),
+        Some(payload),
+        Some(&world.cookie),
+    )
+    .await
+}
+
+/// What the product screen is told about Form 20F on a given day.
+async fn authority_over_http(service: &Service, world: &SaleWorld, as_of: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        &format!("/api/v1/products/{}/regulatory?asOf={as_of}", world.product),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body["form20fAuthority"].clone()
+}
+
+async fn cover_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    licence: &str,
+    from: &str,
+    to: Option<&str>,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        "/api/v1/store/licence-drug-coverage",
+        Some(json!({
+            "licenceId": licence,
+            "productId": world.product,
+            "effectiveFrom": from,
+            "effectiveTo": to,
+            "sourceCitation": "Form 20F item 2, names of drugs",
+        })),
+        Some(&world.cookie),
+    )
+    .await
+}
+
+/// Phase 1M-D1-B, item 14. The whole authority surface over the wire: what is refused, what is
+/// recorded, and what each state answers on a date.
+#[tokio::test]
+async fn real_service_records_form_20f_authority_and_drug_coverage_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+
+    // Nothing recorded at all: the product screen says so, and says which fact is missing.
+    let answer = authority_over_http(&service, &world, "2026-09-25").await;
+    assert_eq!(answer["state"], "unresolved");
+    assert_eq!(answer["gap"], "no_licence_recorded");
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    // A licence whose standing nobody has recorded is not a licence in force.
+    let answer = authority_over_http(&service, &world, "2026-09-25").await;
+    assert_eq!(answer["state"], "unresolved");
+    assert_eq!(answer["gap"], "licence_status_unknown");
+
+    // A validity basis and its dates must agree, and the refusal names the field.
+    let refused = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({ "legalStatus": "in_force", "validityBasis": "fixed_term" }),
+    )
+    .await;
+    assert_eq!(refused.status, 422, "{:?}", refused.body);
+    assert_eq!(refused.body["issues"][0]["field"], "validUpto");
+    let refused = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validUpto": "2030-03-31",
+        }),
+    )
+    .await;
+    assert_eq!(refused.status, 422, "{:?}", refused.body);
+    assert_eq!(refused.body["issues"][0]["field"], "validUpto");
+    let refused = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({ "legalStatus": "probably", "validityBasis": "perpetual" }),
+    )
+    .await;
+    assert_eq!(refused.status, 422, "{:?}", refused.body);
+    assert_eq!(refused.body["issues"][0]["field"], "legalStatus");
+
+    // The Form 20F of rule 61(3) carries no expiry of its own.
+    let updated = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2024-04-01",
+            "reason": "read from the certificate",
+        }),
+    )
+    .await;
+    assert_eq!(updated.status, 200, "{:?}", updated.body);
+    assert_eq!(updated.body["legalStatus"], "in_force");
+    assert_eq!(updated.body["validityBasis"], "perpetual");
+    let revision = updated.body["revision"].as_i64().expect("revision");
+
+    // A licence in force still covers no drug until somebody writes the drug onto it.
+    let answer = authority_over_http(&service, &world, "2026-09-25").await;
+    assert_eq!(answer["state"], "not_established");
+    assert_eq!(answer["gap"], "product_not_covered");
+
+    // Rule 61(3) issues Form 20G to a wholesaler; it is not retail authority.
+    let wholesale = call(
+        &service,
+        "POST",
+        "/api/v1/store/compliance-licences",
+        Some(json!({
+            "licenceForm": "form_20g",
+            "licenceNumber": "MH-PUNE-20G-8812",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(wholesale.status, 201, "{:?}", wholesale.body);
+    let refused = cover_over_http(
+        &service,
+        &world,
+        wholesale.body["id"].as_str().expect("id"),
+        "2024-04-01",
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, 422, "{:?}", refused.body);
+    assert_eq!(refused.body["issues"][0]["field"], "licenceId");
+
+    let covered = cover_over_http(&service, &world, &licence, "2026-04-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    let coverage = covered.body["id"].as_str().expect("coverage id").to_owned();
+    let coverage_revision = covered.body["revision"].as_i64().expect("revision");
+    assert_eq!(covered.body["licenceNumber"], "MH-PUNE-20F-4471");
+
+    // Both facts are now established — on the days the coverage runs, and not before them.
+    let answer = authority_over_http(&service, &world, "2026-09-25").await;
+    assert_eq!(answer["state"], "established", "{answer:?}");
+    assert_eq!(answer["licenceNumber"], "MH-PUNE-20F-4471");
+    assert_eq!(answer["coverageId"], Value::from(coverage.clone()));
+    let answer = authority_over_http(&service, &world, "2026-03-31").await;
+    assert_eq!(answer["state"], "not_established");
+    assert_eq!(answer["gap"], "product_not_covered");
+
+    // Two active rows must never answer for the same drug on the same day.
+    let overlap = cover_over_http(&service, &world, &licence, "2026-06-01", None).await;
+    assert_eq!(overlap.status, 409, "{:?}", overlap.body);
+    assert_eq!(
+        overlap.body["code"],
+        "licence_drug_coverage_period_overlaps"
+    );
+
+    // A suspension or a cancellation is an answer, and each is named as itself.
+    let mut revision = revision;
+    for (status, gap) in [
+        ("suspended", "licence_suspended"),
+        ("cancelled", "licence_cancelled"),
+    ] {
+        let changed = set_authority_over_http(
+            &service,
+            &world,
+            &licence,
+            revision,
+            json!({
+                "legalStatus": status,
+                "validityBasis": "perpetual",
+                "validFrom": "2024-04-01",
+                "reason": "order of the Licensing Authority",
+            }),
+        )
+        .await;
+        assert_eq!(changed.status, 200, "{status}: {:?}", changed.body);
+        let answer = authority_over_http(&service, &world, "2026-09-25").await;
+        assert_eq!(answer["state"], "not_established", "{status}");
+        assert_eq!(answer["gap"], gap);
+        // Restore the licence for the next turn of the loop.
+        let restored = set_authority_over_http(
+            &service,
+            &world,
+            &licence,
+            changed.body["revision"].as_i64().expect("revision"),
+            json!({
+                "legalStatus": "in_force",
+                "validityBasis": "perpetual",
+                "validFrom": "2024-04-01",
+            }),
+        )
+        .await;
+        assert_eq!(restored.status, 200, "{:?}", restored.body);
+        revision = restored.body["revision"].as_i64().expect("revision");
+    }
+    // The expected revision is the caller's proof they read the licence as it stands.
+    let stale = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        1,
+        json!({ "legalStatus": "in_force", "validityBasis": "perpetual" }),
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert_eq!(stale.body["code"], "revision_conflict");
+
+    // Coverage that has come to an end keeps answering for the days it governed.
+    let closed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/licence-drug-coverage/{coverage}/close"),
+        Some(json!({
+            "expectedRevision": coverage_revision,
+            "effectiveTo": "2026-09-01",
+            "reason": "struck off the licence on renewal",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{:?}", closed.body);
+    assert_eq!(
+        authority_over_http(&service, &world, "2026-08-31").await["state"],
+        "established"
+    );
+    assert_eq!(
+        authority_over_http(&service, &world, "2026-09-01").await["gap"],
+        "product_not_covered"
+    );
+
+    // The screen that manages all this reads one payload, and the coverage is in it.
+    let compliance = call(
+        &service,
+        "GET",
+        "/api/v1/store/drug-compliance",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(compliance.status, 200, "{:?}", compliance.body);
+    assert_eq!(
+        compliance.body["drugCoverage"][0]["id"],
+        Value::from(coverage.clone())
+    );
+    assert_eq!(
+        compliance.body["drugCoverage"][0]["effectiveTo"],
+        "2026-09-01"
+    );
+
+    // Every change left a trail, and none of it names a patient.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action,change_payload FROM master_change_events \
+         WHERE entity_type='store_licence_drug_coverage' ORDER BY occurred_at_utc,event_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("coverage events");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].0, "created");
+    assert_eq!(events[1].0, "updated");
+    assert!(events[0].1.contains("Form 20F item 2"), "{:?}", events[0].1);
+    // Coverage is history: the database will not let it be deleted at all.
+    assert!(
+        sqlx::query("DELETE FROM store_licence_drug_coverage")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D1-B, item 8 — the hard requirement. Every fact a Schedule X supply would need is on
+/// file: an in-force Form 20F, the drug written onto it, a registered pharmacist, a complete
+/// prescription. The workflow still does not exist, so the sale is still refused, and the stock is
+/// still where it was. Establishing authority is not the same as building the register.
+#[tokio::test]
+async fn real_service_keeps_schedule_x_refused_with_established_form_20f_authority_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    // The advisory display says the paperwork is in order...
+    let answer = authority_over_http(&service, &world, SALE_DATE).await;
+    assert_eq!(answer["state"], "established", "{answer:?}");
+
+    // ...and the counter still refuses, on the same code as before this phase existed.
+    let (sale_id, sale_revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let unprepared = prepare_entry_over_http(&service, &world, &sale_id, sale_revision).await;
+    assert_eq!(unprepared.status, 409, "{:?}", unprepared.body);
+    assert_eq!(unprepared.body["code"], "schedule_x_workflow_not_available");
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-0000000002f1",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+
+    // Nothing moved, and nothing was dispensed against the prescription on the way past.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let sold: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale'")
+            .fetch_one(&pool)
+            .await
+            .expect("movements");
+    assert_eq!(sold, 0, "a Schedule X line moved stock");
+    let dispensed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prescription_dispensings")
+        .fetch_one(&pool)
+        .await
+        .expect("dispensings");
+    assert_eq!(
+        dispensed, 0,
+        "a Schedule X line dispensed against a prescription"
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D1-B, item 14. Authority and coverage are part of the pharmacy's own record, so they
+/// come back from a backup exactly as they went in — guards and all.
+#[tokio::test]
+async fn real_service_keeps_form_20f_authority_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_sale_world(service, 1).await;
+
+    let (licence, revision) = form_20f_over_http(service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "fixed_term",
+            "validFrom": "2024-04-01",
+            "validUpto": "2029-03-31",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(service, &world, &licence, "2026-04-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    let coverage = covered.body["id"].as_str().expect("coverage id").to_owned();
+    let citation = covered.body["sourceCitation"].clone();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+    let bytes = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &bytes,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    let (legal_status, validity_basis, valid_upto): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT legal_status,validity_basis,valid_upto FROM store_compliance_licences \
+             WHERE id=?",
+        )
+        .bind(&licence)
+        .fetch_one(&reopened)
+        .await
+        .expect("restored licence");
+    assert_eq!(legal_status, "in_force");
+    assert_eq!(validity_basis, "fixed_term");
+    assert_eq!(valid_upto.as_deref(), Some("2029-03-31"));
+    let (product, from, source): (String, String, String) = sqlx::query_as(
+        "SELECT product_id,effective_from,source_citation FROM store_licence_drug_coverage \
+         WHERE id=?",
+    )
+    .bind(&coverage)
+    .fetch_one(&reopened)
+    .await
+    .expect("restored coverage");
+    assert_eq!(product, world.product);
+    assert_eq!(from, "2026-04-01");
+    assert_eq!(Value::from(source), citation);
+
+    // And so did the guards that keep it coherent.
+    for statement in [
+        "DELETE FROM store_licence_drug_coverage",
+        "UPDATE store_compliance_licences SET validity_basis='perpetual' \
+         WHERE licence_form='form_20f'",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&reopened).await.is_err(),
+            "{statement}"
+        );
+    }
+    reopened.close().await;
+}
+
+/// Corrective C1, item 1 and item 3. Archiving coverage that should never have been written, and
+/// the proof that the archived row grants nothing afterwards.
+///
+/// Closing coverage and archiving it are different acts. Closing says the licence stopped naming
+/// the drug on a date, and the row keeps answering for every day before it. Archiving says the row
+/// was never true, so it must answer for no day at all — which is what makes the production
+/// loader's `status = 'active'` filter load-bearing rather than decorative.
+#[tokio::test]
+async fn real_service_archives_drug_coverage_and_the_archived_row_grants_nothing_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    let coverage = covered.body["id"].as_str().expect("coverage id").to_owned();
+    let coverage_revision = covered.body["revision"].as_i64().expect("revision");
+
+    // While the row is active the authority is established. Everything below is about taking that
+    // away again.
+    let answer = authority_over_http(&service, &world, SALE_DATE).await;
+    assert_eq!(answer["state"], "established", "{answer:?}");
+
+    let archive_uri = format!("/api/v1/store/licence-drug-coverage/{coverage}/archive");
+
+    // A withdrawal nobody explained is not a withdrawal: the reason is required.
+    let unexplained = call(
+        &service,
+        "POST",
+        &archive_uri,
+        Some(json!({ "expectedRevision": coverage_revision, "reason": "   " })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(unexplained.status, 422, "{:?}", unexplained.body);
+    assert_eq!(unexplained.body["issues"][0]["field"], "reason");
+
+    // And the caller must have read the row as it stands.
+    let stale = call(
+        &service,
+        "POST",
+        &archive_uri,
+        Some(json!({
+            "expectedRevision": coverage_revision + 5,
+            "reason": "entered against the wrong drug",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert_eq!(stale.body["code"], "revision_conflict");
+
+    let archived = call(
+        &service,
+        "POST",
+        &archive_uri,
+        Some(json!({
+            "expectedRevision": coverage_revision,
+            "reason": "entered against the wrong drug",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(archived.status, 204, "{:?}", archived.body);
+
+    // Archiving is not idempotent by accident: an archived row is read-only, at any revision.
+    let again = call(
+        &service,
+        "POST",
+        &archive_uri,
+        Some(json!({
+            "expectedRevision": coverage_revision + 1,
+            "reason": "and again",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(again.status, 409, "{:?}", again.body);
+    assert_eq!(again.body["code"], "record_archived");
+
+    // The row is history, not a hole. It is still listed, archived, one revision on.
+    let compliance = call(
+        &service,
+        "GET",
+        "/api/v1/store/drug-compliance",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(compliance.status, 200, "{:?}", compliance.body);
+    let listed = compliance.body["drugCoverage"]
+        .as_array()
+        .expect("coverage list")
+        .iter()
+        .find(|row| row["id"] == coverage.as_str())
+        .expect("the archived row is still listed");
+    assert_eq!(listed["status"], "archived");
+    assert_eq!(listed["revision"], coverage_revision + 1);
+    assert_eq!(
+        listed["effectiveTo"],
+        Value::Null,
+        "archiving is not closing"
+    );
+
+    // Item 3. The advisory answer collapses, because the loader reads active rows only. This is
+    // the assertion that exercises `status = 'active'` in the production SQL.
+    let answer = authority_over_http(&service, &world, SALE_DATE).await;
+    assert_eq!(answer["state"], "not_established", "{answer:?}");
+    assert_eq!(answer["gap"], "product_not_covered");
+    assert_eq!(answer["coverageId"], Value::Null);
+    assert_eq!(answer["licenceNumber"], Value::Null);
+    // The licence itself is untouched by the withdrawal of one drug.
+    let licences = compliance.body["complianceLicences"]
+        .as_array()
+        .expect("licences")
+        .iter()
+        .find(|row| row["id"] == licence.as_str())
+        .expect("the licence");
+    assert_eq!(licences["legalStatus"], "in_force");
+
+    // Both acts are in the audit log, in order, and the row cannot be deleted at all.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let events: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT action,entity_revision,reason FROM master_change_events \
+         WHERE entity_type='store_licence_drug_coverage' AND entity_id=? ORDER BY entity_revision",
+    )
+    .bind(&coverage)
+    .fetch_all(&pool)
+    .await
+    .expect("coverage events");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].0, "created");
+    assert_eq!(events[1].0, "archived");
+    assert_eq!(events[1].1, coverage_revision + 1);
+    assert_eq!(
+        events[1].2.as_deref(),
+        Some("entered against the wrong drug")
+    );
+    assert!(
+        sqlx::query("DELETE FROM store_licence_drug_coverage")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "an archived coverage row is still history"
+    );
+    pool.close().await;
+}
+
+/// Corrective C1, item 2. None of the four Form 20F mutations belongs to a counter.
+///
+/// Recording what a licence covers is the licensee's own assertion about their own licence. A
+/// cashier may read the compliance record — they need to know what the pharmacy may supply — but
+/// the four writes are refused, and refused before anything is written: no row moves, no revision
+/// advances, and the audit log gains nothing, because a refused mutation is not an event.
+#[tokio::test]
+async fn real_service_refuses_every_form_20f_mutation_to_a_non_admin_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let licence_revision = authorised.body["revision"].as_i64().expect("revision");
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    let coverage = covered.body["id"].as_str().expect("coverage id").to_owned();
+    let coverage_revision = covered.body["revision"].as_i64().expect("revision");
+
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "coverage.cashier",
+        "01997a00-0000-7000-8000-000000000401",
+    )
+    .await;
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let licence_before: (i64, String, String, Option<String>) = sqlx::query_as(
+        "SELECT revision,legal_status,validity_basis,valid_upto FROM store_compliance_licences \
+         WHERE id=?",
+    )
+    .bind(&licence)
+    .fetch_one(&pool)
+    .await
+    .expect("licence before");
+    let coverage_before: (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT revision,status,effective_to FROM store_licence_drug_coverage WHERE id=?",
+    )
+    .bind(&coverage)
+    .fetch_one(&pool)
+    .await
+    .expect("coverage before");
+    let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM master_change_events")
+        .fetch_one(&pool)
+        .await
+        .expect("events before");
+    let rows_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM store_licence_drug_coverage")
+        .fetch_one(&pool)
+        .await
+        .expect("rows before");
+
+    // Each attempt is the one that would do the most damage if it succeeded: cancel the licence,
+    // forge coverage, end real coverage early, or withdraw it outright.
+    let attempts: [(&str, &str, String, Value); 4] = [
+        (
+            "update Form 20F authority",
+            "PUT",
+            format!("/api/v1/store/compliance-licences/{licence}/authority"),
+            json!({
+                "expectedRevision": licence_revision,
+                "legalStatus": "cancelled",
+                "validityBasis": "perpetual",
+            }),
+        ),
+        (
+            "create drug coverage",
+            "POST",
+            "/api/v1/store/licence-drug-coverage".to_owned(),
+            json!({
+                "licenceId": licence,
+                "productId": world.product,
+                "effectiveFrom": "2020-01-01",
+                "sourceCitation": "asserted at the counter",
+            }),
+        ),
+        (
+            "close drug coverage",
+            "POST",
+            format!("/api/v1/store/licence-drug-coverage/{coverage}/close"),
+            json!({
+                "expectedRevision": coverage_revision,
+                "effectiveTo": "2026-01-01",
+                "reason": "asserted at the counter",
+            }),
+        ),
+        (
+            "archive drug coverage",
+            "POST",
+            format!("/api/v1/store/licence-drug-coverage/{coverage}/archive"),
+            json!({
+                "expectedRevision": coverage_revision,
+                "reason": "asserted at the counter",
+            }),
+        ),
+    ];
+    for (label, method, uri, body) in attempts {
+        let refused = call(&service, method, &uri, Some(body.clone()), Some(&cashier)).await;
+        assert_eq!(refused.status, 403, "{label}: {:?}", refused.body);
+        assert_eq!(refused.body["code"], "authorization_denied", "{label}");
+        // And an unauthenticated caller does not even get that far.
+        let anonymous = call(&service, method, &uri, Some(body), None).await;
+        assert_eq!(
+            anonymous.status, 401,
+            "{label} anonymous: {:?}",
+            anonymous.body
+        );
+    }
+
+    // Reading is still theirs: a cashier must be able to see what the pharmacy may supply.
+    let read = call(
+        &service,
+        "GET",
+        "/api/v1/store/drug-compliance",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(read.status, 200, "{:?}", read.body);
+    assert_eq!(
+        read.body["drugCoverage"][0]["id"],
+        Value::from(coverage.clone())
+    );
+
+    // Nothing moved: not the licence, not the coverage, not the count of either, not the log.
+    let licence_after: (i64, String, String, Option<String>) = sqlx::query_as(
+        "SELECT revision,legal_status,validity_basis,valid_upto FROM store_compliance_licences \
+         WHERE id=?",
+    )
+    .bind(&licence)
+    .fetch_one(&pool)
+    .await
+    .expect("licence after");
+    assert_eq!(licence_after, licence_before);
+    let coverage_after: (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT revision,status,effective_to FROM store_licence_drug_coverage WHERE id=?",
+    )
+    .bind(&coverage)
+    .fetch_one(&pool)
+    .await
+    .expect("coverage after");
+    assert_eq!(coverage_after, coverage_before);
+    let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM master_change_events")
+        .fetch_one(&pool)
+        .await
+        .expect("events after");
+    assert_eq!(
+        events_after, events_before,
+        "a refused mutation was audited"
+    );
+    let rows_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM store_licence_drug_coverage")
+        .fetch_one(&pool)
+        .await
+        .expect("rows after");
+    assert_eq!(
+        rows_after, rows_before,
+        "a refused create left a row behind"
+    );
+
+    // The authority the owner recorded is exactly as it was.
+    let answer = authority_over_http(&service, &world, SALE_DATE).await;
+    assert_eq!(answer["state"], "established", "{answer:?}");
+    pool.close().await;
+}

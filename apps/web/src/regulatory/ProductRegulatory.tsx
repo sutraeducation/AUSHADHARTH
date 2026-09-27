@@ -10,6 +10,8 @@ import { LocalServiceError } from "../platform/localService";
 import { CatalogDialog } from "../products/CatalogDialog";
 import {
   ANSWER_LABELS,
+  AUTHORITY_GAP_LABELS,
+  AUTHORITY_STATE_LABELS,
   GATE_LABELS,
   SCHEME_LABELS,
   archiveClassification,
@@ -62,6 +64,20 @@ export function RegulatoryClassificationSection({ product, canMutate }: { produc
           </div>)}
         </dl>
         <p className="panel-note">Position in force on {regulatory.data.resolvedOn}.</p>
+
+        {/*
+          Phase 1M-D1-B — advisory. This says where the pharmacy's Form 20F paperwork stands for
+          this drug; it is not a permission. The Schedule X sale workflow does not exist, and the
+          counter refuses those lines whatever this panel says, which is why it sits apart from the
+          gate above and never restates it.
+        */}
+        <div className={`regulatory-authority regulatory-authority--${regulatory.data.form20fAuthority.state}`} data-testid="form-20f-authority">
+          <strong>{AUTHORITY_STATE_LABELS[regulatory.data.form20fAuthority.state]}</strong>
+          <small>{regulatory.data.form20fAuthority.gap
+            ? AUTHORITY_GAP_LABELS[regulatory.data.form20fAuthority.gap]
+            : `Recorded on Form 20F ${regulatory.data.form20fAuthority.licenceNumber ?? ""} as at ${regulatory.data.resolvedOn}.`}</small>
+          <small>Advisory only. It records where the licence paperwork stands and does not permit a sale; Schedule X sales are not available in this version.</small>
+        </div>
 
         {regulatory.data.classifications.length === 0
           ? <p className="panel-note">No finding has been recorded for this product.</p>
