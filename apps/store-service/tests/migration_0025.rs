@@ -143,8 +143,8 @@ async fn refused(pool: &SqlitePool, statement: &str) -> String {
 
 const STORE: &str = "01997000-0000-7000-8000-0000000000bb";
 const USER: &str = "01997000-0000-7000-8000-0000000000cc";
-const ALPRAZOLAM: &str = "01997000-0000-7000-8000-0000000000d1";
-const METHYLPHENIDATE: &str = "01997000-0000-7000-8000-0000000000d2";
+const SCHEDULE_X_TEST_MEDICINE_A: &str = "01997000-0000-7000-8000-0000000000d1";
+const SCHEDULE_X_TEST_MEDICINE_B: &str = "01997000-0000-7000-8000-0000000000d2";
 const WITHDRAWN_PRODUCT: &str = "01997000-0000-7000-8000-0000000000d3";
 const LICENCE_20F: &str = "01997000-0000-7000-8000-000000000531";
 const LICENCE_20G: &str = "01997000-0000-7000-8000-000000000532";
@@ -204,12 +204,12 @@ async fn populate_before_0025(pool: &SqlitePool) {
         "INSERT INTO products (id,product_kind,dosage_form_id,base_unit_id,quantity_scale,\
          display_name,normalized_search_name,status,created_at_utc,updated_at_utc) VALUES \
          ('01997000-0000-7000-8000-0000000000d1','medicine','01997000-0000-7000-8000-0000000000a1',\
-         '01997000-0000-7000-8000-000000000001',0,'Alprazolam 0.5 mg Tablet',\
-         'alprazolam 0.5 mg tablet','active','2026-01-01T00:00:00.000Z',\
+         '01997000-0000-7000-8000-000000000001',0,'Schedule X Test Medicine A',\
+         'schedule x test medicine a','active','2026-01-01T00:00:00.000Z',\
          '2026-01-01T00:00:00.000Z'),\
          ('01997000-0000-7000-8000-0000000000d2','medicine','01997000-0000-7000-8000-0000000000a1',\
-         '01997000-0000-7000-8000-000000000001',0,'Methylphenidate 10 mg Tablet',\
-         'methylphenidate 10 mg tablet','active','2026-01-01T00:00:00.000Z',\
+         '01997000-0000-7000-8000-000000000001',0,'Schedule X Test Medicine B',\
+         'schedule x test medicine b','active','2026-01-01T00:00:00.000Z',\
          '2026-01-01T00:00:00.000Z'),\
          ('01997000-0000-7000-8000-0000000000d3','medicine','01997000-0000-7000-8000-0000000000a1',\
          '01997000-0000-7000-8000-000000000001',0,'Withdrawn Tablet','withdrawn tablet',\
@@ -247,17 +247,18 @@ async fn populate_before_0025(pool: &SqlitePool) {
          'rule_65_3_prescription_supply','prescription_register','2026-04-01',\
          '01997000-0000-7000-8000-0000000000cc',1,'active','2026-09-01T00:00:00.000Z',\
          '2026-09-01T00:00:00.000Z')",
-        // Both drugs are recorded inside Schedule X. Being inside Schedule X is what the law calls
-        // the drug; it says nothing about what this store's licence covers.
+        // Both test products are owner-recorded as inside Schedule X for this fixture; product
+        // names themselves do not determine regulatory classification. Being inside Schedule X is
+        // what the law calls a drug; it says nothing about what this store's licence covers.
         "INSERT INTO product_regulatory_classifications (id,product_id,scheme,applies,\
          effective_from,source_citation,determined_by_user_id,revision,status,created_at_utc,\
          updated_at_utc) VALUES \
          ('01997000-0000-7000-8000-000000000401','01997000-0000-7000-8000-0000000000d1',\
-         'schedule_x',1,'2020-01-01','Drugs Rules, 1945, Schedule X',\
+         'schedule_x',1,'2020-01-01','Test fixture: owner-recorded Schedule X finding',\
          '01997000-0000-7000-8000-0000000000cc',1,'active','2026-09-01T00:00:00.000Z',\
          '2026-09-01T00:00:00.000Z'),\
          ('01997000-0000-7000-8000-000000000402','01997000-0000-7000-8000-0000000000d2',\
-         'schedule_x',1,'2020-01-01','Drugs Rules, 1945, Schedule X',\
+         'schedule_x',1,'2020-01-01','Test fixture: owner-recorded Schedule X finding',\
          '01997000-0000-7000-8000-0000000000cc',1,'active','2026-09-01T00:00:00.000Z',\
          '2026-09-01T00:00:00.000Z')",
         "INSERT INTO master_change_events (event_id,entity_type,entity_id,entity_revision,action,\
@@ -624,7 +625,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
             &insert(
                 "01997000-0000-7000-8000-000000000a01",
                 licence,
-                ALPRAZOLAM,
+                SCHEDULE_X_TEST_MEDICINE_A,
                 "2026-01-01",
                 "NULL",
                 STORE,
@@ -666,7 +667,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
         &insert(
             "01997000-0000-7000-8000-000000000a03",
             LICENCE_20F,
-            ALPRAZOLAM,
+            SCHEDULE_X_TEST_MEDICINE_A,
             "2026-01-01",
             "NULL",
             ANOTHER_STORE,
@@ -689,7 +690,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
             &insert(
                 "01997000-0000-7000-8000-000000000a04",
                 LICENCE_20F,
-                ALPRAZOLAM,
+                SCHEDULE_X_TEST_MEDICINE_A,
                 from,
                 to,
                 STORE,
@@ -708,7 +709,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
         &insert(
             "01997000-0000-7000-8000-000000000a10",
             LICENCE_20F,
-            ALPRAZOLAM,
+            SCHEDULE_X_TEST_MEDICINE_A,
             "2026-01-01",
             "'2026-07-01'",
             STORE,
@@ -727,7 +728,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
             &insert(
                 "01997000-0000-7000-8000-000000000a11",
                 LICENCE_20F,
-                ALPRAZOLAM,
+                SCHEDULE_X_TEST_MEDICINE_A,
                 from,
                 to,
                 STORE,
@@ -745,7 +746,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
         &insert(
             "01997000-0000-7000-8000-000000000a12",
             LICENCE_20F,
-            ALPRAZOLAM,
+            SCHEDULE_X_TEST_MEDICINE_A,
             "2026-07-01",
             "NULL",
             STORE,
@@ -758,7 +759,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
         &insert(
             "01997000-0000-7000-8000-000000000a13",
             LICENCE_20F,
-            METHYLPHENIDATE,
+            SCHEDULE_X_TEST_MEDICINE_B,
             "2026-01-01",
             "NULL",
             STORE,
@@ -822,7 +823,7 @@ async fn drug_coverage_must_rest_on_this_stores_own_form_20f() {
         &insert(
             "01997000-0000-7000-8000-000000000a14",
             LICENCE_20F,
-            METHYLPHENIDATE,
+            SCHEDULE_X_TEST_MEDICINE_B,
             "2026-01-01",
             "NULL",
             STORE,
@@ -909,12 +910,13 @@ async fn an_archived_row_with_no_reason_is_a_known_limitation_that_grants_no_aut
             "INSERT INTO store_licence_drug_coverage (id,store_id,licence_id,product_id,\
              effective_from,source_citation,recorded_by_user_id,revision,status,created_at_utc,\
              updated_at_utc) VALUES ('01997000-0000-7000-8000-000000000b01','{STORE}',\
-             '{LICENCE_20F}','{ALPRAZOLAM}','2024-04-01','Form 20F item 2, names of drugs',\
+             '{LICENCE_20F}','{SCHEDULE_X_TEST_MEDICINE_A}','2024-04-01',\
+             'Form 20F item 2, names of drugs',\
              '{USER}',1,'active','2026-09-25T00:00:00.000Z','2026-09-25T00:00:00.000Z')"
         ),
     )
     .await;
-    assert_eq!(active_coverage(&pool, ALPRAZOLAM).await, 1);
+    assert_eq!(active_coverage(&pool, SCHEDULE_X_TEST_MEDICINE_A).await, 1);
 
     // A BLANK reason is caught, so the CHECK is not simply absent.
     let error = refused(
@@ -959,7 +961,7 @@ async fn an_archived_row_with_no_reason_is_a_known_limitation_that_grants_no_aut
     // THE SAFETY PROPERTY. The row is not active coverage, so no authority can rest on it. This is
     // what makes the limitation fail-closed rather than dangerous.
     assert_eq!(
-        active_coverage(&pool, ALPRAZOLAM).await,
+        active_coverage(&pool, SCHEDULE_X_TEST_MEDICINE_A).await,
         0,
         "an archived row with no reason must not be active coverage"
     );
@@ -995,12 +997,13 @@ async fn an_archived_row_with_no_reason_is_a_known_limitation_that_grants_no_aut
             "INSERT INTO store_licence_drug_coverage (id,store_id,licence_id,product_id,\
              effective_from,source_citation,recorded_by_user_id,revision,status,created_at_utc,\
              updated_at_utc) VALUES ('01997000-0000-7000-8000-000000000b02','{STORE}',\
-             '{LICENCE_20F}','{ALPRAZOLAM}','2024-04-01','Form 20F item 2, re-read on renewal',\
+             '{LICENCE_20F}','{SCHEDULE_X_TEST_MEDICINE_A}','2024-04-01',\
+             'Form 20F item 2, re-read on renewal',\
              '{USER}',1,'active','2026-09-25T02:00:00.000Z','2026-09-25T02:00:00.000Z')"
         ),
     )
     .await;
-    assert_eq!(active_coverage(&pool, ALPRAZOLAM).await, 1);
+    assert_eq!(active_coverage(&pool, SCHEDULE_X_TEST_MEDICINE_A).await, 1);
     structural_checks(&pool).await;
     pool.close().await;
 }
