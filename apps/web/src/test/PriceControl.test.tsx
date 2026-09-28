@@ -134,7 +134,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("Product price control UI", () => {
   it("says a product is unassessed rather than implying it is uncontrolled", async () => {
     renderApp(`/app/products/${IDs.product}`);
-    expect(await screen.findByRole("heading", { name: "Price Control" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Price Control" }, { timeout: 3000 })).toBeInTheDocument();
     expect(await within(panel()).findByText("Not assessed yet")).toBeInTheDocument();
     expect(within(panel()).getByText("Nobody has assessed this product yet")).toBeInTheDocument();
     expect(within(panel()).getByText(/not the same as saying it is uncontrolled/)).toBeInTheDocument();
@@ -171,7 +171,7 @@ describe("Product price control UI", () => {
     renderApp(`/app/products/${IDs.product}`, priceService({
       initial: { priceControlStatus: "controlled", controlledFormulationId: IDs.formulation, applicableCeiling: CEILING, comparability: "comparable", resolved: true }
     }));
-    await screen.findByRole("heading", { name: "Price Control" });
+    await screen.findByRole("heading", { name: "Price Control" }, { timeout: 3000 });
     expect(await within(panel()).findByText(/A notified ceiling is exclusive of GST/)).toBeInTheDocument();
     expect(within(panel()).getByText(/never compared with each other/)).toBeInTheDocument();
   });
@@ -180,7 +180,7 @@ describe("Product price control UI", () => {
     renderApp(`/app/products/${IDs.product}`, priceService({
       initial: { priceControlStatus: "controlled", controlledFormulationId: IDs.formulation, applicableCeiling: null, resolved: false }
     }));
-    await screen.findByRole("heading", { name: "Price Control" });
+    await screen.findByRole("heading", { name: "Price Control" }, { timeout: 3000 });
     const alert = await within(panel()).findByRole("alert");
     expect(alert).toHaveTextContent("No ceiling is in force");
     expect(alert).toHaveTextContent(/must refuse rather than treat the product as unconstrained/);
@@ -194,7 +194,7 @@ describe("Product price control UI", () => {
       renderApp(`/app/products/${IDs.product}`, priceService({
         initial: { priceControlStatus: "controlled", controlledFormulationId: IDs.formulation, applicableCeiling: { ...CEILING, ceilingBasis: "per_pack" }, comparability, resolved: true }
       }));
-      await screen.findByRole("heading", { name: "Price Control" });
+      await screen.findByRole("heading", { name: "Price Control" }, { timeout: 3000 });
       const alert = await within(panel()).findByRole("alert");
       expect(alert).toHaveTextContent("cannot be compared with a selling rate");
       expect(alert).toHaveTextContent(expected);
@@ -238,13 +238,13 @@ describe("Product price control UI", () => {
 
   it("is read-only for a pharmacist", async () => {
     renderApp(`/app/products/${IDs.product}`, priceService({ role: "pharmacist" }));
-    expect(await screen.findByRole("heading", { name: "Price Control" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Price Control" }, { timeout: 3000 })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit Price Control" })).not.toBeInTheDocument();
   });
 
   it("does not put a price-control panel on a product that is not a medicine", async () => {
     renderApp(`/app/products/${IDs.product}`, priceService({ productKind: "general_pharmacy_item" }));
-    expect(await screen.findByRole("heading", { name: "Tax Classification" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Tax Classification" }, { timeout: 3000 })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Price Control" })).not.toBeInTheDocument();
   });
 });

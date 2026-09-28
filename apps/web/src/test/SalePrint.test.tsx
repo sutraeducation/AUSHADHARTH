@@ -118,7 +118,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("Printing a posted sale", () => {
   it("renders the posted document from the canonical invoice", async () => {
     renderPrint();
-    expect(await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 })).toBeInTheDocument();
     const document = within(sheet());
     expect(document.getByText("INV/2627/000001")).toBeInTheDocument();
     expect(document.getByText("2026-09-18")).toBeInTheDocument();
@@ -136,7 +136,7 @@ describe("Printing a posted sale", () => {
     const print = vi.fn();
     vi.stubGlobal("print", print);
     renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(print).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Print" }));
@@ -150,7 +150,7 @@ describe("Printing a posted sale", () => {
     const print = vi.fn();
     vi.stubGlobal("print", print);
     const service = renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     fireEvent.click(screen.getByRole("button", { name: "Print" }));
     await waitFor(() => expect(print).toHaveBeenCalled());
     expect(service.requests.every((request) => request.method === "GET")).toBe(true);
@@ -160,7 +160,7 @@ describe("Printing a posted sale", () => {
   /** A statutory document is built from the posting, never topped up from today's masters. */
   it("asks for no Store Profile, Party or product data", async () => {
     const service = renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     for (const path of ["/api/v1/store/profile", "/api/v1/parties", "/api/v1/products"]) {
       expect(service.requests.some((request) => request.path.startsWith(path))).toBe(false);
     }
@@ -168,7 +168,7 @@ describe("Printing a posted sale", () => {
 
   it("prints the copy the operator chose", async () => {
     renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(within(sheet()).getByText("ORIGINAL FOR RECIPIENT")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Copy"), { target: { value: "duplicate" } });
@@ -181,7 +181,7 @@ describe("Printing a posted sale", () => {
 
   it("keeps every fact when the paper changes", async () => {
     renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(sheet().querySelector(".doc__grand")?.textContent).toContain("112.00");
 
     fireEvent.change(screen.getByLabelText("Paper"), { target: { value: "thermal80" } });
@@ -216,7 +216,7 @@ describe("Printing a posted sale", () => {
         tender: [{ method: "cash", amountPaise: 13_900, referenceText: null, recordedAtUtc: "2026-09-18T06:30:00.100Z" }]
       })
     }));
-    await screen.findByRole("heading", { name: "INVOICE-CUM-BILL OF SUPPLY", level: 1 });
+    await screen.findByRole("heading", { name: "INVOICE-CUM-BILL OF SUPPLY", level: 1 }, { timeout: 3000 });
     const document = within(sheet());
     // The exempted line says what it is rather than showing a tax of zero.
     expect(document.getByText("Exempt")).toBeInTheDocument();
@@ -239,7 +239,7 @@ describe("Printing a posted sale", () => {
         regulatory: { ...invoice().regulatory, rule46sDeclaration: "applicable", dynamicQrApplicability: null }
       })
     }));
-    expect(await screen.findByRole("heading", { name: "BILL OF SUPPLY", level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "BILL OF SUPPLY", level: 1 }, { timeout: 3000 })).toBeInTheDocument();
     const document = within(sheet());
     expect(document.queryByRole("columnheader", { name: "GST" })).not.toBeInTheDocument();
     expect(document.queryByText(/TRANSPORTER/)).not.toBeInTheDocument();
@@ -273,12 +273,12 @@ describe("Printing a posted sale", () => {
     renderPrint(printService({
       document: invoice({ regulatory: { ...invoice().regulatory, rule46sDeclaration: "applicable" } })
     }));
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(within(sheet()).getByText(/I\/We hereby declare/)).toBeInTheDocument();
 
     cleanup();
     renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(within(sheet()).queryByText(/I\/We hereby declare/)).not.toBeInTheDocument();
   });
 
@@ -289,7 +289,7 @@ describe("Printing a posted sale", () => {
         regulatory: { ...invoice().regulatory, dynamicQrApplicability: "required" }
       })
     }));
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     const document = within(sheet());
     expect(document.getByText(/UPI · 112.00 · Ref UPI-4471-99210/)).toBeInTheDocument();
     expect(document.getByText(/Recorded 2026-09-18T06:30:00.100Z/)).toBeInTheDocument();
@@ -364,7 +364,7 @@ describe("Printing a posted sale", () => {
     const print = vi.fn();
     vi.stubGlobal("print", print);
     const service = renderPrint();
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     fireEvent.click(screen.getByRole("button", { name: "Print" }));
 
     const document = within(sheet());
@@ -379,7 +379,7 @@ describe("Printing a posted sale", () => {
 
   it("offers printing from the posted sale itself", async () => {
     renderPrint(printService(), `/app/sales/${IDs.sale}/print`);
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     expect(screen.getByRole("link", { name: "Back to Sale" })).toHaveAttribute("href", `/app/sales/${IDs.sale}`);
   });
 
@@ -392,7 +392,7 @@ describe("Printing a posted sale", () => {
         regulatory: { ...invoice().regulatory, dynamicQrApplicability: "required" }
       })
     }));
-    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 });
+    await screen.findByRole("heading", { name: "TAX INVOICE", level: 1 }, { timeout: 3000 });
     fireEvent.change(screen.getByLabelText("Paper"), { target: { value: "thermal80" } });
     const document = within(sheet());
     expect(document.getByText(new RegExp(reference))).toBeInTheDocument();

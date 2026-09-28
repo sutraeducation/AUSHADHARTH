@@ -4,6 +4,13 @@ import {
   RegulatoryClassificationSchema,
   StoreProfessionalSchema,
   ComplianceLicenceSchema,
+  ScheduleXRegisterSchema,
+  ScheduleXRegisterEntrySchema,
+  type ConfirmScheduleXEntryRequest,
+  type ScheduleXEntryKind,
+  type ScheduleXEntryStatus,
+  type ScheduleXRegister,
+  type VoidScheduleXEntryRequest,
   LicenceDrugCoverageSchema,
   RecordElectionSchema,
   type CloseLicenceDrugCoverageRequest,
@@ -309,3 +316,60 @@ export const CAPACITY_LABELS: Record<ProfessionalCapacity, string> = {
   registered_pharmacist: "Registered pharmacist",
   competent_person: "Competent person"
 };
+
+// --- Phase 1M-D2: the Schedule X working record -----------------------------------------------
+
+/**
+ * Rule 65(21)(a) requires a bound, serially page numbered register. This reads the WORKING RECORD
+ * that helps a person write it — never the register itself, and never a page number.
+ */
+export async function getScheduleXRegister(): Promise<ScheduleXRegister> {
+  return ScheduleXRegisterSchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/register")
+  );
+}
+
+/** Records that both physical acts of rule 65(21) were done, and who is named for them. */
+export async function confirmScheduleXEntry(id: string, input: ConfirmScheduleXEntryRequest) {
+  return ScheduleXRegisterEntrySchema.parse(
+    await localServiceRequest(`/api/v1/store/schedule-x/register/${id}/confirm`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+/** Closes the working entry. After this it never changes again. */
+export async function finalizeScheduleXEntry(id: string) {
+  return ScheduleXRegisterEntrySchema.parse(
+    await localServiceRequest(`/api/v1/store/schedule-x/register/${id}/finalize`, {
+      method: "POST",
+      body: JSON.stringify({})
+    })
+  );
+}
+
+/** Withdraws an entry prepared in error. The row and its reference are kept, never reissued. */
+export async function voidScheduleXEntry(id: string, input: VoidScheduleXEntryRequest) {
+  return ScheduleXRegisterEntrySchema.parse(
+    await localServiceRequest(`/api/v1/store/schedule-x/register/${id}/void`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+export const SCHEDULE_X_STATUS_LABELS: Record<ScheduleXEntryStatus, string> = {
+  prepared: "Not yet written in the register",
+  confirmed: "Written and authenticated",
+  finalized: "Closed",
+  void: "Withdrawn"
+};
+
+export const SCHEDULE_X_ENTRY_KIND_LABELS: Record<ScheduleXEntryKind, string> = {
+  receipt: "Received",
+  supply: "Supplied"
+};
+
+/** A particular the store never recorded says so, rather than borrowing today's master value. */
+export const NOT_RECORDED = "Not recorded";

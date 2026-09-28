@@ -10,6 +10,7 @@ pub mod references;
 pub mod regulatory;
 pub mod returns;
 pub mod sales;
+pub mod schedule_x;
 pub mod stock_operations;
 pub mod store_profile;
 pub mod taxation;

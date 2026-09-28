@@ -622,3 +622,115 @@ fieldset.field { border: 0; margin: 0; padding: 0; min-width: 0; }
 fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; }
 .choice { display: flex; align-items: flex-start; gap: 8px; margin: 4px 0; font-weight: 500; }
 .choice input { margin-top: 3px; }
+/* Phase 1M-D2. The Schedule X working-record advisory: calm, not alarming. This is the normal state
+   of affairs — the bound register is the legal record — so it reads as guidance, never as an error. */
+.register-advisory { display: grid; gap: 4px; margin-bottom: 14px; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent-500, var(--ink-700)); border-radius: var(--radius-md); background: var(--surface-2, #fafafa); }
+.register-advisory p { margin: 0; color: var(--ink-700); font-size: .78rem; line-height: 1.55; }
+.register-reference { font-variant-numeric: tabular-nums; font-weight: 600; }
+.not-recorded { color: var(--warning-700); font-style: italic; }
+
+/* --------------------------------------------------------------------------------------------
+   Phase 1M-D2 U1 — the Schedule X working record, made readable on a phone.
+
+   Rule 65(21)(b) lists ten particulars and none of them may be dropped, so the desktop keeps a
+   compliance table with every column. On a phone that same table put the reference, the kind and a
+   sliver of the drug name on screen and pushed the supplier, the licence, the bill and the actions
+   past the edge — a scroll hint is not a substitute for being able to read the record. So below the
+   breakpoint each row becomes a card that carries the SAME cells, labelled, in a legible order.
+   One DOM, one set of data, two presentations: no business logic is duplicated.
+
+   Every selector here is scoped to .schedule-x-table, so no other screen's table changes.
+   -------------------------------------------------------------------------------------------- */
+
+/* The descriptor under a reference belongs on its own line. `small` is inline by default, which is
+   what ran "AXR-000001" and "AUSHADHARTH reference" together into one word. */
+.schedule-x-table small { display: block; margin-top: 2px; color: var(--ink-500); font-size: .68rem; font-weight: 500; line-height: 1.35; }
+.schedule-x-table .register-reference { display: block; font-size: .82rem; }
+
+/* Desktop: let the particulars that carry real text have room, rather than wrapping a supplier
+   address one word per line inside the global 270px ceiling. */
+.schedule-x-table td { max-width: none; vertical-align: top; }
+.schedule-x-table .cell-wide { min-width: 12.5rem; }
+.schedule-x-table .cell-reference { min-width: 8.5rem; max-width: 10rem; }
+/* The state and the actions carry no statutory particular, so they give their width back to the
+   columns that do rather than each taking a quarter of the table. The text columns keep theirs:
+   squeezing a supplier address to fit the viewport would trade a readable record for a tidy one. */
+.schedule-x-table .cell-status { min-width: 10rem; max-width: 12rem; }
+/* An inline-flex badge will not break a long phrase, and a clipped status is worse than a tall one:
+   the reader has to be able to see WHICH state the entry is in, in full. */
+.schedule-x-table .cell-status .status-badge { display: inline-block; max-width: 100%; white-space: normal; text-align: left; }
+.schedule-x-table .cell-actions { max-width: 9.5rem; white-space: normal; }
+.schedule-x-table .cell-actions .button { width: 100%; margin: 0 0 4px; }
+.schedule-x-table .cell-actions .button:last-child { margin-bottom: 0; }
+
+@media (max-width: 720px) {
+  /* The header row is the label source for the cards, so it is removed from view and each cell
+     carries its own label instead. Nothing is hidden from a screen reader: the label is real text
+     rendered before the value. */
+  .schedule-x-table thead { display: none; }
+  .schedule-x-table, .schedule-x-table tbody, .schedule-x-table tr, .schedule-x-table td { display: block; width: 100%; }
+
+  .schedule-x-table tr {
+    display: grid;
+    margin: 0 0 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: white;
+  }
+  .schedule-x-table tr:last-child { margin-bottom: 0; }
+  .schedule-x-table td { max-width: none; padding: 6px 0; border-bottom: 0; }
+  .schedule-x-table tr td + td { border-top: 1px solid #f1f4f2; }
+
+  /* Label beside value, so a particular and its name are never separated. */
+  .schedule-x-table td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--ink-500);
+    font-size: .62rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .schedule-x-table td { display: grid; grid-template-columns: minmax(7.5rem, 38%) 1fr; gap: 10px; align-items: baseline; }
+  .schedule-x-table td::before { align-self: baseline; }
+
+  /* The header of the card: the reference and the physical-register state, both visible without any
+     horizontal movement. The status is lifted here by `order` alone — the DOM keeps the table's own
+     column order, so the desktop table and the tests are untouched by the rearrangement. */
+  .schedule-x-table .cell-reference,
+  .schedule-x-table .cell-status { display: block; border-top: 0; }
+  .schedule-x-table .cell-reference::before,
+  .schedule-x-table .cell-status::before,
+  .schedule-x-table .cell-actions::before { display: none; }
+  .schedule-x-table .cell-reference { order: 1; padding-top: 0; }
+  .schedule-x-table .cell-status { order: 2; padding-bottom: 10px; }
+  .schedule-x-table td[data-label="Kind"] { order: 3; border-top: 1px solid #f1f4f2; }
+  .schedule-x-table td[data-label="Date"] { order: 4; }
+  .schedule-x-table td[data-label="Drug"],
+  .schedule-x-table td[data-label="Drug name recorded at posting"] { order: 5; }
+  .schedule-x-table td[data-label="Quantity"] { order: 6; }
+  .schedule-x-table td[data-label="Batch"] { order: 7; }
+  .schedule-x-table td[data-label="Manufacturer"] { order: 8; }
+  .schedule-x-table td[data-label="Supplier"] { order: 9; }
+  .schedule-x-table td[data-label="Supplier address"] { order: 10; }
+  .schedule-x-table td[data-label="Supplier licence"] { order: 11; }
+  .schedule-x-table td[data-label="Bill"] { order: 12; }
+  .schedule-x-table td[data-label="Product (name today)"] { order: 13; }
+  .schedule-x-table .cell-actions { order: 20; display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; white-space: normal; }
+  .schedule-x-table .cell-actions .button { flex: 1 1 auto; min-height: 40px; }
+
+  /* A card is already the full width of the column, so the sideways-scroll affordance has nothing
+     left to offer and the hint would be telling the reader to do something pointless. */
+  .table-scroll:has(.schedule-x-table) { overflow-x: visible; }
+}
+
+/* The attestation dialog on a phone: tighter, without shrinking anything a thumb has to hit or
+   separating a checkbox from the sentence it is agreeing to. */
+@media (max-width: 720px) {
+  .master-form { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 16px; }
+  .master-form fieldset.field legend { margin-bottom: 4px; }
+  .master-form .choice { gap: 10px; margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); line-height: 1.45; }
+  .master-form .choice:last-child { margin-bottom: 0; }
+  .master-form .choice input[type="checkbox"] { flex: 0 0 auto; width: 20px; height: 20px; margin-top: 1px; }
+}

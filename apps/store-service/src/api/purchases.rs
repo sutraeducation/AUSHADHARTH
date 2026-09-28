@@ -1379,6 +1379,18 @@ async fn post_within_transaction(
     .execute(&mut **connection)
     .await
     .map_err(map_database_error)?;
+
+    // Phase 1M-D2. A Schedule X receipt and its working record are one event, so they are one
+    // transaction: this runs under the same `BEGIN IMMEDIATE` as the stock and the provenance, after
+    // the document is posted and its particulars frozen. A posting that fails leaves no working
+    // record, and a Schedule X receipt can never exist without one.
+    //
+    // Only a line whose product the owner has RECORDED as inside Schedule X on this document's date
+    // produces an entry. An ordinary Purchase is untouched, and an unclassified product is untouched
+    // too, because `unknown` is not `applies`.
+    crate::domain::schedule_x::prepare_receipt_entries(connection, id, actor_id)
+        .await
+        .map_err(map_database_error)?;
     Ok(())
 }
 
@@ -3725,10 +3737,11 @@ mod tests {
         assert_eq!(quantity, 10);
     }
 
-    /// D1-A, §26 boundary. A drug the owner has placed in Schedule X may be RECEIVED, with all the
-    /// provenance a later register would need — and that is all. Nothing here makes it sellable:
-    /// the Schedule X sale is still refused as an unsupported workflow (proved against the sale
-    /// path itself in `s16_h1_x_and_c_cannot_be_prepared_or_posted`).
+    /// D1-A, §26 boundary, carried forward to Phase 1M-D2. A drug the owner has placed in Schedule X
+    /// may be RECEIVED, with all the provenance the register needs — and that is all. Under D2 the
+    /// receipt now also writes its working record, which is still not a supply and still not a
+    /// permission: the Schedule X sale remains refused as an unsupported workflow (proved against
+    /// the sale path itself in `s16_h1_x_and_c_cannot_be_prepared_or_posted`).
     #[tokio::test]
     async fn d1a_a_schedule_x_drug_may_be_received_and_is_still_not_sellable() {
         let f = fixture().await;
@@ -3772,14 +3785,28 @@ mod tests {
             posted["lines"][0]["manufacturerName"],
             "Meridian Laboratories"
         );
-        // Receiving it says nothing about supplying it: no register exists, and none is implied.
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%schedule_x%'",
+        // Phase 1M-D2 built the register this test anticipated, so the boundary is now sharper
+        // rather than absent. Receiving writes exactly one RECEIPT working entry, prepared and not
+        // yet written into the bound book — and it writes nothing on the supply side, because
+        // receiving a drug still says nothing whatever about supplying it.
+        let kinds: Vec<(String, String)> = sqlx::query_as(
+            "SELECT entry_kind,status FROM store_schedule_x_register_entries ORDER BY reference_value",
         )
         .fetch_all(&f.pool)
         .await
         .unwrap();
-        assert!(tables.is_empty(), "{tables:?}");
+        assert_eq!(
+            kinds,
+            vec![("receipt".to_owned(), "prepared".to_owned())],
+            "receiving wrote something other than one prepared receipt entry"
+        );
+        let supplied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE entry_kind='supply'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(supplied, 0, "receiving implied a supply");
         let text = posted.to_string().to_lowercase();
         for claim in [
             "schedule x",

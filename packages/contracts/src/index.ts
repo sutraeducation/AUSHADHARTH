@@ -3119,3 +3119,135 @@ export const H1SheetSchema = z.object({
 export type H1Entry = z.infer<typeof H1EntrySchema>;
 export type H1Annotation = z.infer<typeof H1AnnotationSchema>;
 export type H1Sheet = z.infer<typeof H1SheetSchema>;
+
+/* ------------------------------------------------------------------------------------------------
+ * Phase 1M-D2 — the Schedule X working record
+ *
+ * Rule 65(21)(a) of the Drugs and Cosmetics Rules, 1945 requires Schedule X supply to be recorded at
+ * the time of supply in a register that is BOUND and SERIALLY PAGE NUMBERED, with separate pages
+ * allotted for each drug. A bound book is not something software can be, so what these types
+ * describe is a WORKING RECORD: the ten particulars of rule 65(21)(b), frozen so a person can write
+ * the statutory register accurately, plus the attestations that say the physical acts were done.
+ *
+ * There is no page number in this contract and there never will be. Rule 65(21) says separate pages
+ * per drug and says nothing about what happens when a page fills, whether a drug continues
+ * elsewhere, or whether a page may be reused — and inventing those rules would be inventing law.
+ * `reference` is AUSHADHARTH's own and is labelled as such everywhere it is shown.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** One register carrying both sides of the transaction, exactly as rule 65(21)(b) describes it. */
+export const ScheduleXEntryKindSchema = z.enum(["receipt", "supply"]);
+
+/**
+ * `prepared`  the particulars are frozen; the bound register has not been written yet.
+ * `confirmed` a person attested BOTH physical acts: the particulars were entered in the register,
+ *             and the entry was authenticated there by the supervising person.
+ * `finalized` the working entry is closed and never changes again.
+ * `void`      withdrawn before closing, with a reason; the row and its reference are kept.
+ */
+export const ScheduleXEntryStatusSchema = z.enum([
+  "prepared",
+  "confirmed",
+  "finalized",
+  "void"
+]);
+
+/** A particular is either recorded with its text, or recorded as absent. Never filled in later. */
+export const ScheduleXParticularStateSchema = z.enum(["recorded", "not_recorded"]);
+
+export const ScheduleXRegisterEntrySchema = z.object({
+  id: z.string(),
+  entryKind: ScheduleXEntryKindSchema,
+  /** The AUSHADHARTH reference. NOT a statutory serial and NOT a page number. */
+  reference: z.string(),
+  transactionDate: z.string(),
+  drugName: z.string(),
+  productId: z.string(),
+  batchState: ScheduleXParticularStateSchema,
+  batchNumber: z.string().nullable(),
+  manufacturerState: ScheduleXParticularStateSchema,
+  manufacturerName: z.string().nullable(),
+  quantityAtoms: z.number().int(),
+  quantityPacks: z.number().int().nullable(),
+  billNumber: z.string().nullable(),
+  billDate: z.string().nullable(),
+  purchaseDocumentId: z.string().nullable(),
+  purchaseLineId: z.string().nullable(),
+  supplierName: z.string().nullable(),
+  supplierAddressState: ScheduleXParticularStateSchema.nullable(),
+  supplierAddress: z.string().nullable(),
+  supplierLicenceState: ScheduleXParticularStateSchema.nullable(),
+  supplierLicenceNumber: z.string().nullable(),
+  status: ScheduleXEntryStatusSchema,
+  particularsEnteredInPhysicalRegister: z.boolean(),
+  physicalEntryAuthenticated: z.boolean(),
+  supervisingProfessionalId: z.string().nullable(),
+  supervisingProfessionalName: z.string().nullable(),
+  confirmedAtUtc: z.string().nullable(),
+  finalizedAtUtc: z.string().nullable(),
+  voidedAtUtc: z.string().nullable(),
+  voidReason: z.string().nullable(),
+  createdAtUtc: z.string()
+});
+
+/**
+ * A posted Schedule X receipt with no working record, because it was posted before this software
+ * kept one. Listed so the gap is visible; nothing is backfilled and no action marks it compliant.
+ */
+export const ScheduleXLegacyReceiptSchema = z.object({
+  purchaseDocumentId: z.string(),
+  purchaseLineId: z.string(),
+  invoiceDate: z.string(),
+  supplierInvoiceNumber: z.string(),
+  /** The drug name frozen at posting. `null` for a receipt older than that — the truth, not a gap. */
+  frozenDrugName: z.string().nullable(),
+  productId: z.string(),
+  /** The catalogue's name TODAY, for identification only. Not a frozen particular. */
+  currentProductName: z.string()
+});
+
+export const ScheduleXRegisterSchema = z.object({
+  entries: z.array(ScheduleXRegisterEntrySchema),
+  legacyReceipts: z.array(ScheduleXLegacyReceiptSchema)
+});
+
+/**
+ * Both physical acts are sent explicitly and both must be true. The screen does not pre-check them:
+ * a pre-ticked box is not an attestation, it is a guess about what somebody did with a pen.
+ */
+export const ConfirmScheduleXEntryRequestSchema = z.object({
+  supervisingProfessionalId: z.string(),
+  particularsEnteredInPhysicalRegister: z.boolean(),
+  physicalEntryAuthenticated: z.boolean()
+});
+
+export const VoidScheduleXEntryRequestSchema = z.object({ reason: z.string() });
+
+/**
+ * Rule 65(9)(a): a Schedule X prescription is in duplicate and the licensee retains one copy for two
+ * years. The duplicate is paper. This records only that a person said the retained copy is held.
+ */
+export const DuplicateCopyAttestationRequestSchema = z.object({
+  retainedDuplicatePrescriptionCopyConfirmed: z.boolean(),
+  note: z.string().nullable().optional()
+});
+
+export const DuplicateCopyAttestationSchema = z.object({
+  id: z.string(),
+  prescriptionId: z.string(),
+  retainedDuplicatePrescriptionCopyConfirmed: z.boolean(),
+  attestedByUserId: z.string(),
+  attestedAtUtc: z.string(),
+  note: z.string().nullable()
+});
+
+export type ScheduleXEntryKind = z.infer<typeof ScheduleXEntryKindSchema>;
+export type ScheduleXEntryStatus = z.infer<typeof ScheduleXEntryStatusSchema>;
+export type ScheduleXParticularState = z.infer<typeof ScheduleXParticularStateSchema>;
+export type ScheduleXRegisterEntry = z.infer<typeof ScheduleXRegisterEntrySchema>;
+export type ScheduleXLegacyReceipt = z.infer<typeof ScheduleXLegacyReceiptSchema>;
+export type ScheduleXRegister = z.infer<typeof ScheduleXRegisterSchema>;
+export type ConfirmScheduleXEntryRequest = z.infer<typeof ConfirmScheduleXEntryRequestSchema>;
+export type VoidScheduleXEntryRequest = z.infer<typeof VoidScheduleXEntryRequestSchema>;
+export type DuplicateCopyAttestationRequest = z.infer<typeof DuplicateCopyAttestationRequestSchema>;
+export type DuplicateCopyAttestation = z.infer<typeof DuplicateCopyAttestationSchema>;

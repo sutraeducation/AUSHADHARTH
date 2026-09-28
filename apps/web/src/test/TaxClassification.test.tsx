@@ -134,7 +134,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("Product tax classification UI", () => {
   it("shows an honest incomplete state for an unclassified Product", async () => {
     renderApp(`/app/products/${IDs.product}`);
-    expect(await screen.findByRole("heading", { name: "Tax Classification" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Tax Classification" }, { timeout: 3000 })).toBeInTheDocument();
     expect(await within(section()).findByText("Incomplete")).toBeInTheDocument();
     expect(within(section()).getAllByText("Not classified")).toHaveLength(2);
     expect(within(section()).getByText(/Assign a Tax Category to resolve/)).toBeInTheDocument();

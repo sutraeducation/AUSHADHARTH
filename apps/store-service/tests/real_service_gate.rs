@@ -7274,3 +7274,1079 @@ async fn real_service_refuses_every_form_20f_mutation_to_a_non_admin_over_http()
     assert_eq!(answer["state"], "established", "{answer:?}");
     pool.close().await;
 }
+
+// -------------------------------------------------------------------------------------------
+// Phase 1M-D2 — the Schedule X working record.
+//
+// Rule 65(21) requires a bound, serially page numbered register. What these tests exercise is the
+// WORKING RECORD that helps a person write it: particulars frozen at posting, the two physical-act
+// attestations, and a lifecycle that closes and never reopens. Nothing here posts a Schedule X sale,
+// and the last test in this block proves the sale is still refused.
+// -------------------------------------------------------------------------------------------
+
+/// Records an owner finding for the purchase world's product.
+async fn purchase_finding_over_http(
+    service: &Service,
+    world: &PurchaseWorld,
+    scheme: &str,
+    applies: bool,
+) {
+    let finding = call(
+        service,
+        "POST",
+        &format!(
+            "/api/v1/products/{}/regulatory/classifications",
+            world.product
+        ),
+        Some(json!({
+            "scheme": scheme,
+            "applies": applies,
+            "effectiveFrom": "2020-01-01",
+            "sourceCitation": "Owner-recorded finding with its authority",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(finding.status, 201, "{scheme}: {:?}", finding.body);
+}
+
+/// Posts a one-line Purchase of the world's product and returns the posted document.
+async fn post_purchase_over_http(
+    service: &Service,
+    world: &PurchaseWorld,
+    invoice: &str,
+    idempotency: &str,
+) -> Value {
+    let draft = create_draft(service, world, invoice).await;
+    let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "newBatchNumber": format!("BX-{invoice}"),
+            "newBatchExpiresOn": "2028-03-31",
+            "quantityPacks": 5,
+            "ratePerPackPaise": 3_000,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let revision = with_line.body["revision"].as_i64().expect("revision");
+    let posted = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({ "expectedRevision": revision, "idempotencyKey": idempotency })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    posted.body
+}
+
+async fn register_over_http(service: &Service, cookie: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        "/api/v1/store/schedule-x/register",
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body
+}
+
+/// A registered pharmacist on the store's own Phase 1M-A record.
+async fn purchase_pharmacist_over_http(service: &Service, world: &PurchaseWorld) -> String {
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/store/professionals",
+        Some(json!({
+            "fullName": "Meera Iyer",
+            "capacity": "registered_pharmacist",
+            "registrationNumber": "MH-PH-44821",
+            "registeringAuthority": "Maharashtra State Pharmacy Council",
+            "validFrom": "2020-01-01",
+            "linkedUserId": null,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    created.body["id"]
+        .as_str()
+        .expect("professional")
+        .to_owned()
+}
+
+/// Phase 1M-D2, item 39. An ordinary Purchase is untouched, and an unclassified product is untouched
+/// too: `unknown` is not `applies`, and a product's NAME classifies nothing.
+#[tokio::test]
+async fn real_service_leaves_an_ordinary_purchase_out_of_the_schedule_x_register_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    // No finding at all. The product's own display name is deliberately loud about Schedule X.
+    let renamed = call(
+        &service,
+        "GET",
+        &format!("/api/v1/products/{}", world.product),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(renamed.status, 200, "{:?}", renamed.body);
+
+    let posted = post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9001",
+        "01997a00-0000-7000-8000-000000000d01",
+    )
+    .await;
+    assert_eq!(posted["purchaseProvenanceSnapshotVersion"], 1);
+
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(
+        register["entries"].as_array().expect("entries").len(),
+        0,
+        "an unclassified purchase entered the Schedule X working record"
+    );
+    assert_eq!(
+        register["legacyReceipts"].as_array().expect("legacy").len(),
+        0
+    );
+
+    // Recording the product as OUTSIDE Schedule X changes nothing either.
+    purchase_finding_over_http(&service, &world, "schedule_x", false).await;
+    let posted = post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9002",
+        "01997a00-0000-7000-8000-000000000d02",
+    )
+    .await;
+    assert_eq!(posted["status"], "posted");
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(
+        register["entries"].as_array().expect("entries").len(),
+        0,
+        "a product recorded outside Schedule X entered the working record"
+    );
+}
+
+/// Phase 1M-D2, items 39 and 15. A posted Schedule X receipt writes one working entry, frozen — and
+/// renaming the supplier, the product and the manufacturer afterwards changes nothing about it.
+#[tokio::test]
+async fn real_service_freezes_a_schedule_x_receipt_working_record_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+
+    // A maker on record, so the manufacturer particular of rule 65(21)(b)(v) is available to freeze.
+    let company = call(
+        &service,
+        "POST",
+        "/api/v1/reference/companies",
+        Some(json!({ "attributes": { "displayName": "Meridian Laboratories", "countryCode": "IN" } })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(company.status, 201, "{:?}", company.body);
+    let company_id = company.body["id"].as_str().expect("company").to_owned();
+    let role = call(
+        &service,
+        "POST",
+        &format!("/api/v1/products/{}/company-roles", world.product),
+        Some(json!({ "companyId": company_id, "role": "manufacturer" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(role.status, 201, "{:?}", role.body);
+
+    let posted = post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9101",
+        "01997a00-0000-7000-8000-000000000d11",
+    )
+    .await;
+    let purchase_id = posted["id"].as_str().expect("purchase").to_owned();
+
+    let register = register_over_http(&service, &world.cookie).await;
+    let entries = register["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["entryKind"], "receipt");
+    // The reference is AUSHADHARTH's own, and looks nothing like a register serial or a page.
+    assert_eq!(entry["reference"], "AXR-000001");
+    assert_eq!(entry["status"], "prepared");
+    assert_eq!(
+        entry["purchaseDocumentId"],
+        Value::from(purchase_id.clone())
+    );
+    assert_eq!(entry["billNumber"], "INV-9101");
+    assert_eq!(entry["batchState"], "recorded");
+    assert_eq!(entry["batchNumber"], "BX-INV-9101");
+    assert_eq!(entry["manufacturerState"], "recorded");
+    assert_eq!(entry["manufacturerName"], "Meridian Laboratories");
+    assert_eq!(entry["quantityAtoms"], 50);
+    assert_eq!(entry["quantityPacks"], 5);
+    assert_eq!(entry["particularsEnteredInPhysicalRegister"], false);
+    assert_eq!(entry["physicalEntryAuthenticated"], false);
+    // No page number, by any name, anywhere in the payload.
+    let serialised = entry.to_string();
+    for forbidden in ["page", "Page"] {
+        assert!(!serialised.contains(forbidden), "{forbidden}: {serialised}");
+    }
+    let frozen_supplier = entry["supplierName"].clone();
+    let frozen_drug = entry["drugName"].clone();
+    let frozen_maker = entry["manufacturerName"].clone();
+    let frozen_licence = entry["supplierLicenceNumber"].clone();
+
+    // Now move every master the particulars came from.
+    let party = call(
+        &service,
+        "GET",
+        &format!("/api/v1/parties/{}", world.supplier),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(party.status, 200, "{:?}", party.body);
+    let renamed = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/parties/{}", world.supplier),
+        Some(json!({
+            "expectedRevision": party.body["revision"],
+            "party": {
+                "displayName": "Renamed Distributors",
+                "gstRegistrationStatus": "unregistered",
+                "placeOfSupplyStateId": MAHARASHTRA,
+                "drugLicenceNumber": "CHANGED-LICENCE-0000",
+            },
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        renamed.status == 200 || renamed.status == 201,
+        "{:?}",
+        renamed.body
+    );
+
+    // 15. The working record is unmoved: it is a snapshot, not a view.
+    let register = register_over_http(&service, &world.cookie).await;
+    let entry = &register["entries"].as_array().expect("entries")[0];
+    assert_eq!(entry["supplierName"], frozen_supplier);
+    assert_eq!(entry["drugName"], frozen_drug);
+    assert_eq!(entry["manufacturerName"], frozen_maker);
+    assert_eq!(entry["supplierLicenceNumber"], frozen_licence);
+    assert_ne!(entry["supplierName"], Value::from("Renamed Distributors"));
+}
+
+/// Phase 1M-D2, items 9, 10, 11 and 21. The two physical acts, the pharmacist who is named for them,
+/// and a lifecycle that closes once and never reopens.
+#[tokio::test]
+async fn real_service_confirms_the_physical_schedule_x_register_acts_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+    let professional = purchase_pharmacist_over_http(&service, &world).await;
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9201",
+        "01997a00-0000-7000-8000-000000000d21",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("entry")
+        .to_owned();
+    let confirm_uri = format!("/api/v1/store/schedule-x/register/{entry_id}/confirm");
+
+    // Closing an entry nobody attested would assert something untrue.
+    let premature = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(premature.status, 409, "{:?}", premature.body);
+    assert_eq!(
+        premature.body["code"],
+        "schedule_x_physical_confirmation_required"
+    );
+
+    // One physical act without the other is not an attestation.
+    for body in [
+        json!({ "supervisingProfessionalId": professional, "particularsEnteredInPhysicalRegister": true, "physicalEntryAuthenticated": false }),
+        json!({ "supervisingProfessionalId": professional, "particularsEnteredInPhysicalRegister": false, "physicalEntryAuthenticated": true }),
+    ] {
+        let partial = call(
+            &service,
+            "POST",
+            &confirm_uri,
+            Some(body),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(partial.status, 422, "{:?}", partial.body);
+        assert_eq!(partial.body["code"], "schedule_x_attestations_incomplete");
+    }
+
+    // The supervising person must be a registered pharmacist this pharmacy actually has on record.
+    let stranger = call(
+        &service,
+        "POST",
+        &confirm_uri,
+        Some(json!({
+            "supervisingProfessionalId": "01997a00-0000-7000-8000-0000000009ff",
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(stranger.status, 409, "{:?}", stranger.body);
+    assert_eq!(stranger.body["code"], "schedule_x_pharmacist_required");
+
+    let confirmed = call(
+        &service,
+        "POST",
+        &confirm_uri,
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    assert_eq!(confirmed.body["status"], "confirmed");
+    assert_eq!(confirmed.body["particularsEnteredInPhysicalRegister"], true);
+    assert_eq!(confirmed.body["physicalEntryAuthenticated"], true);
+    assert_eq!(confirmed.body["supervisingProfessionalName"], "Meera Iyer");
+
+    let finalized = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(finalized.status, 200, "{:?}", finalized.body);
+    assert_eq!(finalized.body["status"], "finalized");
+
+    // A closed entry is beyond reach, by every route that exists.
+    for (uri, body) in [
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+            json!({ "supervisingProfessionalId": professional, "particularsEnteredInPhysicalRegister": true, "physicalEntryAuthenticated": true }),
+        ),
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+            json!({}),
+        ),
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/void"),
+            json!({ "reason": "changed my mind" }),
+        ),
+    ] {
+        let refused = call(&service, "POST", &uri, Some(body), Some(&world.cookie)).await;
+        assert_eq!(refused.status, 409, "{uri}: {:?}", refused.body);
+        assert_eq!(refused.body["code"], "schedule_x_entry_finalized", "{uri}");
+    }
+
+    // The audit log carries every step, and names no patient because a receipt has none.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action,change_payload FROM master_change_events \
+         WHERE entity_type='schedule_x_register_entry' AND entity_id=? ORDER BY occurred_at_utc,event_id",
+    )
+    .bind(&entry_id)
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0].0, "created");
+    assert!(
+        events[1].1.contains("prepared_to_confirmed"),
+        "{:?}",
+        events[1]
+    );
+    assert!(
+        events[2].1.contains("confirmed_to_finalized"),
+        "{:?}",
+        events[2]
+    );
+    // And the row cannot be deleted at all.
+    assert!(
+        sqlx::query("DELETE FROM store_schedule_x_register_entries")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D2, items 21 and 22. A cashier has no part in Schedule X compliance work — not the
+/// reading, which carries a patient's particulars on the supply side, and not any of the writing.
+#[tokio::test]
+async fn real_service_refuses_the_schedule_x_working_record_to_a_cashier_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+    let professional = purchase_pharmacist_over_http(&service, &world).await;
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9301",
+        "01997a00-0000-7000-8000-000000000d31",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("entry")
+        .to_owned();
+
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "schedulex.cashier",
+        "01997a00-0000-7000-8000-000000000d41",
+    )
+    .await;
+
+    let denied = call(
+        &service,
+        "GET",
+        "/api/v1/store/schedule-x/register",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(denied.status, 403, "{:?}", denied.body);
+    assert_eq!(denied.body["code"], "authorization_denied");
+
+    for (uri, body) in [
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+            json!({ "supervisingProfessionalId": professional, "particularsEnteredInPhysicalRegister": true, "physicalEntryAuthenticated": true }),
+        ),
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+            json!({}),
+        ),
+        (
+            format!("/api/v1/store/schedule-x/register/{entry_id}/void"),
+            json!({ "reason": "not mine to withdraw" }),
+        ),
+    ] {
+        let denied = call(&service, "POST", &uri, Some(body.clone()), Some(&cashier)).await;
+        assert_eq!(denied.status, 403, "{uri}: {:?}", denied.body);
+        assert_eq!(denied.body["code"], "authorization_denied", "{uri}");
+        let anonymous = call(&service, "POST", &uri, Some(body), None).await;
+        assert_eq!(anonymous.status, 401, "{uri}: {:?}", anonymous.body);
+    }
+
+    // Nothing moved.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM store_schedule_x_register_entries WHERE id=?")
+            .bind(&entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+    assert_eq!(status, "prepared");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM master_change_events WHERE entity_type='schedule_x_register_entry'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events, 1, "a refused mutation was audited");
+    pool.close().await;
+}
+
+/// Phase 1M-D2, items 11 and 34 (Race A). A replayed posting does not write the register twice, and a
+/// withdrawn entry never hands its reference to the next one.
+#[tokio::test]
+async fn real_service_never_writes_the_schedule_x_register_twice_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+    let posted = post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9401",
+        "01997a00-0000-7000-8000-000000000d51",
+    )
+    .await;
+    let purchase_id = posted["id"].as_str().expect("purchase").to_owned();
+    let revision = posted["revision"].as_i64().expect("revision");
+
+    // Replaying the same posting is idempotent and writes no second entry.
+    let replay = call(
+        &service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": revision,
+            "idempotencyKey": "01997a00-0000-7000-8000-000000000d51",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        replay.status == 200 || replay.status == 409,
+        "{:?}",
+        replay.body
+    );
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(register["entries"].as_array().expect("entries").len(), 1);
+
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("entry")
+        .to_owned();
+    let voided = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/void"),
+        Some(json!({ "reason": "prepared against the wrong invoice" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(voided.status, 200, "{:?}", voided.body);
+    assert_eq!(voided.body["status"], "void");
+    assert_eq!(voided.body["reference"], "AXR-000001");
+
+    // A void entry cannot be resurrected, and its reference is not reissued: the next Schedule X
+    // receipt takes the following number.
+    let resurrect = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": "01997a00-0000-7000-8000-0000000009ff",
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(resurrect.status, 409, "{:?}", resurrect.body);
+    assert_eq!(resurrect.body["code"], "schedule_x_entry_void");
+
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9402",
+        "01997a00-0000-7000-8000-000000000d52",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    let references: Vec<&str> = register["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["reference"].as_str().expect("reference"))
+        .collect();
+    assert_eq!(references, vec!["AXR-000002", "AXR-000001"]);
+}
+
+/// Phase 1M-D2, item 8. Rule 65(9)(a)'s retained duplicate copy: a fact about paper, recorded once.
+#[tokio::test]
+async fn real_service_records_the_retained_duplicate_prescription_copy_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    let (prescription, _item) = prescription_over_http(&service, &world, None, 20).await;
+    let uri = format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy");
+
+    let recorded = call(
+        &service,
+        "POST",
+        &uri,
+        Some(json!({
+            "retainedDuplicatePrescriptionCopyConfirmed": true,
+            "note": "Second copy filed in the Schedule X folder",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(recorded.status, 201, "{:?}", recorded.body);
+    assert_eq!(
+        recorded.body["retainedDuplicatePrescriptionCopyConfirmed"],
+        true
+    );
+
+    // It is a statement about a piece of paper, not a setting to toggle.
+    let again = call(
+        &service,
+        "POST",
+        &uri,
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": false })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(again.status, 409, "{:?}", again.body);
+    assert_eq!(
+        again.body["code"],
+        "schedule_x_duplicate_copy_already_attested"
+    );
+
+    // A cashier does not make this statement.
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "duplicate.cashier",
+        "01997a00-0000-7000-8000-000000000d61",
+    )
+    .await;
+    let denied = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true })),
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(denied.status, 403, "{:?}", denied.body);
+
+    // Nothing here deletes itself after two years, and nothing claims to be the paper.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM prescription_duplicate_copy_attestations")
+            .fetch_one(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(rows, 1);
+    assert!(
+        sqlx::query("DELETE FROM prescription_duplicate_copy_attestations")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D2, items 25 and 26. A Purchase return is a separate business event: it does not rewrite
+/// the receipt working record, and a Schedule X receipt posted before this software kept a working
+/// record is listed as unresolved rather than invented.
+#[tokio::test]
+async fn real_service_keeps_the_schedule_x_receipt_record_stable_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+
+    // A Schedule X receipt posted BEFORE the owner recorded the finding gets no working record —
+    // the finding did not exist on that date, and the software does not reach backwards.
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9501",
+        "01997a00-0000-7000-8000-000000000d71",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(register["entries"].as_array().expect("entries").len(), 0);
+
+    // Now the owner records the finding. The earlier receipt is NOT backfilled; it surfaces as a
+    // legacy receipt with its frozen particulars and nothing invented.
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(
+        register["entries"].as_array().expect("entries").len(),
+        0,
+        "the earlier receipt was backfilled"
+    );
+    let legacy = register["legacyReceipts"].as_array().expect("legacy");
+    assert_eq!(legacy.len(), 1, "{legacy:?}");
+    assert_eq!(legacy[0]["supplierInvoiceNumber"], "INV-9501");
+    assert_eq!(legacy[0]["invoiceDate"], "2026-09-10");
+
+    // A later Purchase of the same drug does get a working record, and the legacy one stays legacy.
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9502",
+        "01997a00-0000-7000-8000-000000000d72",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    assert_eq!(register["entries"].as_array().expect("entries").len(), 1);
+    assert_eq!(
+        register["legacyReceipts"].as_array().expect("legacy").len(),
+        1,
+        "the legacy receipt was quietly repaired"
+    );
+}
+
+/// Phase 1M-D2, item 27. The working record survives the real backup and restore, with its frozen
+/// particulars, its attestations and its guards.
+#[tokio::test]
+async fn real_service_keeps_the_schedule_x_working_record_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_purchase_world(service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(service, &world, "schedule_x", true).await;
+    let professional = purchase_pharmacist_over_http(service, &world).await;
+    post_purchase_over_http(
+        service,
+        &world,
+        "INV-9601",
+        "01997a00-0000-7000-8000-000000000d81",
+    )
+    .await;
+    let register = register_over_http(service, &world.cookie).await;
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("entry")
+        .to_owned();
+    let confirmed = call(
+        service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    let frozen_reference = confirmed.body["reference"].clone();
+    let frozen_supplier = confirmed.body["supplierName"].clone();
+    let frozen_batch = confirmed.body["batchNumber"].clone();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let filename = created.body["filename"]
+        .as_str()
+        .expect("filename")
+        .to_owned();
+    let bytes = std::fs::read(harness.backups.join(&filename)).expect("backup on disk");
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &bytes,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    let (reference, status, supplier, batch, entered, authenticated): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT reference,status,supplier_name,batch_number,\
+         particulars_entered_in_physical_register,physical_entry_authenticated \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&entry_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("restored entry");
+    assert_eq!(Value::from(reference), frozen_reference);
+    assert_eq!(status, "confirmed");
+    assert_eq!(Value::from(supplier), frozen_supplier);
+    assert_eq!(Value::from(batch), frozen_batch);
+    assert_eq!((entered, authenticated), (1, 1));
+
+    // And so did the guards that keep it that way.
+    for statement in [
+        "DELETE FROM store_schedule_x_register_entries",
+        "UPDATE store_schedule_x_register_entries SET supplier_name='Someone Else'",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&reopened).await.is_err(),
+            "{statement}"
+        );
+    }
+    reopened.close().await;
+}
+
+/// Phase 1M-D2, item 0 — THE HARD BOUNDARY. D2 builds the receipt working record and nothing else:
+/// with an in-force Form 20F, active drug coverage, a confirmed Schedule X receipt working record, a
+/// registered pharmacist and a complete prescription, a Schedule X SALE is still refused, and no
+/// stock moves.
+#[tokio::test]
+async fn real_service_keeps_schedule_x_sales_refused_after_the_register_foundations_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+
+    // Everything D1-B and D2 can give it.
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    // And the counter still refuses, on the same code as before this phase existed.
+    let (sale_id, sale_revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let unprepared = prepare_entry_over_http(&service, &world, &sale_id, sale_revision).await;
+    assert_eq!(unprepared.status, 409, "{:?}", unprepared.body);
+    assert_eq!(unprepared.body["code"], "schedule_x_workflow_not_available");
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-000000000d91",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+
+    // Nothing moved, nothing was dispensed, and no supply working entry was conjured up.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let sold: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale'")
+            .fetch_one(&pool)
+            .await
+            .expect("movements");
+    assert_eq!(sold, 0, "a Schedule X line moved stock");
+    let dispensed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prescription_dispensings")
+        .fetch_one(&pool)
+        .await
+        .expect("dispensings");
+    assert_eq!(dispensed, 0);
+    let supply_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE entry_kind='supply'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("supply entries");
+    assert_eq!(supply_entries, 0, "a supply working entry was written");
+    pool.close().await;
+}
+
+/// Phase 1M-D2, item 34 (Races B and D). Two Schedule X receipts posted at the same instant take
+/// distinct references, and a void racing a confirmation leaves one terminal history.
+///
+/// No sleeps and no retries: the postings are joined, and the assertion holds for either order the
+/// scheduler chooses, because the invariant is "distinct and complete", not "this one first".
+#[tokio::test]
+async fn real_service_allocates_distinct_schedule_x_references_under_a_race_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+
+    // Two drafts, each with a line, prepared up to the moment of posting.
+    let mut ready = Vec::new();
+    for (invoice, key) in [
+        ("INV-9701", "01997a00-0000-7000-8000-000000000e01"),
+        ("INV-9702", "01997a00-0000-7000-8000-000000000e02"),
+    ] {
+        let draft = create_draft(&service, &world, invoice).await;
+        let purchase_id = draft["id"].as_str().expect("purchase id").to_owned();
+        let with_line = call(
+            &service,
+            "POST",
+            &format!("/api/v1/purchases/{purchase_id}/lines"),
+            Some(json!({
+                "expectedRevision": 1,
+                "productId": world.product,
+                "productPackId": world.pack,
+                "newBatchNumber": format!("BX-{invoice}"),
+                "newBatchExpiresOn": "2028-03-31",
+                "quantityPacks": 5,
+                "ratePerPackPaise": 3_000,
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+        ready.push((
+            purchase_id,
+            with_line.body["revision"].as_i64().expect("revision"),
+            key,
+        ));
+    }
+
+    let first_uri = format!("/api/v1/purchases/{}/post", ready[0].0);
+    let second_uri = format!("/api/v1/purchases/{}/post", ready[1].0);
+    let (first, second) = tokio::join!(
+        call(
+            &service,
+            "POST",
+            &first_uri,
+            Some(json!({ "expectedRevision": ready[0].1, "idempotencyKey": ready[0].2 })),
+            Some(&world.cookie),
+        ),
+        call(
+            &service,
+            "POST",
+            &second_uri,
+            Some(json!({ "expectedRevision": ready[1].1, "idempotencyKey": ready[1].2 })),
+            Some(&world.cookie),
+        )
+    );
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert_eq!(second.status, 200, "{:?}", second.body);
+
+    // Race B. Two entries, two distinct references, no collision and no gap invented.
+    let register = register_over_http(&service, &world.cookie).await;
+    let entries = register["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let mut references: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["reference"].as_str().expect("reference"))
+        .collect();
+    references.sort_unstable();
+    assert_eq!(references, vec!["AXR-000001", "AXR-000002"]);
+
+    // Race D. A void and a confirmation aimed at one entry leave exactly one terminal history:
+    // whichever lands first, the other is refused and the entry is never in both states.
+    let professional = purchase_pharmacist_over_http(&service, &world).await;
+    let entry_id = entries[0]["id"].as_str().expect("entry").to_owned();
+    let confirm_uri = format!("/api/v1/store/schedule-x/register/{entry_id}/confirm");
+    let void_uri = format!("/api/v1/store/schedule-x/register/{entry_id}/void");
+    let (confirmed, voided) = tokio::join!(
+        call(
+            &service,
+            "POST",
+            &confirm_uri,
+            Some(json!({
+                "supervisingProfessionalId": professional,
+                "particularsEnteredInPhysicalRegister": true,
+                "physicalEntryAuthenticated": true,
+            })),
+            Some(&world.cookie),
+        ),
+        call(
+            &service,
+            "POST",
+            &void_uri,
+            Some(json!({ "reason": "withdrawn while somebody else was confirming" })),
+            Some(&world.cookie),
+        )
+    );
+    assert!(
+        (confirmed.status == 200) ^ (voided.status == 200),
+        "both or neither won: confirm={:?} void={:?}",
+        confirmed.body,
+        voided.body
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM store_schedule_x_register_entries WHERE id=?")
+            .bind(&entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+    if confirmed.status == 200 {
+        assert_eq!(status, "confirmed");
+    } else {
+        assert_eq!(status, "void");
+    }
+    // Exactly one row, in exactly one state, with its reference intact.
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE id=?")
+            .bind(&entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(rows, 1);
+    pool.close().await;
+}
