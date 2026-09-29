@@ -8350,3 +8350,1063 @@ async fn real_service_allocates_distinct_schedule_x_references_under_a_race_over
     assert_eq!(rows, 1);
     pool.close().await;
 }
+
+// ==============================================================================================
+// Phase 1M-D3-A — rule 65(11)(c), the note written on the physical prescription
+// ==============================================================================================
+
+/// The prescription-annotation surface, read over real HTTP.
+async fn annotations_over_http(service: &Service, cookie: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        "/api/v1/store/schedule-x/prescription-annotations",
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body
+}
+
+async fn record_annotation_over_http(
+    service: &Service,
+    cookie: &str,
+    line: &str,
+    confirmed: bool,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        "/api/v1/store/schedule-x/prescription-annotations",
+        Some(json!({
+            "saleLineId": line,
+            "sellerParticularsNotedOnPrescription": confirmed,
+            "note": Value::Null,
+        })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// A posted Purchase of the sale world's own product, so a Schedule X receipt working entry exists.
+async fn sale_world_purchase_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    invoice: &str,
+    idempotency: &str,
+) -> Value {
+    let draft = call(
+        service,
+        "POST",
+        "/api/v1/purchases",
+        Some(json!({
+            "supplierPartyId": world.supplier,
+            "supplierInvoiceNumber": invoice,
+            "invoiceDate": "2026-09-10",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let purchase_id = draft.body["id"].as_str().expect("purchase id").to_owned();
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "newBatchNumber": format!("BX-{invoice}"),
+            "newBatchExpiresOn": "2028-03-31",
+            "quantityPacks": 5,
+            "ratePerPackPaise": 3_000,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let posted = call(
+        service,
+        "POST",
+        &format!("/api/v1/purchases/{purchase_id}/post"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "idempotencyKey": idempotency,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    posted.body
+}
+
+/// The sale line of a draft Schedule X sale, which is the dispensing occasion before it is one.
+async fn sale_line_id_over_http(service: &Service, world: &SaleWorld, sale_id: &str) -> String {
+    let detail = call(
+        service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    detail.body["lines"][0]["id"]
+        .as_str()
+        .expect("sale line id")
+        .to_owned()
+}
+
+/// D3A-1. The whole rule 65(11)(c) fact across a real socket.
+///
+/// What must be true: the particulars shown are the ones frozen; the confirmation is append-only;
+/// a retry hands back the same fact rather than asking for the pen twice; and a Store Profile
+/// edited afterwards does not rewrite what the record says was written on the paper.
+#[tokio::test]
+async fn real_service_records_and_freezes_the_prescription_annotation_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    // The occasion is waiting, and the seller particulars the confirmation would freeze are shown
+    // BEFORE anything is confirmed — the operator is told exactly what to write.
+    let listed = annotations_over_http(&service, &world.cookie).await;
+    assert_eq!(
+        listed["pendingOccasions"].as_array().expect("array").len(),
+        1
+    );
+    assert_eq!(listed["pendingOccasions"][0]["saleLineId"], line_id);
+    assert_eq!(listed["pendingOccasions"][0]["dispensingDate"], SALE_DATE);
+    assert_eq!(
+        listed["sellerName"], "Integration Pharmacy Private Limited",
+        "{listed:?}"
+    );
+    let address = listed["sellerAddress"]
+        .as_str()
+        .expect("address")
+        .to_owned();
+    assert!(address.starts_with("12 Market Road"), "{address}");
+    assert!(address.contains("Pune"), "{address}");
+    assert!(
+        listed["sellerMissing"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "{listed:?}"
+    );
+    // The list points at a piece of paper. It does not carry the patient or the prescriber.
+    let listed_text = listed.to_string();
+    for private in ["Sita Kulkarni", "Lakshmi Road", "Anjali Rao", "Rao Clinic"] {
+        assert!(!listed_text.contains(private), "{private} leaked: {listed}");
+    }
+
+    // An unticked box is not an attestation.
+    let unticked = record_annotation_over_http(&service, &world.cookie, &line_id, false).await;
+    assert_eq!(unticked.status, 422, "{:?}", unticked.body);
+    assert_eq!(
+        unticked.body["code"],
+        "schedule_x_prescription_annotation_not_confirmed"
+    );
+
+    let recorded = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(recorded.status, 201, "{:?}", recorded.body);
+    let annotation_id = recorded.body["id"].as_str().expect("id").to_owned();
+    assert_eq!(recorded.body["saleLineId"], line_id);
+    assert_eq!(recorded.body["prescriptionId"], prescription);
+    assert_eq!(recorded.body["dispensingDate"], SALE_DATE);
+    assert_eq!(
+        recorded.body["sellerName"],
+        "Integration Pharmacy Private Limited"
+    );
+    assert_eq!(recorded.body["sellerAddress"], address);
+
+    // A retry after a client timeout finds the fact already written and is handed that same row.
+    let retried = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(retried.status, 200, "{:?}", retried.body);
+    assert_eq!(retried.body["id"], annotation_id);
+
+    // The occasion is no longer pending, and the fact is listed once.
+    let after = annotations_over_http(&service, &world.cookie).await;
+    assert!(
+        after["pendingOccasions"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "{after:?}"
+    );
+    assert_eq!(after["annotations"].as_array().expect("array").len(), 1);
+
+    // The Store is renamed and moves. What was written on the paper does not change.
+    let profile = call(
+        &service,
+        "GET",
+        "/api/v1/store/profile",
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    let renamed = call(
+        &service,
+        "PUT",
+        "/api/v1/store/profile",
+        Some(json!({
+            "expectedRevision": profile.body["revision"],
+            "displayName": "Renamed Pharmacy",
+            "legalName": "Renamed Pharmacy LLP",
+            "primaryPhone": "02099999999",
+            "primaryEmail": "counter@example.test",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(renamed.status, 200, "{:?}", renamed.body);
+    let later = annotations_over_http(&service, &world.cookie).await;
+    assert_eq!(
+        later["annotations"][0]["sellerName"], "Integration Pharmacy Private Limited",
+        "a profile edit rewrote what the record says was written on the prescription: {later:?}"
+    );
+    assert_eq!(later["sellerName"], "Renamed Pharmacy LLP", "{later:?}");
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+
+    // Append-only against direct SQL, in both directions.
+    for statement in [
+        "UPDATE schedule_x_prescription_annotations SET seller_name='Somebody Else' WHERE id=?",
+        "UPDATE schedule_x_prescription_annotations SET dispensing_date='2026-01-01' WHERE id=?",
+        "UPDATE schedule_x_prescription_annotations SET seller_particulars_noted_on_prescription=0 WHERE id=?",
+        "DELETE FROM schedule_x_prescription_annotations WHERE id=?",
+    ] {
+        let refused = sqlx::query(statement)
+            .bind(&annotation_id)
+            .execute(&pool)
+            .await;
+        assert!(refused.is_err(), "direct SQL succeeded: {statement}");
+        assert!(
+            refused.unwrap_err().to_string().contains("append_only"),
+            "{statement}"
+        );
+    }
+
+    // The audit log names the fact and the identifiers, and carries no prescription content.
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action,change_payload FROM master_change_events \
+         WHERE entity_type='schedule_x_prescription_annotation' AND entity_id=?",
+    )
+    .bind(&annotation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].0, "created");
+    for private in [
+        "Sita Kulkarni",
+        "Anjali Rao",
+        "Integration Pharmacy",
+        "Market Road",
+    ] {
+        assert!(
+            !events[0].1.contains(private),
+            "{private} reached the audit payload: {}",
+            events[0].1
+        );
+    }
+    assert!(
+        events[0]
+            .1
+            .contains("seller_particulars_noted_on_prescription"),
+        "{}",
+        events[0].1
+    );
+    pool.close().await;
+}
+
+/// D3A-2. Direct SQL cannot forge an occasion. Every coherence limb is refused by the database
+/// itself, not merely by the service that normally writes these rows.
+#[tokio::test]
+async fn real_service_refuses_a_forged_prescription_annotation_in_direct_sql_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let cashier: Option<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE role='cashier' LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .expect("cashier lookup");
+    let owner: String = sqlx::query_scalar("SELECT id FROM users WHERE role='owner_admin' LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("owner");
+    let stranger_store = "01997a00-0000-7000-8000-0000000007ff";
+
+    // Every attempt names a real occasion and changes exactly one thing, so each assertion is about
+    // the limb it names and nothing else.
+    let insert = "INSERT INTO schedule_x_prescription_annotations (id,store_id,sale_document_id,\
+         sale_line_id,prescription_id,prescription_item_id,product_id,\
+         seller_particulars_noted_on_prescription,seller_name,seller_address,dispensing_date,\
+         attested_on_store_date,attested_by_user_id,attested_at_utc,note,created_at_utc) \
+         VALUES (?,?,?,?,?,?,?,1,'Seller','Address',?,'2026-09-29',?,\
+         '2026-09-29T06:00:00.000Z',NULL,'2026-09-29T06:00:00.000Z')";
+
+    struct Forgery<'a> {
+        what: &'a str,
+        store: &'a str,
+        document: &'a str,
+        line: &'a str,
+        prescription: &'a str,
+        item: &'a str,
+        product: &'a str,
+        date: &'a str,
+        actor: &'a str,
+    }
+    let base = Forgery {
+        what: "",
+        store: &world.store,
+        document: &sale_id,
+        line: &line_id,
+        prescription: &prescription,
+        item: &item,
+        product: &world.product,
+        date: SALE_DATE,
+        actor: &owner,
+    };
+
+    let mut attempts = vec![
+        Forgery {
+            what: "another store",
+            store: stranger_store,
+            ..Forgery { ..base }
+        },
+        Forgery {
+            what: "a date that is not the draft's business date",
+            date: "2026-09-11",
+            ..Forgery { ..base }
+        },
+        Forgery {
+            what: "a line belonging to no such document",
+            document: "01997a00-0000-7000-8000-0000000008ff",
+            ..Forgery { ..base }
+        },
+        Forgery {
+            what: "a product the line does not supply",
+            product: "01997a00-0000-7000-8000-0000000008fe",
+            ..Forgery { ..base }
+        },
+    ];
+    if let Some(cashier) = cashier.as_deref() {
+        attempts.push(Forgery {
+            what: "a cashier as the confirmer",
+            actor: cashier,
+            ..Forgery { ..base }
+        });
+    }
+
+    for (index, attempt) in attempts.iter().enumerate() {
+        let refused = sqlx::query(insert)
+            .bind(format!("01997a00-0000-7000-8000-00000000f{index:03}"))
+            .bind(attempt.store)
+            .bind(attempt.document)
+            .bind(attempt.line)
+            .bind(attempt.prescription)
+            .bind(attempt.item)
+            .bind(attempt.product)
+            .bind(attempt.date)
+            .bind(attempt.actor)
+            .execute(&pool)
+            .await;
+        assert!(refused.is_err(), "direct SQL wrote {}", attempt.what);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("schedule_x_prescription_annotation_incoherent"),
+            "{}",
+            attempt.what
+        );
+    }
+
+    // And the sound one goes in, so the refusals above are about their limbs and not about the
+    // statement being malformed.
+    let accepted = sqlx::query(insert)
+        .bind("01997a00-0000-7000-8000-00000000fa01")
+        .bind(base.store)
+        .bind(base.document)
+        .bind(base.line)
+        .bind(base.prescription)
+        .bind(base.item)
+        .bind(base.product)
+        .bind(base.date)
+        .bind(base.actor)
+        .execute(&pool)
+        .await;
+    assert!(accepted.is_ok(), "{accepted:?}");
+
+    // One live confirmation per occasion, whoever writes it.
+    let second = sqlx::query(insert)
+        .bind("01997a00-0000-7000-8000-00000000fa02")
+        .bind(base.store)
+        .bind(base.document)
+        .bind(base.line)
+        .bind(base.prescription)
+        .bind(base.item)
+        .bind(base.product)
+        .bind(base.date)
+        .bind(base.actor)
+        .execute(&pool)
+        .await;
+    assert!(second.is_err(), "a second confirmation was written");
+    pool.close().await;
+}
+
+/// D3A-3. A Schedule X annotation cannot be recorded for a drug that is not in Schedule X, so an
+/// ordinary Schedule H prescription sale acquires no new requirement from this phase.
+#[tokio::test]
+async fn real_service_keeps_the_prescription_annotation_to_schedule_x_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_h"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, sale_revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    let listed = annotations_over_http(&service, &world.cookie).await;
+    assert!(
+        listed["pendingOccasions"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "a Schedule H line appeared on the Schedule X annotation surface: {listed:?}"
+    );
+    let refused = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(refused.status, 404, "{:?}", refused.body);
+
+    // And the Schedule H rule 65(3) entry still prepares, exactly as it did before this phase.
+    let record = prepare_entry_over_http(&service, &world, &sale_id, sale_revision).await;
+    assert_eq!(record.status, 200, "{:?}", record.body);
+    assert_eq!(
+        record.body["prescriptionRecords"][0]["status"], "prepared",
+        "{:?}",
+        record.body
+    );
+}
+
+/// D3A-4. The seller particulars are refused, never guessed. Rule 65(11)(c) names the seller's name
+/// and address, and a record that cannot say what was written is not evidence of anything.
+#[tokio::test]
+async fn real_service_refuses_a_prescription_annotation_without_seller_particulars_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    // The pharmacy's registered name goes missing — the state a half-set-up installation is in.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    sqlx::query("UPDATE store_identity SET legal_name=NULL")
+        .execute(&pool)
+        .await
+        .expect("clear legal name");
+    pool.close().await;
+
+    let listed = annotations_over_http(&service, &world.cookie).await;
+    assert_eq!(listed["sellerName"], Value::Null, "{listed:?}");
+    assert_eq!(listed["sellerMissing"][0], "legalName", "{listed:?}");
+
+    let refused = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["code"],
+        "schedule_x_seller_particulars_unavailable"
+    );
+    assert_eq!(refused.body["issues"][0]["field"], "legalName");
+}
+
+/// D3A-5. Schedule X compliance records are the owner's and the pharmacist's. A cashier can neither
+/// read the surface nor write the fact.
+#[tokio::test]
+async fn real_service_refuses_the_prescription_annotation_to_a_cashier_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "till-d3a",
+        "01997a00-0000-7000-8000-0000000003a1",
+    )
+    .await;
+    let read = call(
+        &service,
+        "GET",
+        "/api/v1/store/schedule-x/prescription-annotations",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(read.status, 403, "{:?}", read.body);
+    let write = record_annotation_over_http(&service, &cashier, &line_id, true).await;
+    assert_eq!(write.status, 403, "{:?}", write.body);
+
+    // Nothing was written, and the pharmacist path still works.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_x_prescription_annotations")
+        .fetch_one(&pool)
+        .await
+        .expect("rows");
+    assert_eq!(rows, 0);
+    pool.close().await;
+}
+
+/// D3A-6. Two confirmations of the same occasion at the same instant. Exactly one durable fact
+/// survives, and the loser is told so rather than being handed a second.
+#[tokio::test]
+async fn real_service_keeps_one_prescription_annotation_under_a_race_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+
+    let (first, second) = tokio::join!(
+        record_annotation_over_http(&service, &world.cookie, &line_id, true),
+        record_annotation_over_http(&service, &world.cookie, &line_id, true),
+    );
+    // Whichever order they landed in, neither is an error and neither invents a second fact.
+    for reply in [&first, &second] {
+        assert!(
+            reply.status == 201 || reply.status == 200,
+            "{:?}",
+            reply.body
+        );
+    }
+    assert_eq!(
+        first.body["id"], second.body["id"],
+        "two facts were written"
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM schedule_x_prescription_annotations WHERE sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows, 1);
+    pool.close().await;
+}
+
+/// D3A-7. Rule 65(2) — active is not the same as registered on the day.
+///
+/// A pharmacist whose registration had expired before the receipt cannot authenticate the physical
+/// Schedule X register entry for it, and the database refuses the same transition on its own.
+#[tokio::test]
+async fn real_service_refuses_a_schedule_x_confirmation_by_a_lapsed_pharmacist_over_http() {
+    let service = start().await;
+    let world = seed_purchase_world(&service, MAHARASHTRA, "taxable").await;
+    purchase_finding_over_http(&service, &world, "schedule_x", true).await;
+    let professional = purchase_pharmacist_over_http(&service, &world).await;
+    post_purchase_over_http(
+        &service,
+        &world,
+        "INV-9401",
+        "01997a00-0000-7000-8000-000000000d41",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("entry")
+        .to_owned();
+    let confirm_uri = format!("/api/v1/store/schedule-x/register/{entry_id}/confirm");
+    let body = json!({
+        "supervisingProfessionalId": professional,
+        "particularsEnteredInPhysicalRegister": true,
+        "physicalEntryAuthenticated": true,
+    });
+
+    // The registration lapsed before this receipt. The record is still ACTIVE, which is exactly the
+    // gap Phase 1M-D3 found: active said nothing about the date.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    sqlx::query("UPDATE store_professionals SET valid_upto='2026-01-31' WHERE id=?")
+        .bind(&professional)
+        .execute(&pool)
+        .await
+        .expect("lapse the registration");
+    let still_active: String =
+        sqlx::query_scalar("SELECT status FROM store_professionals WHERE id=?")
+            .bind(&professional)
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+    assert_eq!(still_active, "active");
+
+    let lapsed = call(
+        &service,
+        "POST",
+        &confirm_uri,
+        Some(body.clone()),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(lapsed.status, 409, "{:?}", lapsed.body);
+    assert_eq!(
+        lapsed.body["code"],
+        "schedule_x_pharmacist_not_valid_on_date"
+    );
+
+    // Not yet registered on the day is refused for the same reason, from the other side.
+    sqlx::query(
+        "UPDATE store_professionals SET valid_from='2027-01-01',valid_upto=NULL WHERE id=?",
+    )
+    .bind(&professional)
+    .execute(&pool)
+    .await
+    .expect("move the start");
+    let early = call(
+        &service,
+        "POST",
+        &confirm_uri,
+        Some(body.clone()),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(early.status, 409, "{:?}", early.body);
+    assert_eq!(
+        early.body["code"],
+        "schedule_x_pharmacist_not_valid_on_date"
+    );
+
+    // The database refuses the same transition on its own, so the service is not the only guard.
+    let forged = sqlx::query(
+        "UPDATE store_schedule_x_register_entries SET status='confirmed',\
+         particulars_entered_in_physical_register=1,physical_entry_authenticated=1,\
+         supervising_professional_id=?,supervising_professional_name='Meera Iyer',\
+         supervising_registration_number='MH-PH-44821',confirmed_by_user_id=\
+         (SELECT id FROM users WHERE role='owner_admin' LIMIT 1),\
+         confirmed_at_utc='2026-09-29T06:00:00.000Z',updated_at_utc='2026-09-29T06:00:00.000Z' \
+         WHERE id=?",
+    )
+    .bind(&professional)
+    .bind(&entry_id)
+    .execute(&pool)
+    .await;
+    assert!(forged.is_err(), "direct SQL confirmed with a lapsed record");
+    assert!(
+        forged
+            .unwrap_err()
+            .to_string()
+            .contains("schedule_x_register_entry_immutable"),
+        "the transition guard did not refuse it"
+    );
+
+    // Restored to a registration that actually covers the receipt, the confirmation goes through.
+    sqlx::query(
+        "UPDATE store_professionals SET valid_from='2020-01-01',valid_upto=NULL WHERE id=?",
+    )
+    .bind(&professional)
+    .execute(&pool)
+    .await
+    .expect("restore");
+    pool.close().await;
+    let confirmed = call(
+        &service,
+        "POST",
+        &confirm_uri,
+        Some(body),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    assert_eq!(confirmed.body["status"], "confirmed");
+}
+
+/// D3A-8, the hard final boundary. THE MANDATORY PROOF.
+///
+/// Every fact Phase 1M-D3-A knows how to record is on file: the Schedule X classification, an
+/// in-force Form 20F with this drug written onto it, a valid prescription for the exact product
+/// within its repeat and quantity authority, the retained duplicate copy, the NEW rule 65(11)(c)
+/// annotation, a registered pharmacist whose record covers the day, and a Schedule X receipt
+/// working entry whose physical register acts are confirmed and closed.
+///
+/// The sale is still refused, because the supply workflow does not exist. Prescription-side
+/// compliance facts are not an authority to dispense, and this phase does not pretend otherwise.
+#[tokio::test]
+async fn real_service_keeps_schedule_x_refused_with_every_d3a_fact_present_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    // Form 20F authority, in force, with this drug covered.
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    assert_eq!(
+        authority_over_http(&service, &world, SALE_DATE).await["state"],
+        "established"
+    );
+
+    // Receipt provenance: a posted Purchase of this drug, with its Schedule X working entry
+    // confirmed in the bound register and then closed.
+    sale_world_purchase_over_http(
+        &service,
+        &world,
+        "INV-D3A-1",
+        "01997a00-0000-7000-8000-000000000e11",
+    )
+    .await;
+    let register = register_over_http(&service, &world.cookie).await;
+    let entry_id = register["entries"][0]["id"]
+        .as_str()
+        .expect("receipt entry")
+        .to_owned();
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    let closed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{:?}", closed.body);
+    assert_eq!(closed.body["status"], "finalized");
+
+    // The prescription, the draft, and both prescription-side facts.
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, sale_revision) =
+        prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(&service, &world, &sale_id).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+
+    // Everything this software can record is recorded. The counter still refuses.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-0000000002f8",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+
+    // The Sale is still a draft, with no number, no stock movement, no dispensing, and no supply
+    // entry anywhere in the Schedule X register.
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let outflow: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("movements");
+    assert_eq!(outflow, 0, "a refused Schedule X sale moved stock");
+    let dispensings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("dispensings");
+    assert_eq!(dispensings, 0);
+    let supplies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE entry_kind='supply'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("supply entries");
+    assert_eq!(supplies, 0, "a Schedule X supply entry was created");
+
+    // The annotation survives the refusal: the paper was written on, and a refused sale does not
+    // unwrite it.
+    let surviving: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM schedule_x_prescription_annotations WHERE sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("annotations");
+    assert_eq!(surviving, 1);
+    pool.close().await;
+
+    // And the refusal still says nothing that would frighten a pharmacist into thinking the drug
+    // is unlawful. It is lawful; this software simply cannot keep its register yet.
+    let text = refused.body.to_string().to_lowercase();
+    for word in ["banned", "prohibit", "illegal"] {
+        assert!(!text.contains(word), "{word}: {:?}", refused.body);
+    }
+}
+
+/// D3A-9, item 22. Migration 0027 adds compliance evidence, so the existing backup path has to
+/// carry it — unchanged, with its frozen particulars intact and its professional linkage still
+/// sound. No backup format change was needed: `VACUUM INTO` takes the whole file, and a new table
+/// is simply part of the file.
+#[tokio::test]
+async fn real_service_carries_the_prescription_annotation_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_sale_world(service, 1).await;
+    schedule_over_http(service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(service, &world).await;
+    let (prescription, item) = prescription_over_http(service, &world, None, 20).await;
+    let (sale_id, _) = prepared_sale_over_http(service, &world, &item, &professional, 1).await;
+    let line_id = sale_line_id_over_http(service, &world, &sale_id).await;
+
+    // Both prescription-side facts of this phase and of D2, recorded before the backup.
+    let duplicate = call(
+        service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+    let recorded = record_annotation_over_http(service, &world.cookie, &line_id, true).await;
+    assert_eq!(recorded.status, 201, "{:?}", recorded.body);
+    let annotation_id = recorded.body["id"].as_str().expect("id").to_owned();
+    let seller_name = recorded.body["sellerName"]
+        .as_str()
+        .expect("seller name")
+        .to_owned();
+    let seller_address = recorded.body["sellerAddress"]
+        .as_str()
+        .expect("seller address")
+        .to_owned();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let backup_id = created.body["backupId"]
+        .as_str()
+        .expect("backup id")
+        .to_owned();
+    let resolved = call(
+        service,
+        "GET",
+        &format!("/api/v1/backups/{backup_id}/download"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(resolved.status, 200, "{:?}", resolved.body);
+    let url = resolved.body["url"].as_str().expect("url").to_owned();
+    let (status, _, downloaded) = get_bytes(service, &url, Some(&world.cookie)).await;
+    assert_eq!(status, 200);
+
+    // Something happens after the backup that the restore must undo, so the assertions below prove
+    // a real restore rather than a database that was never changed.
+    let after = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Post-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(after.status, 201, "{:?}", after.body);
+
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &downloaded,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    assert_eq!(prepared["report"]["compatibility"], "ready");
+    let token = prepared["candidateToken"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({ "candidateToken": token, "password": "Integration-Password-42" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    // The restore really happened.
+    let post_backup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM parties WHERE display_name='Post-Backup Supplier'",
+    )
+    .fetch_one(&reopened)
+    .await
+    .expect("parties");
+    assert_eq!(post_backup, 0, "the restore did not roll the pharmacy back");
+
+    // And the compliance evidence came back, with every frozen particular exactly as it was.
+    let restored: (String, String, String, String, String, String) = sqlx::query_as(
+        "SELECT seller_name,seller_address,dispensing_date,attested_on_store_date,\
+         prescription_id,sale_line_id FROM schedule_x_prescription_annotations WHERE id=?",
+    )
+    .bind(&annotation_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("the rule 65(11)(c) attestation did not survive the restore");
+    assert_eq!(restored.0, seller_name);
+    assert_eq!(restored.1, seller_address);
+    assert_eq!(restored.2, SALE_DATE);
+    assert_eq!(restored.4, prescription);
+    assert_eq!(restored.5, line_id);
+
+    // The rule 65(9)(a) fact came back too, and both are still append-only after a restore.
+    let duplicates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM prescription_duplicate_copy_attestations")
+            .fetch_one(&reopened)
+            .await
+            .expect("duplicate copy attestations");
+    assert_eq!(duplicates, 1);
+    let still_guarded = sqlx::query("DELETE FROM schedule_x_prescription_annotations WHERE id=?")
+        .bind(&annotation_id)
+        .execute(&reopened)
+        .await;
+    assert!(
+        still_guarded.is_err(),
+        "the restored database lost its append-only guard"
+    );
+
+    // The professional linkage is still sound: the pharmacist the Sale names is a registered
+    // pharmacist of this store, and the attestation's occasion still points at that Sale.
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM schedule_x_prescription_annotations annotation \
+         JOIN sale_documents document ON document.id=annotation.sale_document_id \
+         JOIN store_professionals professional \
+           ON professional.id=document.supervising_professional_id \
+         WHERE annotation.id=? AND professional.store_id=annotation.store_id \
+           AND professional.status='active' AND professional.capacity='registered_pharmacist' \
+           AND (professional.valid_from IS NULL \
+                OR professional.valid_from<=annotation.dispensing_date) \
+           AND (professional.valid_upto IS NULL \
+                OR professional.valid_upto>=annotation.dispensing_date)",
+    )
+    .bind(&annotation_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("linkage");
+    assert_eq!(linked, 1, "the professional linkage did not survive intact");
+
+    // And a restored pharmacy still refuses a Schedule X sale.
+    let schemes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE entry_kind='supply'",
+    )
+    .fetch_one(&reopened)
+    .await
+    .expect("supply entries");
+    assert_eq!(schemes, 0);
+    reopened.close().await;
+}

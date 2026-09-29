@@ -3241,6 +3241,64 @@ export const DuplicateCopyAttestationSchema = z.object({
   note: z.string().nullable()
 });
 
+/**
+ * Phase 1M-D3-A, rule 65(11)(c): a dispensing occasion on which the seller particulars still have
+ * to be written on the physical prescription. Carries the prescription's own reference and never
+ * the patient's or the prescriber's name — the list points at a piece of paper, nothing more.
+ */
+export const ScheduleXPendingAnnotationOccasionSchema = z.object({
+  saleDocumentId: z.string(),
+  saleLineId: z.string(),
+  prescriptionId: z.string(),
+  prescriptionItemId: z.string(),
+  productId: z.string(),
+  drugName: z.string(),
+  quantityAtoms: z.number().int(),
+  dispensingDate: z.string(),
+  prescriptionReference: z.string()
+});
+
+/**
+ * One recorded confirmation that the physical act of rule 65(11)(c) was done, with the particulars
+ * the operator was shown frozen beside it. The seller name, the seller address and the dispensing
+ * date read here exactly as they read on the day, whatever Store Profile says later.
+ */
+export const ScheduleXPrescriptionAnnotationSchema = z.object({
+  id: z.string(),
+  saleDocumentId: z.string(),
+  saleLineId: z.string(),
+  prescriptionId: z.string(),
+  prescriptionItemId: z.string(),
+  productId: z.string(),
+  sellerName: z.string(),
+  sellerAddress: z.string(),
+  dispensingDate: z.string(),
+  /** The store's own calendar day when the confirmation was made, beside the dispensing date. */
+  attestedOnStoreDate: z.string(),
+  attestedByUserId: z.string(),
+  attestedAtUtc: z.string(),
+  note: z.string().nullable()
+});
+
+export const ScheduleXPrescriptionAnnotationsSchema = z.object({
+  pendingOccasions: z.array(ScheduleXPendingAnnotationOccasionSchema),
+  annotations: z.array(ScheduleXPrescriptionAnnotationSchema),
+  /** What a confirmation would freeze right now, or null when the Store has not recorded it. */
+  sellerName: z.string().nullable(),
+  sellerAddress: z.string().nullable(),
+  sellerMissing: z.array(z.enum(["legalName", "addressLine1", "saleLicence"]))
+});
+
+/**
+ * There is deliberately no date field. The dispensing date comes from the draft Sale, so nothing
+ * typed into a screen can become the authoritative one.
+ */
+export const RecordScheduleXPrescriptionAnnotationRequestSchema = z.object({
+  saleLineId: z.string(),
+  sellerParticularsNotedOnPrescription: z.boolean(),
+  note: z.string().nullable().optional()
+});
+
 export type ScheduleXEntryKind = z.infer<typeof ScheduleXEntryKindSchema>;
 export type ScheduleXEntryStatus = z.infer<typeof ScheduleXEntryStatusSchema>;
 export type ScheduleXParticularState = z.infer<typeof ScheduleXParticularStateSchema>;
@@ -3251,3 +3309,15 @@ export type ConfirmScheduleXEntryRequest = z.infer<typeof ConfirmScheduleXEntryR
 export type VoidScheduleXEntryRequest = z.infer<typeof VoidScheduleXEntryRequestSchema>;
 export type DuplicateCopyAttestationRequest = z.infer<typeof DuplicateCopyAttestationRequestSchema>;
 export type DuplicateCopyAttestation = z.infer<typeof DuplicateCopyAttestationSchema>;
+export type ScheduleXPendingAnnotationOccasion = z.infer<
+  typeof ScheduleXPendingAnnotationOccasionSchema
+>;
+export type ScheduleXPrescriptionAnnotation = z.infer<
+  typeof ScheduleXPrescriptionAnnotationSchema
+>;
+export type ScheduleXPrescriptionAnnotations = z.infer<
+  typeof ScheduleXPrescriptionAnnotationsSchema
+>;
+export type RecordScheduleXPrescriptionAnnotationRequest = z.infer<
+  typeof RecordScheduleXPrescriptionAnnotationRequestSchema
+>;

@@ -21,7 +21,12 @@ const IDs = {
   product: "01997c00-0000-7000-8000-000000000001",
   purchase: "01997c00-0000-7000-8000-000000000080",
   purchaseLine: "01997c00-0000-7000-8000-000000000081",
-  pharmacist: "01997c00-0000-7000-8000-000000000090"
+  pharmacist: "01997c00-0000-7000-8000-000000000090",
+  sale: "01997c00-0000-7000-8000-0000000000a0",
+  saleLine: "01997c00-0000-7000-8000-0000000000a1",
+  prescription: "01997c00-0000-7000-8000-0000000000a2",
+  prescriptionItem: "01997c00-0000-7000-8000-0000000000a3",
+  annotation: "01997c00-0000-7000-8000-0000000000a4"
 };
 const system = {
   status: "ok",
@@ -90,7 +95,46 @@ function failure(code: string, status: number) {
   );
 }
 
-type Options = { role?: UserRole; register?: Record<string, unknown> };
+/** Phase 1M-D3-A — a dispensing occasion waiting for the rule 65(11)(c) note. */
+function occasion(overrides: Record<string, unknown> = {}) {
+  return {
+    saleDocumentId: IDs.sale,
+    saleLineId: IDs.saleLine,
+    prescriptionId: IDs.prescription,
+    prescriptionItemId: IDs.prescriptionItem,
+    productId: IDs.product,
+    drugName: "Schedule X Test Medicine A",
+    quantityAtoms: 10,
+    dispensingDate: "2026-09-12",
+    prescriptionReference: "RX-000001",
+    ...overrides
+  };
+}
+
+function annotation(overrides: Record<string, unknown> = {}) {
+  return {
+    id: IDs.annotation,
+    saleDocumentId: IDs.sale,
+    saleLineId: IDs.saleLine,
+    prescriptionId: IDs.prescription,
+    prescriptionItemId: IDs.prescriptionItem,
+    productId: IDs.product,
+    sellerName: "Care Pharmacy Private Limited",
+    sellerAddress: "12 Market Road, Pune, 411001",
+    dispensingDate: "2026-09-12",
+    attestedOnStoreDate: "2026-09-12",
+    attestedByUserId: IDs.user,
+    attestedAtUtc: "2026-09-12T07:00:00Z",
+    note: null,
+    ...overrides
+  };
+}
+
+type Options = {
+  role?: UserRole;
+  register?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+};
 
 function service(options: Options = {}) {
   const role = options.role ?? "owner_admin";
@@ -110,6 +154,22 @@ function service(options: Options = {}) {
       return response({ entries: [entry()], legacyReceipts: [], ...options.register });
     }
     if (url.pathname === "/api/v1/store/professionals") return response([pharmacist]);
+    // Phase 1M-D3-A — rule 65(11)(c).
+    if (url.pathname === "/api/v1/store/schedule-x/prescription-annotations") {
+      if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
+      if (method === "POST") {
+        writes.push({ path: url.pathname, body });
+        return response(annotation(), 201);
+      }
+      return response({
+        pendingOccasions: [occasion()],
+        annotations: [],
+        sellerName: "Care Pharmacy Private Limited",
+        sellerAddress: "12 Market Road, Pune, 411001",
+        sellerMissing: [],
+        ...options.annotations
+      });
+    }
     if (/\/schedule-x\/register\/[^/]+\/confirm$/.test(url.pathname) && method === "POST") {
       if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
       writes.push({ path: url.pathname, body });
@@ -373,6 +433,11 @@ describe("the Schedule X working record", () => {
   it("scrolls the particulars sideways rather than dropping any of them", async () => {
     renderApp("/app/settings/schedule-x");
     await awaitAdvisory();
+    // Scoped to the working-entries table. The page also carries the Phase 1M-D3-A rule 65(11)(c)
+    // section, whose table shares some column names; a document-wide query would conflate them.
+    const entries = within(
+      screen.getByTestId(`schedule-x-entry-${IDs.entry}`).closest("table") as HTMLElement
+    );
     // Every rule 65(21)(b) receipt particular has its own column; none is omitted to fit.
     for (const header of [
       "AUSHADHARTH reference",
@@ -387,7 +452,7 @@ describe("the Schedule X working record", () => {
       "Bill",
       "Physical register"
     ]) {
-      expect(screen.getByRole("columnheader", { name: header })).toBeInTheDocument();
+      expect(entries.getByRole("columnheader", { name: header })).toBeInTheDocument();
     }
     expect(document.querySelector(".table-scroll")).not.toBeNull();
   });
@@ -429,8 +494,11 @@ describe("the Schedule X working record on a narrow viewport", () => {
       "Actions"
     ]);
     // Each label matches the column header it came from, so the two presentations cannot drift.
+    // Scoped to this row's own table: the page also carries the rule 65(11)(c) section, whose
+    // table shares some column names.
+    const entries = within(row.closest("table") as HTMLElement);
     for (const label of labels.filter((name) => name && name !== "Actions")) {
-      expect(screen.getByRole("columnheader", { name: label as string })).toBeInTheDocument();
+      expect(entries.getByRole("columnheader", { name: label as string })).toBeInTheDocument();
     }
   });
 
@@ -527,5 +595,169 @@ describe("the Schedule X working record on a narrow viewport", () => {
     expect(within(dialog).getByLabelText("Supervising registered pharmacist")).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Record confirmation" })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Phase 1M-D3-A — rule 65(11)(c), the note on the physical prescription.
+ *
+ * The attack here is the same as D2's, one step closer to the paper: a screen that calls a click a
+ * signature, or quietly claims to have annotated a prescription it has never touched. These tests
+ * check the wording as carefully as the behaviour.
+ */
+describe("the rule 65(11)(c) prescription annotation", () => {
+  // The heading renders before the query settles, so gating on it alone would assert against a
+  // still-loading section. The wait is a readiness budget only; every assertion below stays exact.
+  const awaitAnnotations = async () => {
+    await screen.findByRole("heading", { name: "Note on the prescription" }, { timeout: 3000 });
+    const section = screen.getByTestId("schedule-x-annotations");
+    await waitFor(
+      () =>
+        expect(
+          within(section).queryByText("Loading prescription annotations…")
+        ).not.toBeInTheDocument(),
+      { timeout: 3000 }
+    );
+    return section;
+  };
+
+  it("says a person writes on the prescription and the software does not", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = within(await awaitAnnotations());
+    expect(
+      section.getByText(/AUSHADHARTH records this confirmation; it does not write on or sign the prescription/)
+    ).toBeInTheDocument();
+    // Never these words, anywhere on the surface.
+    const text = (await awaitAnnotations()).textContent ?? "";
+    for (const forbidden of [
+      "e-sign",
+      "esign",
+      "digital signature",
+      "electronic annotation",
+      "compliant prescription",
+      "legally completed"
+    ]) {
+      expect(text.toLowerCase()).not.toContain(forbidden);
+    }
+  });
+
+  it("shows the particulars to write, and never a patient or prescriber name", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = within(await awaitAnnotations());
+    // The prescription is named by its own reference, not by whoever it is for.
+    expect(section.getByText("RX-000001")).toBeInTheDocument();
+    expect(section.getByText("Schedule X Test Medicine A")).toBeInTheDocument();
+    expect(section.getByText("2026-09-12")).toBeInTheDocument();
+
+    fireEvent.click(section.getByRole("button", { name: "Confirm note written" }));
+    const dialog = await screen.findByRole("dialog");
+    const particulars = within(dialog).getByTestId("schedule-x-annotation-particulars");
+    // Exactly the three things rule 65(11)(c) names.
+    expect(particulars.textContent).toContain("Care Pharmacy Private Limited");
+    expect(particulars.textContent).toContain("12 Market Road, Pune, 411001");
+    expect(particulars.textContent).toContain("2026-09-12");
+    expect(particulars.textContent).toContain("above the prescriber's signature");
+  });
+
+  it("starts unchecked, labels the box, and sends only the confirmation", async () => {
+    const double = renderApp("/app/settings/schedule-x");
+    await awaitAnnotations();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm note written" }));
+    const dialog = await screen.findByRole("dialog");
+
+    const boxes = within(dialog).getAllByRole("checkbox");
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0]).not.toBeChecked();
+    // The statement lives in the label that owns the box, so the association survives restyling.
+    const label = boxes[0].closest("label") as HTMLElement;
+    expect(label).not.toBeNull();
+    expect(label.textContent).toContain(
+      "written on the physical prescription above the prescriber's signature"
+    );
+    // The action stays unavailable until the person actually confirms.
+    const submit = within(dialog).getByRole("button", { name: "Record confirmation" });
+    expect(submit).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toBeEnabled();
+    expect(within(dialog).getByLabelText("Note (optional)")).toBeInTheDocument();
+
+    fireEvent.click(boxes[0]);
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(double.writes).toHaveLength(1));
+    expect(double.writes[0].path).toBe("/api/v1/store/schedule-x/prescription-annotations");
+    expect(double.writes[0].body).toEqual({
+      saleLineId: IDs.saleLine,
+      sellerParticularsNotedOnPrescription: true,
+      note: null
+    });
+    // THE DATE IS NOT SENT. It comes from the draft Sale, so nothing typed here can become the
+    // authoritative dispensing date.
+    expect(double.writes[0].body).not.toHaveProperty("dispensingDate");
+  });
+
+  it("shows the frozen particulars of a recorded confirmation, not today's profile", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({
+        annotations: {
+          pendingOccasions: [],
+          annotations: [annotation()],
+          // The pharmacy has since been renamed and has moved.
+          sellerName: "Renamed Pharmacy LLP",
+          sellerAddress: "99 Another Road, Pune, 411002",
+          sellerMissing: []
+        }
+      })
+    );
+    const section = within(await awaitAnnotations());
+    const list = within(section.getByTestId("schedule-x-annotation-list"));
+    expect(list.getByText("Care Pharmacy Private Limited")).toBeInTheDocument();
+    expect(list.getByText("12 Market Road, Pune, 411001")).toBeInTheDocument();
+    // Today's profile does not overwrite what the record says was written on the paper.
+    expect(list.queryByText("Renamed Pharmacy LLP")).not.toBeInTheDocument();
+    // The state is named in words, not by colour alone.
+    expect(list.getByText("Noted on the prescription")).toBeInTheDocument();
+  });
+
+  it("refuses to offer a confirmation the pharmacy cannot truthfully make", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({
+        annotations: {
+          pendingOccasions: [occasion()],
+          annotations: [],
+          sellerName: null,
+          sellerAddress: null,
+          sellerMissing: ["legalName"]
+        }
+      })
+    );
+    const section = within(await awaitAnnotations());
+    expect(section.getByTestId("schedule-x-seller-missing")).toBeInTheDocument();
+    expect(
+      section.getByText(/Record them in Store Profile before confirming anything here/)
+    ).toBeInTheDocument();
+    expect(section.getByRole("button", { name: "Confirm note written" })).toBeDisabled();
+  });
+
+  it("keeps the annotation surface away from a cashier", async () => {
+    renderApp("/app/settings/schedule-x", service({ role: "cashier" }));
+    expect(
+      await screen.findByRole("heading", { name: "This record is not available to your role" }, { timeout: 3000 })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Note on the prescription" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm note written" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the rule 65(9)(a) duplicate copy and the rule 65(11)(c) note separate", async () => {
+    renderApp("/app/settings/schedule-x");
+    await awaitAnnotations();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm note written" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    // One statement about one physical act. The retained duplicate copy is a different fact and is
+    // not merged into this confirmation.
+    expect(dialog.getAllByRole("checkbox")).toHaveLength(1);
+    expect(dialog.queryByText(/duplicate/i)).not.toBeInTheDocument();
+    expect(dialog.queryByText(/retained/i)).not.toBeInTheDocument();
   });
 });

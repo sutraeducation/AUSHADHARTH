@@ -19,6 +19,40 @@ use sqlx::{Sqlite, pool::PoolConnection};
 
 use crate::domain::regulatory::{Resolution, resolve_for_product};
 
+/// The calendar day(s) the current instant can be in the store's own time.
+///
+/// Phase 1M-B established this policy on the Sale path and Phase 1M-D3-A needs the same answer for
+/// the Schedule X compliance facts, so it lives here and both callers share it rather than each
+/// keeping its own idea of what day it is.
+///
+/// Every store this software creates records `Asia/Kolkata`, which observes no daylight saving and
+/// sits at a fixed UTC+05:30, so its day is exact. Any other recorded zone cannot be resolved here
+/// without a time-zone database, so the answer widens to every day the instant could fall on
+/// anywhere — yesterday, today and tomorrow in UTC — and the caller takes the strictest of them.
+/// That can refuse something up to a day early around a boundary; it can never let one through late.
+pub async fn store_days(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    let zone: Option<String> =
+        sqlx::query_scalar("SELECT business_time_zone FROM store_identity LIMIT 1")
+            .fetch_optional(&mut *connection)
+            .await?;
+    if zone.as_deref() == Some("Asia/Kolkata") {
+        let today: String =
+            sqlx::query_scalar("SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes')")
+                .fetch_one(&mut *connection)
+                .await?;
+        return Ok(vec![today]);
+    }
+    let window: (String, String, String) = sqlx::query_as(
+        "SELECT strftime('%Y-%m-%d','now','-1 day'),strftime('%Y-%m-%d','now'),\
+         strftime('%Y-%m-%d','now','+1 day')",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(vec![window.0, window.1, window.2])
+}
+
 /// A posted Purchase's frozen header particulars, exactly as Phase 1M-D1-A wrote them.
 ///
 /// Read from the document, never from the Party: a supplier renamed next year does not change what

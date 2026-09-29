@@ -221,6 +221,12 @@ export function safeErrorMessage(code?: string): string {
     case "state_restricted_drug_workflow_not_available": return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
     case "state_regulatory_position_unresolved": return "This medicine's position under the Punjab drug-control boundary is not recorded, or the store's premises State is not recorded.";
     case "schedule_x_workflow_not_available": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
+    // Phase 1M-D3-A: rule 65(11)(c), the note written on the physical prescription.
+    case "schedule_x_pharmacist_not_valid_on_date": return "That registered pharmacist's record does not cover the date of this transaction.";
+    case "schedule_x_seller_particulars_unavailable": return "Record the pharmacy's name and address in Store Profile before confirming what was written on the prescription.";
+    case "schedule_x_prescription_annotation_not_confirmed": return "Tick the confirmation to record that the note was written on the prescription.";
+    case "schedule_x_prescription_annotation_already_recorded": return "This dispensing occasion already has a prescription annotation confirmation.";
+    case "schedule_x_dispensing_date_in_future": return "This sale's date is later than today, so the prescription cannot yet have been dispensed.";
     case "prescription_requirements_incomplete": return "This prescription sale is missing prescription requirements.";
     case "prescription_record_election_unresolved": return "The pharmacy's rule 65(3)(2) prescription-supply record election is not recorded. The owner records it in Drug Compliance.";
     case "prescription_record_prepared": return "This sale's prescription-supply entry is prepared, so the sale cannot be changed. Void the entry to change it; its serial is not reused.";

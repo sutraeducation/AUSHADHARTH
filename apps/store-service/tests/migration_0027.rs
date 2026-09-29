@@ -1,19 +1,24 @@
-//! Migration 0026 against a database that already holds the Phase 1M-A..D1-B records.
+//! Migration 0027 against a database that already holds the Phase 1M-A..D2 records.
 //!
-//! 0026 adds the Schedule X working record: one register with two entry kinds, the two physical-act
-//! attestations rule 65(21) implies, and the rule 65(9)(a) retained-duplicate fact. The outcomes that
-//! must never happen are a working record appearing for a receipt nobody recorded one for, a page
-//! number entering the schema, a finalized entry changing, one purchase line acquiring two live
-//! entries, a reference being reissued, and the audit log losing an event while it is rebuilt.
+//! 0027 adds the two prescription-side Schedule X compliance facts Phase 1M-D3 identified: the rule
+//! 65(11)(c) attestation that the seller particulars were written on the physical prescription, and
+//! the rule 65(2) hardening that the registered pharmacist named on a Schedule X register entry was
+//! actually registered on the date of the transaction being attested.
+//!
+//! The outcomes that must never happen are: an attestation appearing for a drug that is not in
+//! Schedule X; an attestation whose frozen seller particulars or dispensing date can be changed
+//! afterwards; two live attestations for one dispensing occasion; the audit rebuild losing an event
+//! or a column; the 0026 transition trigger losing a clause while it is replaced; and — above all —
+//! this migration enabling a Schedule X sale, which it does not touch.
 //!
 //! ```text
-//! cargo test --test migration_0026
+//! cargo test --test migration_0027
 //! ```
 use std::path::{Path, PathBuf};
 
 use sqlx::{SqlitePool, migrate::Migrator, sqlite::SqliteConnectOptions};
 
-const NEW_MIGRATION: i64 = 26;
+const NEW_MIGRATION: i64 = 27;
 
 fn migrations_directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations")
@@ -145,32 +150,12 @@ const PRODUCT_X: &str = "01997000-0000-7000-8000-0000000000d1";
 const PRODUCT_PLAIN: &str = "01997000-0000-7000-8000-0000000000d2";
 const POSTED: &str = "01997000-0000-7000-8000-000000000605";
 const POSTED_LINE: &str = "01997000-0000-7000-8000-000000000606";
-const POSTED_PLAIN_LINE: &str = "01997000-0000-7000-8000-000000000609";
-const POSTED_TWO: &str = "01997000-0000-7000-8000-000000000607";
-const POSTED_TWO_LINE: &str = "01997000-0000-7000-8000-000000000608";
-const INVOICE_DATE_TWO: &str = "2026-05-05";
 const PHARMACIST: &str = "01997000-0000-7000-8000-000000000501";
 const INVOICE_DATE: &str = "2026-05-04";
 
-/// What 0026 adds.
-const NEW_TABLES: [&str; 2] = [
-    "prescription_duplicate_copy_attestations",
-    "store_schedule_x_register_entries",
-];
-
-const NEW_TRIGGERS: [&str; 6] = [
-    "prescription_duplicate_copy_attestations_coherent_insert",
-    "prescription_duplicate_copy_attestations_no_delete",
-    "prescription_duplicate_copy_attestations_no_update",
-    "store_schedule_x_register_entries_coherent_insert",
-    "store_schedule_x_register_entries_no_delete",
-    "store_schedule_x_register_entries_transition",
-];
-
-/// A pharmacy as it stands at 0025: a posted Purchase carrying full D1-A provenance, one drug the
 /// owner recorded inside Schedule X and one ordinary drug with no finding at all, a registered
 /// pharmacist, and an audit log with events already in it.
-async fn populate_before_0026(pool: &SqlitePool) {
+async fn populate_before_0027(pool: &SqlitePool) {
     for statement in [
         "INSERT INTO installation_identity (installation_id,created_at_utc) \
          VALUES ('01997000-0000-7000-8000-0000000000aa','2026-01-01T00:00:00.000Z')",
@@ -336,59 +321,114 @@ async fn populate_before_0026(pool: &SqlitePool) {
     }
 }
 
-/// Inserts a coherent receipt working entry for the seeded Schedule X purchase line.
-fn receipt_insert(id: &str, reference_value: i64) -> String {
-    receipt_insert_for(
+const PRESCRIPTION: &str = "01997000-0000-7000-8000-000000000701";
+const PRESCRIPTION_ITEM: &str = "01997000-0000-7000-8000-000000000702";
+const PRESCRIPTION_PLAIN: &str = "01997000-0000-7000-8000-000000000705";
+const PRESCRIPTION_PLAIN_ITEM: &str = "01997000-0000-7000-8000-000000000706";
+const DRAFT_SALE: &str = "01997000-0000-7000-8000-000000000703";
+const DRAFT_LINE: &str = "01997000-0000-7000-8000-000000000704";
+const DRAFT_PLAIN_LINE: &str = "01997000-0000-7000-8000-000000000707";
+const SALE_DATE: &str = "2026-05-06";
+
+/// What 0027 adds.
+const NEW_TABLES: [&str; 1] = ["schedule_x_prescription_annotations"];
+
+const NEW_TRIGGERS: [&str; 3] = [
+    "schedule_x_prescription_annotations_coherent_insert",
+    "schedule_x_prescription_annotations_no_delete",
+    "schedule_x_prescription_annotations_no_update",
+];
+
+/// A draft Sale carrying one Schedule X line and one ordinary line, each linked to a prescription
+/// item — the two dispensing occasions rule 65(11)(c) does and does not reach.
+async fn populate_dispensing_occasions(pool: &SqlitePool) {
+    for statement in [
+        // The ordinary drug needs a lot of its own: `sale_lines` binds the batch to the pack.
+        "INSERT INTO product_batches (id,product_pack_id,batch_number,normalized_batch_number,\
+         expires_on,created_at_utc,updated_at_utc) VALUES \
+         ('01997000-0000-7000-8000-0000000000e6','01997000-0000-7000-8000-0000000000e2','BX-02',\
+         'BX-02','2028-03-31','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')"
+            .to_owned(),
+        format!(
+            "INSERT INTO prescriptions (id,store_id,reference,prescribed_on,prescriber_name,\
+             prescriber_address,subject_kind,subject_name,subject_address,repeat_authority,\
+             written_signed_dated_attested,created_by_user_id,created_at_utc,updated_at_utc) \
+             VALUES ('{PRESCRIPTION}','{STORE}','RX-000001','2026-05-05','Dr. A. Prescriber',\
+             'Clinic Road','human','Test Patient','Patient Street','once',1,'{OWNER}',\
+             '2026-05-05T05:00:00.000Z','2026-05-05T05:00:00.000Z'),\
+             ('{PRESCRIPTION_PLAIN}','{STORE}','RX-000002','2026-05-05','Dr. A. Prescriber',\
+             'Clinic Road','human','Test Patient','Patient Street','once',1,'{OWNER}',\
+             '2026-05-05T05:00:00.000Z','2026-05-05T05:00:00.000Z')"
+        ),
+        format!(
+            "INSERT INTO prescription_items (id,prescription_id,line_number,product_id,\
+             written_description,prescribed_quantity_atoms,dose_text,created_at_utc,\
+             updated_at_utc) VALUES ('{PRESCRIPTION_ITEM}','{PRESCRIPTION}',1,'{PRODUCT_X}',\
+             'Tab. as prescribed',20,'1 tablet twice daily','2026-05-05T05:00:00.000Z',\
+             '2026-05-05T05:00:00.000Z'),\
+             ('{PRESCRIPTION_PLAIN_ITEM}','{PRESCRIPTION_PLAIN}',1,'{PRODUCT_PLAIN}',\
+             'Tab. as prescribed',20,'1 tablet twice daily','2026-05-05T05:00:00.000Z',\
+             '2026-05-05T05:00:00.000Z')"
+        ),
+        format!(
+            "INSERT INTO sale_documents (id,store_id,business_date,status,revision,\
+             created_by_user_id,created_at_utc,updated_at_utc) VALUES \
+             ('{DRAFT_SALE}','{STORE}','{SALE_DATE}','draft',1,'{OWNER}',\
+             '2026-05-06T05:00:00.000Z','2026-05-06T05:00:00.000Z')"
+        ),
+        format!(
+            "INSERT INTO sale_lines (id,sale_document_id,line_number,product_id,product_pack_id,\
+             batch_id,quantity_basis,quantity_packs,quantity_atoms,selling_rate_paise,\
+             created_at_utc,updated_at_utc,prescription_item_id) VALUES \
+             ('{DRAFT_LINE}','{DRAFT_SALE}',1,'{PRODUCT_X}',\
+             '01997000-0000-7000-8000-0000000000e1','01997000-0000-7000-8000-0000000000e5',\
+             'pack',1,10,8000,'2026-05-06T05:00:00.000Z','2026-05-06T05:00:00.000Z',\
+             '{PRESCRIPTION_ITEM}'),\
+             ('{DRAFT_PLAIN_LINE}','{DRAFT_SALE}',2,'{PRODUCT_PLAIN}',\
+             '01997000-0000-7000-8000-0000000000e2','01997000-0000-7000-8000-0000000000e6',\
+             'pack',1,10,8000,'2026-05-06T05:00:00.000Z','2026-05-06T05:00:00.000Z',\
+             '{PRESCRIPTION_PLAIN_ITEM}')"
+        ),
+    ] {
+        execute(pool, &statement).await;
+    }
+}
+
+/// A coherent rule 65(11)(c) attestation for the Schedule X occasion.
+fn annotation_insert(id: &str) -> String {
+    annotation_insert_for(
         id,
-        reference_value,
-        POSTED,
-        POSTED_LINE,
-        "INV-5501",
-        INVOICE_DATE,
+        DRAFT_LINE,
+        PRESCRIPTION,
+        PRESCRIPTION_ITEM,
+        PRODUCT_X,
+        SALE_DATE,
+        OWNER,
     )
 }
 
-/// The same, for the second posted Purchase, so a withdrawn entry can be replaced without
-/// colliding with the one live entry the first line already has.
-fn receipt_insert_two(id: &str, reference_value: i64) -> String {
-    receipt_insert_for(
-        id,
-        reference_value,
-        POSTED_TWO,
-        POSTED_TWO_LINE,
-        "INV-5502",
-        INVOICE_DATE_TWO,
-    )
-}
-
-fn receipt_insert_for(
+fn annotation_insert_for(
     id: &str,
-    reference_value: i64,
-    document: &str,
     line: &str,
-    bill: &str,
-    date: &str,
+    prescription: &str,
+    item: &str,
+    product: &str,
+    dispensing_date: &str,
+    actor: &str,
 ) -> String {
     format!(
-        "INSERT INTO store_schedule_x_register_entries (id,store_id,entry_kind,reference_value,\
-         reference,transaction_date,drug_name,product_id,batch_state,batch_number,\
-         manufacturer_state,manufacturer_name,quantity_atoms,quantity_packs,bill_number,bill_date,\
-         purchase_document_id,purchase_line_id,supplier_name,supplier_address_state,\
-         supplier_address,supplier_licence_state,supplier_licence_number,status,\
-         prepared_by_user_id,prepared_at_utc,\
-         particulars_entered_in_physical_register,physical_entry_authenticated,\
-         created_at_utc,updated_at_utc) VALUES \
-         ('{id}','{STORE}','receipt',{reference_value},'AXR-{reference_value:06}','{date}',\
-         'Schedule X Test Medicine A','{PRODUCT_X}','recorded','BX-01','recorded',\
-         'Meridian Laboratories',50,5,'{bill}','{date}','{document}','{line}',\
-         'Sunrise Distributors','recorded','14 Ware House Road','recorded',\
-         '20B-MH-9911 / 21B-MH-9912','prepared','{OWNER}','2026-05-04T06:00:00.000Z',0,0,\
-         '2026-05-04T06:00:00.000Z','2026-05-04T06:00:00.000Z')"
+        "INSERT INTO schedule_x_prescription_annotations (id,store_id,sale_document_id,\
+         sale_line_id,prescription_id,prescription_item_id,product_id,\
+         seller_particulars_noted_on_prescription,seller_name,seller_address,dispensing_date,\
+         attested_on_store_date,attested_by_user_id,attested_at_utc,note,created_at_utc) VALUES \
+         ('{id}','{STORE}','{DRAFT_SALE}','{line}','{prescription}','{item}','{product}',1,\
+         'Care Pharmacy Private Limited','12 Market Road, Pune, 411001','{dispensing_date}',\
+         '2026-05-06','{actor}','2026-05-06T06:00:00.000Z',NULL,'2026-05-06T06:00:00.000Z')"
     )
 }
 
-/// Phase 1M-D2, item 38. A database built from nothing reaches 0026, with the working record, every
-/// guard, and no page number anywhere.
+/// Phase 1M-D3-A, item 25A. A database built from nothing reaches 0027, with the rule 65(11)(c)
+/// attestation, its guards, and nothing resembling a signature or a page number.
 #[tokio::test]
 async fn a_fresh_database_migrates_to_the_new_version() {
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -424,60 +464,45 @@ async fn a_fresh_database_migrates_to_the_new_version() {
         );
     }
 
-    // Item 13. There is no page number, and no page concept, anywhere in the new schema.
-    for table in NEW_TABLES {
-        for column in columns_of(&pool, table).await {
-            assert!(
-                !column.contains("page"),
-                "{table}.{column} models a physical page"
-            );
-        }
-    }
-    let register_sql = &objects
-        .iter()
-        .find(|(kind, name, _)| kind == "table" && name == "store_schedule_x_register_entries")
-        .expect("register table")
-        .2;
-    for forbidden in [
-        "page_number",
-        "page_full",
-        "next_page",
-        "continuation",
-        "statutory_serial",
+    // The frozen particulars are all there, and nothing resembling a page number is.
+    let columns = columns_of(&pool, "schedule_x_prescription_annotations").await;
+    for expected in [
+        "seller_name",
+        "seller_address",
+        "dispensing_date",
+        "attested_on_store_date",
+        "attested_by_user_id",
+        "seller_particulars_noted_on_prescription",
     ] {
-        assert!(!register_sql.contains(forbidden), "{forbidden}");
+        assert!(columns.contains(&expected.to_owned()), "{expected} missing");
     }
-    // The reference is shaped so it cannot be mistaken for a register serial.
-    assert!(register_sql.contains("'AXR-'"), "{register_sql}");
+    for forbidden in ["page_number", "page", "signature", "signature_image"] {
+        assert!(
+            !columns.iter().any(|column| column == forbidden),
+            "{forbidden} entered the schema"
+        );
+    }
 
-    // The audit log knows both new entity types, and the scratch copy is gone.
-    let audit_sql = &objects
+    // The audit log admits the new entity type and keeps every column it had.
+    let audit = columns_of(&pool, "master_change_events").await;
+    assert_eq!(audit.len(), 11, "the audit rebuild changed the columns");
+    assert!(audit.contains(&"terminal_id".to_owned()));
+    let audit_sql = objects
         .iter()
         .find(|(kind, name, _)| kind == "table" && name == "master_change_events")
         .expect("audit table")
-        .2;
-    for expected in [
-        "schedule_x_register_entry",
-        "prescription_duplicate_copy_attestation",
-    ] {
-        assert!(
-            audit_sql.contains(expected),
-            "{expected} missing from audit"
-        );
-    }
-    for table in tables(&pool).await {
-        assert!(
-            !table.contains("_phase1"),
-            "scratch table left behind: {table}"
-        );
-    }
+        .2
+        .clone();
+    assert!(audit_sql.contains("schedule_x_prescription_annotation"));
+    assert!(audit_sql.contains("schedule_x_register_entry"));
     pool.close().await;
 }
 
-/// Phase 1M-D2, item 38. Against a pharmacy that already posted a Schedule X receipt under 0025:
-/// every row survives, and NOT ONE working record is invented for it.
+/// Phase 1M-D3-A, item 25A. 0027 arrives at a populated pharmacy and takes nothing away: every row
+/// of every table is where it was, every audit event survives the rebuild, and the only schema
+/// objects that change are the audit table and the one trigger this phase deliberately hardens.
 #[tokio::test]
-async fn the_new_migration_preserves_every_row_and_writes_no_working_record() {
+async fn the_new_migration_preserves_every_row_and_writes_no_attestation() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let before_directory = temp.path().join("before");
     let after_directory = temp.path().join("after");
@@ -487,16 +512,22 @@ async fn the_new_migration_preserves_every_row_and_writes_no_working_record() {
     let database = temp.path().join("populated.sqlite3");
     let pool = open(&database).await;
     run_migrations(&pool, &before_directory).await;
-    populate_before_0026(&pool).await;
+    populate_before_0027(&pool).await;
+    populate_dispensing_occasions(&pool).await;
+    execute(
+        &pool,
+        &receipt_insert("01997000-0000-7000-8000-000000000801", 1),
+    )
+    .await;
     structural_checks(&pool).await;
 
-    // Before 0026 there is no such table to write.
+    // Before 0027 there is no such table to write.
     assert!(
-        sqlx::query("SELECT 1 FROM store_schedule_x_register_entries")
+        sqlx::query("SELECT 1 FROM schedule_x_prescription_annotations")
             .fetch_optional(&pool)
             .await
             .is_err(),
-        "0025 already had the working record"
+        "0026 already had the rule 65(11)(c) attestation"
     );
 
     let before_objects = schema_objects(&pool).await;
@@ -513,12 +544,12 @@ async fn the_new_migration_preserves_every_row_and_writes_no_working_record() {
         .map(|(table, _, _)| table.as_str())
         .collect();
     for expected in [
-        "purchase_documents",
-        "purchase_lines",
-        "product_regulatory_classifications",
-        "store_professionals",
+        "store_schedule_x_register_entries",
+        "prescriptions",
+        "prescription_items",
+        "sale_documents",
+        "sale_lines",
         "master_change_events",
-        "products",
     ] {
         assert!(
             populated.contains(&expected),
@@ -531,18 +562,26 @@ async fn the_new_migration_preserves_every_row_and_writes_no_working_record() {
     run_migrations(&pool, &after_directory).await;
     structural_checks(&pool).await;
 
-    // Only the audit log is redefined, and only to admit the two new entity types.
     let after_objects = schema_objects(&pool).await;
+    let mut redefined = Vec::new();
     for (kind, name, sql) in &before_objects {
         let after = after_objects
             .iter()
             .find(|(after_kind, after_name, _)| after_kind == kind && after_name == name)
             .unwrap_or_else(|| panic!("{kind} {name} was removed"));
-        if name == "master_change_events" {
-            continue;
+        if &after.2 != sql {
+            redefined.push(name.clone());
         }
-        assert_eq!(&after.2, sql, "{kind} {name} was redefined");
     }
+    redefined.sort();
+    assert_eq!(
+        redefined,
+        vec![
+            "master_change_events".to_owned(),
+            "store_schedule_x_register_entries_transition".to_owned(),
+        ],
+        "0027 redefined something it had no business touching"
+    );
 
     // Every pre-existing row of every pre-existing table, on its original columns.
     for (table, columns, rows) in &before_rows {
@@ -564,402 +603,258 @@ async fn the_new_migration_preserves_every_row_and_writes_no_working_record() {
             .expect("terminal ids");
     assert_eq!(terminal, vec![Some("TERMINAL-A".to_owned()), None]);
 
-    // NO BACKFILL. A posted Schedule X receipt sitting in the database when 0026 arrives does not
-    // acquire a working record it never had: legacy stays legacy, and the gap stays visible.
-    let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM store_schedule_x_register_entries")
-        .fetch_one(&pool)
-        .await
-        .expect("entries");
-    assert_eq!(entries, 0, "the migration invented a working record");
-    let attestations: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM prescription_duplicate_copy_attestations")
+    // NO BACKFILL. A draft Schedule X line sitting in the database when 0027 arrives does not
+    // acquire an attestation nobody made.
+    let annotations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schedule_x_prescription_annotations")
             .fetch_one(&pool)
             .await
-            .expect("attestations");
-    assert_eq!(attestations, 0);
+            .expect("annotations");
+    assert_eq!(annotations, 0, "the migration invented an attestation");
     pool.close().await;
 }
 
-/// Phase 1M-D2, item 38. A working entry must agree with the posted Purchase it claims to describe,
-/// and with the owner's own Schedule X finding.
+/// Phase 1M-D3-A, item 16. The rule 65(11)(c) attestation is true of the occasion it names or it is
+/// not written, whoever writes it. Every limb is refused by the database itself.
 #[tokio::test]
-async fn a_working_entry_must_agree_with_its_posted_purchase() {
+async fn an_attestation_must_agree_with_its_dispensing_occasion() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let directory = temp.path().join("migrations");
     migrations_up_to(NEW_MIGRATION, &directory);
     let pool = open(&temp.path().join("coherence.sqlite3")).await;
     run_migrations(&pool, &directory).await;
-    populate_before_0026(&pool).await;
+    populate_before_0027(&pool).await;
+    populate_dispensing_occasions(&pool).await;
 
-    // The coherent case is accepted, and takes the first reference.
+    // The sound one goes in, so every refusal below is about the limb it names.
     execute(
         &pool,
-        &receipt_insert("01997000-0000-7000-8000-000000000a01", 1),
+        &annotation_insert("01997000-0000-7000-8000-000000000901"),
     )
     .await;
-    let reference: String =
-        sqlx::query_scalar("SELECT reference FROM store_schedule_x_register_entries WHERE id=?")
-            .bind("01997000-0000-7000-8000-000000000a01")
-            .fetch_one(&pool)
-            .await
-            .expect("reference");
-    assert_eq!(reference, "AXR-000001");
 
-    // A particular that disagrees with the frozen provenance is refused. Each of these would be a
-    // working record that says something the posted document does not.
-    for (label, forged) in [
-        (
-            "a supplier the document does not name",
-            receipt_insert("01997000-0000-7000-8000-000000000a02", 2).replace(
-                "'Sunrise Distributors','recorded'",
-                "'Someone Else','recorded'",
-            ),
-        ),
-        (
-            "a quantity the line does not carry",
-            receipt_insert("01997000-0000-7000-8000-000000000a03", 2).replace(",50,5,", ",99,5,"),
-        ),
-        (
-            "a batch the line does not carry",
-            receipt_insert("01997000-0000-7000-8000-000000000a04", 2)
-                .replace("'recorded','BX-01'", "'recorded','BX-99'"),
-        ),
-        (
-            "a drug name the line does not carry",
-            receipt_insert("01997000-0000-7000-8000-000000000a05", 2).replace(
-                "'Schedule X Test Medicine A','01997",
-                "'Something Else','01997",
-            ),
-        ),
-        (
-            "a transaction date the document does not carry",
-            receipt_insert("01997000-0000-7000-8000-000000000a06", 2)
-                .replace("'2026-05-04','Schedule X", "'2026-05-05','Schedule X"),
-        ),
-        (
-            "a reference out of sequence",
-            receipt_insert("01997000-0000-7000-8000-000000000a07", 7),
-        ),
-    ] {
-        let error = refused(&pool, &forged).await;
-        assert!(
-            error.contains("schedule_x_register_entry_incoherent"),
-            "{label}: {error}"
-        );
-    }
-
-    // A line whose product the owner has NOT recorded inside Schedule X gets no working record. The
-    // second purchase line is an ordinary medicine with no finding at all: `unknown` is not
-    // `applies`, and the register is not a place for guesses.
-    let plain = receipt_insert("01997000-0000-7000-8000-000000000a08", 2)
-        .replace(PRODUCT_X, PRODUCT_PLAIN)
-        .replace(POSTED_LINE, POSTED_PLAIN_LINE)
-        .replace("'Schedule X Test Medicine A'", "'Ordinary Test Medicine'")
-        .replace(
-            "'recorded','BX-01','recorded','Meridian Laboratories'",
-            "'not_recorded',NULL,'not_recorded',NULL",
-        );
-    let error = refused(&pool, &plain).await;
-    assert!(
-        error.contains("schedule_x_register_entry_incoherent"),
-        "an unclassified product was admitted: {error}"
-    );
-
-    // One live entry per purchase line. A second live receipt for one line would be one drug written
-    // into the register twice.
-    let error = refused(
+    // One live attestation per dispensing occasion.
+    let twice = refused(
         &pool,
-        &receipt_insert("01997000-0000-7000-8000-000000000a09", 2),
+        &annotation_insert("01997000-0000-7000-8000-000000000902"),
     )
     .await;
-    assert!(error.contains("UNIQUE constraint failed"), "{error}");
+    assert!(twice.contains("UNIQUE"), "{twice}");
 
-    // A supply entry cannot borrow a receipt's provenance, and a receipt cannot borrow a supply's.
-    let hybrid =
-        receipt_insert("01997000-0000-7000-8000-000000000a10", 2).replace("'receipt'", "'supply'");
-    let error = refused(&pool, &hybrid).await;
-    // SQLite runs a BEFORE INSERT trigger before it evaluates the table's CHECK constraints, so the
-    // coherence guard answers first. Both refuse it; the point is that the kinds cannot be mixed.
-    assert!(
-        error.contains("schedule_x_register_entry_incoherent"),
-        "{error}"
-    );
-    // The table CHECK is the second line of defence, and it answers for a mixture the trigger does
-    // not inspect: a receipt row has no patient, so carrying a subject at all is a shape this schema
-    // will not hold, whatever any trigger thinks.
-    let with_subject = receipt_insert("01997000-0000-7000-8000-000000000a11", 2).replace(
-        ",status,prepared_by_user_id",
-        ",subject_kind,status,prepared_by_user_id",
-    );
-    assert_ne!(
-        with_subject,
-        receipt_insert("01997000-0000-7000-8000-000000000a11", 2),
-        "the subject column was not spliced in"
-    );
-    let with_subject = with_subject.replace("'prepared','", "'human','prepared','");
-    let error = refused(&pool, &with_subject).await;
-    assert!(error.contains("CHECK constraint failed"), "{error}");
-
-    structural_checks(&pool).await;
-    pool.close().await;
-}
-
-/// Phase 1M-D2, item 38. The lifecycle moves one way, a finalized entry is beyond reach, a void
-/// entry stays void, and no row is ever deleted.
-#[tokio::test]
-async fn the_lifecycle_moves_one_way_and_finalized_entries_are_beyond_reach() {
-    let temp = tempfile::tempdir().expect("temporary directory");
-    let directory = temp.path().join("migrations");
-    migrations_up_to(NEW_MIGRATION, &directory);
-    let pool = open(&temp.path().join("lifecycle.sqlite3")).await;
-    run_migrations(&pool, &directory).await;
-    populate_before_0026(&pool).await;
-    execute(
+    // THE SCHEDULE X BOUNDARY. The ordinary drug has no Schedule X finding, so its dispensing
+    // occasion cannot acquire this fact — an ordinary prescription sale gains no requirement.
+    let ordinary = refused(
         &pool,
-        &receipt_insert("01997000-0000-7000-8000-000000000a01", 1),
-    )
-    .await;
-    let entry = "01997000-0000-7000-8000-000000000a01";
-
-    // A frozen particular never moves, in any state.
-    let error = refused(
-        &pool,
-        &format!(
-            "UPDATE store_schedule_x_register_entries SET supplier_name='Someone Else' \
-             WHERE id='{entry}'"
+        &annotation_insert_for(
+            "01997000-0000-7000-8000-000000000903",
+            DRAFT_PLAIN_LINE,
+            PRESCRIPTION_PLAIN,
+            PRESCRIPTION_PLAIN_ITEM,
+            PRODUCT_PLAIN,
+            SALE_DATE,
+            OWNER,
         ),
     )
     .await;
     assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
+        ordinary.contains("schedule_x_prescription_annotation_incoherent"),
+        "{ordinary}"
     );
 
-    // Closing an entry whose physical acts nobody attested is refused.
-    let error = refused(
+    // A cashier cannot make this statement, in the database any more than over HTTP.
+    let till = refused(
         &pool,
-        &format!(
-            "UPDATE store_schedule_x_register_entries SET status='finalized',\
-             finalized_by_user_id='{OWNER}',finalized_at_utc='2026-05-04T07:00:00.000Z' \
-             WHERE id='{entry}'"
+        &annotation_insert_for(
+            "01997000-0000-7000-8000-000000000904",
+            DRAFT_LINE,
+            PRESCRIPTION,
+            PRESCRIPTION_ITEM,
+            PRODUCT_X,
+            SALE_DATE,
+            CASHIER,
         ),
     )
     .await;
     assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
+        till.contains("schedule_x_prescription_annotation_incoherent"),
+        "{till}"
     );
 
-    // One physical act without the other is not a confirmation.
-    let error = refused(
+    // The dispensing date is the draft's own business date. A date brought in from anywhere else is
+    // refused, so nothing typed into a screen can become the authoritative one.
+    let wrong_date = refused(
         &pool,
-        &format!(
-            "UPDATE store_schedule_x_register_entries SET status='confirmed',\
-             particulars_entered_in_physical_register=1,confirmed_by_user_id='{OWNER}',\
-             confirmed_at_utc='2026-05-04T07:00:00.000Z' WHERE id='{entry}'"
+        &annotation_insert_for(
+            "01997000-0000-7000-8000-000000000905",
+            DRAFT_LINE,
+            PRESCRIPTION,
+            PRESCRIPTION_ITEM,
+            PRODUCT_X,
+            "2026-05-01",
+            OWNER,
         ),
     )
     .await;
-    // The transition trigger answers before the table CHECK does — SQLite runs a BEFORE UPDATE
-    // trigger first — and both refuse a page written but unsigned, or signed but unwritten.
     assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
+        wrong_date.contains("schedule_x_prescription_annotation_incoherent"),
+        "{wrong_date}"
     );
 
-    // A cashier cannot be the confirming user even by direct SQL: the transition names the roles.
-    let confirm = |user: &str, professional: &str| {
-        format!(
-            "UPDATE store_schedule_x_register_entries SET status='confirmed',\
-             particulars_entered_in_physical_register=1,physical_entry_authenticated=1,\
-             supervising_professional_id='{professional}',\
-             supervising_professional_name='Meera Iyer',\
-             supervising_registration_number='MH-PH-44821',confirmed_by_user_id='{user}',\
-             confirmed_at_utc='2026-05-04T07:00:00.000Z' WHERE id='{entry}'"
-        )
-    };
-    let error = refused(&pool, &confirm(CASHIER, PHARMACIST)).await;
-    assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
-    );
-
-    // The confirmation must name a real, active registered pharmacist of this store.
-    let error = refused(
-        &pool,
-        &confirm(OWNER, "01997000-0000-7000-8000-0000000005ff"),
-    )
-    .await;
-    assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
-    );
-
-    // Both acts, attested by an owner, naming the pharmacist on record.
-    execute(&pool, &confirm(OWNER, PHARMACIST)).await;
-    execute(
-        &pool,
-        &format!(
-            "UPDATE store_schedule_x_register_entries SET status='finalized',\
-             finalized_by_user_id='{OWNER}',finalized_at_utc='2026-05-04T08:00:00.000Z' \
-             WHERE id='{entry}'"
-        ),
-    )
-    .await;
-
-    // Finalized is the end of the road: no further transition, and no deletion.
+    // Append-only in both directions: the frozen particulars never move, and no row is deleted.
     for statement in [
-        format!(
-            "UPDATE store_schedule_x_register_entries SET status='void',voided_by_user_id='{OWNER}',\
-             voided_at_utc='2026-05-04T09:00:00.000Z',void_reason='changed my mind' \
-             WHERE id='{entry}'"
-        ),
-        format!(
-            "UPDATE store_schedule_x_register_entries SET status='confirmed',finalized_at_utc=NULL,\
-             finalized_by_user_id=NULL WHERE id='{entry}'"
-        ),
+        "UPDATE schedule_x_prescription_annotations SET seller_name='Somebody Else'",
+        "UPDATE schedule_x_prescription_annotations SET seller_address='Elsewhere'",
+        "UPDATE schedule_x_prescription_annotations SET dispensing_date='2026-01-01'",
+        "UPDATE schedule_x_prescription_annotations SET seller_particulars_noted_on_prescription=0",
+        "DELETE FROM schedule_x_prescription_annotations",
     ] {
-        let error = refused(&pool, &statement).await;
+        let message = refused(&pool, statement).await;
         assert!(
-            error.contains("schedule_x_register_entry_immutable"),
-            "{error}"
+            message.contains("schedule_x_prescription_annotation_is_append_only"),
+            "{statement}: {message}"
         );
     }
-    let error = refused(
-        &pool,
-        &format!("DELETE FROM store_schedule_x_register_entries WHERE id='{entry}'"),
-    )
-    .await;
-    assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
-    );
-
-    // A void entry keeps its reference, so the next entry takes the following one and the withdrawn
-    // number is never reissued.
-    execute(
-        &pool,
-        &receipt_insert_two("01997000-0000-7000-8000-000000000b01", 2),
-    )
-    .await;
-    execute(
-        &pool,
-        &format!(
-            "UPDATE store_schedule_x_register_entries SET status='void',voided_by_user_id='{OWNER}',\
-             voided_at_utc='2026-05-04T09:00:00.000Z',void_reason='prepared against the wrong line' \
-             WHERE id='01997000-0000-7000-8000-000000000b01'"
-        ),
-    )
-    .await;
-    // Void cannot be resurrected.
-    let error = refused(
-        &pool,
-        "UPDATE store_schedule_x_register_entries SET status='prepared',voided_by_user_id=NULL,\
-         voided_at_utc=NULL,void_reason=NULL WHERE id='01997000-0000-7000-8000-000000000b01'",
-    )
-    .await;
-    assert!(
-        error.contains("schedule_x_register_entry_immutable"),
-        "{error}"
-    );
-    // And the reference it held is not handed to the next entry.
-    let error = refused(
-        &pool,
-        &receipt_insert_two("01997000-0000-7000-8000-000000000b02", 2),
-    )
-    .await;
-    assert!(
-        error.contains("schedule_x_register_entry_incoherent")
-            || error.contains("UNIQUE constraint failed"),
-        "a void reference was reissued: {error}"
-    );
-    execute(
-        &pool,
-        &receipt_insert_two("01997000-0000-7000-8000-000000000b03", 3),
-    )
-    .await;
-
-    structural_checks(&pool).await;
     pool.close().await;
 }
 
-/// Phase 1M-D2, item 38. Rule 65(9)(a)'s retained-duplicate fact is written once and never rewritten.
+/// Phase 1M-D3-A, item 16. A required seller particular cannot be blank, and a prescription cannot
+/// have been dispensed on a day that has not happened.
 #[tokio::test]
-async fn the_retained_duplicate_copy_fact_is_written_once() {
+async fn a_blank_particular_and_a_future_dispensing_date_are_both_refused() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let directory = temp.path().join("migrations");
     migrations_up_to(NEW_MIGRATION, &directory);
-    let pool = open(&temp.path().join("duplicate.sqlite3")).await;
+    let pool = open(&temp.path().join("particulars.sqlite3")).await;
     run_migrations(&pool, &directory).await;
-    populate_before_0026(&pool).await;
-    execute(
-        &pool,
-        "INSERT INTO prescriptions (id,store_id,reference,prescribed_on,prescriber_name,\
-         prescriber_address,subject_kind,subject_name,subject_address,\
-         written_signed_dated_attested,created_by_user_id,created_at_utc,updated_at_utc) \
-         VALUES ('01997000-0000-7000-8000-000000000802','01997000-0000-7000-8000-0000000000bb',\
-         'RX-000001','2026-05-02','Dr. Rao','Pune','human','Patient','Pune',1,\
-         '01997000-0000-7000-8000-0000000000cc','2026-05-02T00:00:00.000Z',\
-         '2026-05-02T00:00:00.000Z')",
-    )
-    .await;
+    populate_before_0027(&pool).await;
+    populate_dispensing_occasions(&pool).await;
 
-    let attest = |id: &str, confirmed: i64| {
-        format!(
-            "INSERT INTO prescription_duplicate_copy_attestations (id,store_id,prescription_id,\
-             retained_duplicate_prescription_copy_confirmed,attested_by_user_id,attested_at_utc) \
-             VALUES ('{id}','{STORE}','01997000-0000-7000-8000-000000000802',{confirmed},\
-             '{OWNER}','2026-05-04T07:00:00.000Z')"
-        )
-    };
-    execute(&pool, &attest("01997000-0000-7000-8000-000000000c01", 1)).await;
+    let sound = annotation_insert("01997000-0000-7000-8000-000000000b01");
+    for (what, statement) in [
+        (
+            "a blank seller name",
+            sound.replace("'Care Pharmacy Private Limited'", "'   '"),
+        ),
+        (
+            "a blank seller address",
+            sound.replace("'12 Market Road, Pune, 411001'", "'  '"),
+        ),
+        (
+            // The attestation was made on 2026-05-06; a supply dated later has not happened.
+            "a dispensing date after the day of attestation",
+            sound.replace("'2026-05-06','2026-05-06'", "'2026-05-07','2026-05-06'"),
+        ),
+    ] {
+        let message = refused(&pool, &statement).await;
+        assert!(!message.is_empty(), "{what} was accepted");
+    }
 
-    // One statement per prescription. It is a fact about a piece of paper, not a setting to toggle.
-    let error = refused(&pool, &attest("01997000-0000-7000-8000-000000000c02", 0)).await;
-    assert!(error.contains("UNIQUE constraint failed"), "{error}");
-    let error = refused(
-        &pool,
-        "UPDATE prescription_duplicate_copy_attestations \
-         SET retained_duplicate_prescription_copy_confirmed=0 \
-         WHERE id='01997000-0000-7000-8000-000000000c01'",
-    )
-    .await;
-    assert!(
-        error.contains("duplicate_copy_attestation_is_append_only"),
-        "{error}"
-    );
-    let error = refused(
-        &pool,
-        "DELETE FROM prescription_duplicate_copy_attestations \
-         WHERE id='01997000-0000-7000-8000-000000000c01'",
-    )
-    .await;
-    assert!(
-        error.contains("duplicate_copy_attestation_is_append_only"),
-        "{error}"
-    );
-
-    // A prescription of another store cannot be attested here.
-    let error = refused(
-        &pool,
-        "INSERT INTO prescription_duplicate_copy_attestations (id,store_id,prescription_id,\
-         retained_duplicate_prescription_copy_confirmed,attested_by_user_id,attested_at_utc) \
-         VALUES ('01997000-0000-7000-8000-000000000c03','01997000-0000-7000-8000-0000000000be',\
-         '01997000-0000-7000-8000-000000000802',1,'01997000-0000-7000-8000-0000000000cc',\
-         '2026-05-04T07:00:00.000Z')",
-    )
-    .await;
-    assert!(
-        error.contains("duplicate_copy_attestation_incoherent")
-            || error.contains("FOREIGN KEY constraint failed"),
-        "{error}"
-    );
-
-    structural_checks(&pool).await;
+    // And the sound statement goes in, so the refusals above are about their own reasons.
+    execute(&pool, &sound).await;
     pool.close().await;
 }
 
-/// Phase 1M-D2, item 38. Migrations 0001–0025 are untouched by this phase.
+/// Phase 1M-D3-A, item 11. Rule 65(2) — active is not the same as registered on the day.
+///
+/// The 0026 transition trigger accepted any ACTIVE registered pharmacist. 0027 replaces it with the
+/// same trigger plus two date conditions, and this proves both halves: the hardening bites, and
+/// nothing else about the transition was lost while the trigger was replaced.
+#[tokio::test]
+async fn a_lapsed_registration_cannot_authenticate_a_schedule_x_entry() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("migrations");
+    migrations_up_to(NEW_MIGRATION, &directory);
+    let pool = open(&temp.path().join("validity.sqlite3")).await;
+    run_migrations(&pool, &directory).await;
+    populate_before_0027(&pool).await;
+    execute(
+        &pool,
+        &receipt_insert("01997000-0000-7000-8000-000000000a01", 1),
+    )
+    .await;
+
+    let confirm = format!(
+        "UPDATE store_schedule_x_register_entries SET status='confirmed',\
+         particulars_entered_in_physical_register=1,physical_entry_authenticated=1,\
+         supervising_professional_id='{PHARMACIST}',supervising_professional_name='Meera Iyer',\
+         supervising_registration_number='MH-PH-44821',confirmed_by_user_id='{OWNER}',\
+         confirmed_at_utc='2026-05-04T07:00:00.000Z',updated_at_utc='2026-05-04T07:00:00.000Z' \
+         WHERE id='01997000-0000-7000-8000-000000000a01'"
+    );
+
+    // The registration lapsed before the receipt. The record is still ACTIVE — exactly the gap.
+    execute(
+        &pool,
+        &format!("UPDATE store_professionals SET valid_upto='2026-01-31' WHERE id='{PHARMACIST}'"),
+    )
+    .await;
+    let lapsed = refused(&pool, &confirm).await;
+    assert!(
+        lapsed.contains("schedule_x_register_entry_immutable"),
+        "{lapsed}"
+    );
+
+    // Not yet registered on the day, refused from the other side.
+    execute(
+        &pool,
+        &format!(
+            "UPDATE store_professionals SET valid_from='2027-01-01',valid_upto=NULL \
+             WHERE id='{PHARMACIST}'"
+        ),
+    )
+    .await;
+    let early = refused(&pool, &confirm).await;
+    assert!(
+        early.contains("schedule_x_register_entry_immutable"),
+        "{early}"
+    );
+
+    // Inclusive at both ends, per the repository's own convention: a registration that begins and
+    // ends on the transaction date covers it.
+    execute(
+        &pool,
+        &format!(
+            "UPDATE store_professionals SET valid_from='{INVOICE_DATE}',\
+             valid_upto='{INVOICE_DATE}' WHERE id='{PHARMACIST}'"
+        ),
+    )
+    .await;
+    execute(&pool, &confirm).await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM store_schedule_x_register_entries \
+         WHERE id='01997000-0000-7000-8000-000000000a01'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("status");
+    assert_eq!(status, "confirmed");
+
+    // And nothing else about the transition was lost while the trigger was replaced: a finalized
+    // entry is still beyond reach.
+    execute(
+        &pool,
+        "UPDATE store_schedule_x_register_entries SET status='finalized',\
+         finalized_by_user_id='01997000-0000-7000-8000-0000000000cc',\
+         finalized_at_utc='2026-05-04T08:00:00.000Z',updated_at_utc='2026-05-04T08:00:00.000Z' \
+         WHERE id='01997000-0000-7000-8000-000000000a01'",
+    )
+    .await;
+    let closed = refused(
+        &pool,
+        "UPDATE store_schedule_x_register_entries SET status='void',\
+         voided_by_user_id='01997000-0000-7000-8000-0000000000cc',\
+         voided_at_utc='2026-05-04T09:00:00.000Z',void_reason='too late' \
+         WHERE id='01997000-0000-7000-8000-000000000a01'",
+    )
+    .await;
+    assert!(
+        closed.contains("schedule_x_register_entry_immutable"),
+        "{closed}"
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D3-A, item 29. Exactly one new migration, and every earlier file untouched.
 #[tokio::test]
 async fn the_earlier_migrations_are_unchanged() {
     let directory = migrations_directory();
@@ -975,20 +870,35 @@ async fn the_earlier_migrations_are_unchanged() {
         .filter(|name| name.ends_with(".sql"))
         .collect();
     names.sort();
-    assert_eq!(
-        names.len(),
-        27,
-        "expected exactly 27 migrations after Phase 1M-D3-A: {names:?}"
-    );
-    assert_eq!(names[25], "0026_schedule_x_register_foundations.sql");
+    assert_eq!(names.len(), 27, "expected exactly 27 migrations: {names:?}");
     assert_eq!(names[26], "0027_schedule_x_prescription_compliance.sql");
-    // Every earlier file is still the committed one, byte for byte, as `git status` also proves.
-    for name in &names[..25] {
+    // Every earlier file is still the committed one, as `git status` also proves.
+    for name in &names[..26] {
         let bytes = std::fs::read(directory.join(name)).expect("read migration");
         assert!(!bytes.is_empty(), "{name} is empty");
         assert!(
-            !String::from_utf8_lossy(&bytes).contains("schedule_x_register_entries"),
-            "{name} was edited to mention the D2 working record"
+            !String::from_utf8_lossy(&bytes).contains("schedule_x_prescription_annotations"),
+            "{name} was edited to mention the D3-A attestation"
         );
     }
+}
+
+/// A coherent Phase 1M-D2 receipt working entry for the seeded Schedule X purchase line, so the
+/// rule 65(2) hardening can be exercised against a real entry rather than a synthetic one.
+fn receipt_insert(id: &str, reference_value: i64) -> String {
+    format!(
+        "INSERT INTO store_schedule_x_register_entries (id,store_id,entry_kind,reference_value,\
+         reference,transaction_date,drug_name,product_id,batch_state,batch_number,\
+         manufacturer_state,manufacturer_name,quantity_atoms,quantity_packs,bill_number,bill_date,\
+         purchase_document_id,purchase_line_id,supplier_name,supplier_address_state,\
+         supplier_address,supplier_licence_state,supplier_licence_number,status,\
+         prepared_by_user_id,prepared_at_utc,particulars_entered_in_physical_register,\
+         physical_entry_authenticated,created_at_utc,updated_at_utc) VALUES \
+         ('{id}','{STORE}','receipt',{reference_value},'AXR-{reference_value:06}','{INVOICE_DATE}',\
+         'Schedule X Test Medicine A','{PRODUCT_X}','recorded','BX-01','recorded',\
+         'Meridian Laboratories',50,5,'INV-5501','{INVOICE_DATE}','{POSTED}','{POSTED_LINE}',\
+         'Sunrise Distributors','recorded','14 Ware House Road','recorded',\
+         '20B-MH-9911 / 21B-MH-9912','prepared','{OWNER}','2026-05-04T06:00:00.000Z',0,0,\
+         '2026-05-04T06:00:00.000Z','2026-05-04T06:00:00.000Z')"
+    )
 }

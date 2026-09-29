@@ -3698,33 +3698,13 @@ struct LineRegulatory {
 
 /// The calendar day(s) the posting instant can be in the store's own time.
 ///
-/// Every store this software creates records `Asia/Kolkata`, which observes no daylight saving and
-/// sits at a fixed UTC+05:30, so its day is exact. Any other recorded zone cannot be resolved here
-/// without a time-zone database, so the answer widens to every day the instant could fall on
-/// anywhere — yesterday, today and tomorrow in UTC — and the gate takes the strictest of them. That
-/// can refuse a sale up to a day early around a commencement; it can never let one through late.
+/// The policy itself lives in `domain::schedule_x::store_days`, because Phase 1M-D3-A needs the
+/// same answer for the Schedule X compliance facts and two copies would eventually disagree about
+/// what day it is.
 async fn posting_days(connection: &mut PoolConnection<Sqlite>) -> Result<Vec<String>, SaleError> {
-    let zone: Option<String> =
-        sqlx::query_scalar("SELECT business_time_zone FROM store_identity LIMIT 1")
-            .fetch_optional(&mut **connection)
-            .await
-            .map_err(map_database_error)?;
-    if zone.as_deref() == Some("Asia/Kolkata") {
-        let today: String =
-            sqlx::query_scalar("SELECT strftime('%Y-%m-%d','now','+5 hours','+30 minutes')")
-                .fetch_one(&mut **connection)
-                .await
-                .map_err(map_database_error)?;
-        return Ok(vec![today]);
-    }
-    let window: (String, String, String) = sqlx::query_as(
-        "SELECT strftime('%Y-%m-%d','now','-1 day'),strftime('%Y-%m-%d','now'),\
-         strftime('%Y-%m-%d','now','+1 day')",
-    )
-    .fetch_one(&mut **connection)
-    .await
-    .map_err(map_database_error)?;
-    Ok(vec![window.0, window.1, window.2])
+    crate::domain::schedule_x::store_days(connection)
+        .await
+        .map_err(map_database_error)
 }
 
 /// Which of two gates refuses harder: a missing workflow outranks a missing classification, which

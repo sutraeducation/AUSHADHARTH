@@ -6,10 +6,14 @@ import {
   ComplianceLicenceSchema,
   ScheduleXRegisterSchema,
   ScheduleXRegisterEntrySchema,
+  ScheduleXPrescriptionAnnotationSchema,
+  ScheduleXPrescriptionAnnotationsSchema,
   type ConfirmScheduleXEntryRequest,
   type ScheduleXEntryKind,
   type ScheduleXEntryStatus,
   type ScheduleXRegister,
+  type RecordScheduleXPrescriptionAnnotationRequest,
+  type ScheduleXPrescriptionAnnotations,
   type VoidScheduleXEntryRequest,
   LicenceDrugCoverageSchema,
   RecordElectionSchema,
@@ -373,3 +377,33 @@ export const SCHEDULE_X_ENTRY_KIND_LABELS: Record<ScheduleXEntryKind, string> = 
 
 /** A particular the store never recorded says so, rather than borrowing today's master value. */
 export const NOT_RECORDED = "Not recorded";
+
+// --- Phase 1M-D3-A: rule 65(11)(c), the note written on the physical prescription --------------
+
+/**
+ * The dispensing occasions still waiting for the physical note, and the confirmations already
+ * recorded — with the seller particulars a confirmation would freeze right now.
+ */
+export async function getScheduleXPrescriptionAnnotations(): Promise<ScheduleXPrescriptionAnnotations> {
+  return ScheduleXPrescriptionAnnotationsSchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/prescription-annotations")
+  );
+}
+
+/**
+ * Records that a person wrote the seller name, the seller address and the dispensing date on the
+ * physical prescription, above the prescriber's signature.
+ *
+ * AUSHADHARTH does not write on the prescription and does not sign it. This stores the statement
+ * that somebody did.
+ */
+export async function recordScheduleXPrescriptionAnnotation(
+  input: RecordScheduleXPrescriptionAnnotationRequest
+) {
+  return ScheduleXPrescriptionAnnotationSchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/prescription-annotations", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}

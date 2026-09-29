@@ -197,6 +197,56 @@ fn trimmed(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The seller's address as one line, for a record that has to say what was written by hand.
+///
+/// Deterministic: the same parts in the same order joined by ", ", blanks skipped, so two
+/// installations restoring the same backup produce the same string. Nothing is invented — an
+/// address with only a first line renders as that line alone.
+pub fn postal_address_text(source: &SellerProfileSource) -> Option<String> {
+    let text = [
+        source.address_line1.as_deref(),
+        source.address_line2.as_deref(),
+        source.city.as_deref(),
+        source.postal_code.as_deref(),
+        source.state_name.as_deref(),
+    ]
+    .into_iter()
+    .filter_map(|part| part.map(str::trim).filter(|part| !part.is_empty()))
+    .collect::<Vec<_>>()
+    .join(", ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// The two seller particulars rule 65(11)(c) requires to be noted on a dispensed prescription: the
+/// name of the seller and the address of the seller.
+///
+/// Deliberately NOT `resolve`. That function also requires a sale licence, because rule 65(4)(3)(i)
+/// requires one on a memo; rule 65(11)(c) does not mention a licence, and refusing an attestation
+/// for a particular the rule does not ask for would be inventing law. What it shares with `resolve`
+/// is the refusal: a seller name or address the Store has not recorded is never guessed, never
+/// substituted from the display name, and never left blank.
+pub fn annotation_seller(
+    source: &SellerProfileSource,
+) -> Result<(String, String), Vec<MissingSellerFact>> {
+    let name = source
+        .legal_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let address = postal_address_text(source);
+    let mut missing = Vec::new();
+    if name.is_none() {
+        missing.push(MissingSellerFact::LegalName);
+    }
+    if address.is_none() {
+        missing.push(MissingSellerFact::AddressLine1);
+    }
+    match (name, address) {
+        (Some(name), Some(address)) if missing.is_empty() => Ok((name.to_owned(), address)),
+        _ => Err(missing),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +409,65 @@ mod tests {
         source.legal_name = Some("  <script>alert(1)</script> & Söhne  ".to_owned());
         let snapshot = resolve(&source).expect("complete");
         assert_eq!(snapshot.legal_name, "<script>alert(1)</script> & Söhne");
+    }
+
+    /// Phase 1M-D3-A. The address a person writes on a prescription, assembled the same way on
+    /// every machine and after every restore.
+    #[test]
+    fn the_postal_address_joins_the_recorded_parts_in_order() {
+        assert_eq!(
+            postal_address_text(&complete()),
+            Some("12 Market Road, Pune, 411001, Maharashtra".to_owned())
+        );
+        // Nothing is invented for a part the Store never recorded.
+        let mut sparse = complete();
+        sparse.city = None;
+        sparse.postal_code = Some("   ".to_owned());
+        sparse.state_name = None;
+        assert_eq!(
+            postal_address_text(&sparse),
+            Some("12 Market Road".to_owned())
+        );
+        let mut empty = complete();
+        empty.address_line1 = None;
+        empty.address_line2 = None;
+        empty.city = None;
+        empty.postal_code = None;
+        empty.state_name = None;
+        assert_eq!(postal_address_text(&empty), None);
+    }
+
+    /// Phase 1M-D3-A, rule 65(11)(c). The rule names the seller and the address, and nothing else.
+    /// A pharmacy with no sale licence recorded can still truthfully say what it wrote on a
+    /// prescription, so this must NOT inherit the memo's licence requirement.
+    #[test]
+    fn the_annotation_seller_needs_the_name_and_address_and_not_a_licence() {
+        let mut unlicensed = complete();
+        unlicensed.active_licences.clear();
+        assert_eq!(
+            annotation_seller(&unlicensed),
+            Ok((
+                "Sharma Medical Stores".to_owned(),
+                "12 Market Road, Pune, 411001, Maharashtra".to_owned()
+            ))
+        );
+        // ...while the memo, which rule 65(4)(3)(i) does govern, still refuses without one.
+        assert!(resolve(&unlicensed).is_err());
+
+        // A missing particular is refused and named, never guessed or substituted.
+        let mut blank = complete();
+        blank.legal_name = Some("  ".to_owned());
+        blank.address_line1 = None;
+        blank.address_line2 = None;
+        blank.city = None;
+        blank.postal_code = None;
+        blank.state_name = None;
+        assert_eq!(
+            annotation_seller(&blank),
+            Err(vec![
+                MissingSellerFact::LegalName,
+                MissingSellerFact::AddressLine1
+            ])
+        );
     }
 }
