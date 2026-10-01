@@ -26,7 +26,9 @@ const IDs = {
   saleLine: "01997c00-0000-7000-8000-0000000000a1",
   prescription: "01997c00-0000-7000-8000-0000000000a2",
   prescriptionItem: "01997c00-0000-7000-8000-0000000000a3",
-  annotation: "01997c00-0000-7000-8000-0000000000a4"
+  annotation: "01997c00-0000-7000-8000-0000000000a4",
+  otherSaleLine: "01997c00-0000-7000-8000-0000000000a5",
+  supplyEntry: "01997c00-0000-7000-8000-0000000000a6"
 };
 const system = {
   status: "ok",
@@ -58,6 +60,13 @@ function entry(overrides: Record<string, unknown> = {}) {
     supplierAddress: "14 Ware House Road",
     supplierLicenceState: "recorded",
     supplierLicenceNumber: "20B-MH-9911",
+    supplyBasis: null,
+    saleDocumentId: null,
+    saleLineId: null,
+    prescriptionId: null,
+    prescriptionReference: null,
+    batchId: null,
+    dispensingId: null,
     status: "prepared",
     particularsEnteredInPhysicalRegister: false,
     physicalEntryAuthenticated: false,
@@ -130,10 +139,32 @@ function annotation(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Phase 1M-D3-B — a draft Schedule X line with the verdict on the lot it draws on. */
+function candidate(overrides: Record<string, unknown> = {}) {
+  return {
+    saleDocumentId: IDs.sale,
+    saleLineId: IDs.saleLine,
+    prescriptionId: IDs.prescription,
+    prescriptionItemId: IDs.prescriptionItem,
+    productId: IDs.product,
+    drugName: "Schedule X Test Medicine A",
+    batchId: "01997c00-0000-7000-8000-0000000000b1",
+    batchNumber: "BX-QUALIFIED",
+    quantityAtoms: 10,
+    businessDate: "2026-09-12",
+    prescriptionReference: "RX-000001",
+    entryId: null,
+    entryStatus: null,
+    lotProvenance: { state: "qualified" },
+    ...overrides
+  };
+}
+
 type Options = {
   role?: UserRole;
   register?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  supply?: Record<string, unknown>;
 };
 
 function service(options: Options = {}) {
@@ -154,6 +185,15 @@ function service(options: Options = {}) {
       return response({ entries: [entry()], legacyReceipts: [], ...options.register });
     }
     if (url.pathname === "/api/v1/store/professionals") return response([pharmacist]);
+    // Phase 1M-D3-B — lot provenance and the supply working record.
+    if (url.pathname === "/api/v1/store/schedule-x/supply-preparation") {
+      if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
+      if (method === "POST") {
+        writes.push({ path: url.pathname, body });
+        return response(entry({ entryKind: "supply" }), 201);
+      }
+      return response({ candidates: [candidate()], ...options.supply });
+    }
     // Phase 1M-D3-A — rule 65(11)(c).
     if (url.pathname === "/api/v1/store/schedule-x/prescription-annotations") {
       if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
@@ -759,5 +799,119 @@ describe("the rule 65(11)(c) prescription annotation", () => {
     expect(dialog.getAllByRole("checkbox")).toHaveLength(1);
     expect(dialog.queryByText(/duplicate/i)).not.toBeInTheDocument();
     expect(dialog.queryByText(/retained/i)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Phase 1M-D3-B — the batch behind a Schedule X supply.
+ *
+ * The attack here is a screen that lets stock leave a shelf because it is on the shelf. Rule 65(21)
+ * accounts for what came in and what went out, so these tests check that a batch which is not
+ * accounted for offers no way forward, and that preparing a working record is never described as
+ * selling anything.
+ */
+describe("the Schedule X supply batch check", () => {
+  const awaitSupply = async () => {
+    await screen.findByRole("heading", { name: "Batches behind a Schedule X supply" }, { timeout: 3000 });
+    const section = screen.getByTestId("schedule-x-supply");
+    await waitFor(
+      () => expect(within(section).queryByText("Loading batches…")).not.toBeInTheDocument(),
+      { timeout: 3000 }
+    );
+    return section;
+  };
+
+  it("says what it does and never implies a Schedule X sale is possible", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = await awaitSupply();
+    expect(
+      within(section).getByText(/it does not dispense anything, and Schedule X dispensing at the counter is not yet available/)
+    ).toBeInTheDocument();
+    const text = (section.textContent ?? "").toLowerCase();
+    for (const forbidden of ["sell schedule x", "dispense now", "complete sale", "supply now"]) {
+      expect(text).not.toContain(forbidden);
+    }
+  });
+
+  it("offers no way forward for a batch that is not accounted for", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({
+        supply: {
+          candidates: [
+            candidate({ lotProvenance: { state: "unresolved_inward_movement" } }),
+            candidate({
+              saleLineId: IDs.otherSaleLine,
+              batchNumber: "BX-LEGACY",
+              lotProvenance: { state: "no_qualifying_receipt" }
+            })
+          ]
+        }
+      })
+    );
+    const section = await awaitSupply();
+    // Both verdicts are named in words, not by colour alone.
+    expect(within(section).getByText("Stock in this batch is not accounted for")).toBeInTheDocument();
+    expect(within(section).getByText("Purchase not yet written in the register")).toBeInTheDocument();
+    // And neither offers an action.
+    for (const button of within(section).getAllByRole("button", { name: "Prepare working record" })) {
+      expect(button).toBeDisabled();
+    }
+  });
+
+  it("prepares a working record only for an accounted-for batch, and sends only the line", async () => {
+    const double = renderApp("/app/settings/schedule-x");
+    const section = await awaitSupply();
+    expect(within(section).getByText("Traced to a recorded purchase")).toBeInTheDocument();
+    const button = within(section).getByRole("button", { name: "Prepare working record" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    await waitFor(() => expect(double.writes.some((write) => write.path.endsWith("/supply-preparation"))).toBe(true));
+    const write = double.writes.find((entry) => entry.path.endsWith("/supply-preparation"));
+    expect(write?.body).toEqual({ saleLineId: IDs.saleLine });
+  });
+
+  it("shows a prepared working record's state instead of offering to prepare it again", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({
+        supply: {
+          candidates: [
+            candidate({ entryId: IDs.supplyEntry, entryStatus: "prepared" })
+          ]
+        }
+      })
+    );
+    const section = await awaitSupply();
+    expect(within(section).getByText(/Working record: Not yet written in the register/)).toBeInTheDocument();
+    expect(within(section).queryByRole("button", { name: "Prepare working record" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the batch check away from a cashier", async () => {
+    renderApp("/app/settings/schedule-x", service({ role: "cashier" }));
+    expect(
+      await screen.findByRole("heading", { name: "This record is not available to your role" }, { timeout: 3000 })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Batches behind a Schedule X supply" })).not.toBeInTheDocument();
+  });
+
+  it("labels every cell so the mobile card can name it", async () => {
+    renderApp("/app/settings/schedule-x");
+    await awaitSupply();
+    const row = screen.getByTestId(`schedule-x-supply-${IDs.saleLine}`);
+    const labels = [...row.querySelectorAll("td")].map((cell) => cell.getAttribute("data-label"));
+    expect(labels).toEqual([
+      "Prescription",
+      "Date",
+      "Drug",
+      "Batch",
+      "Quantity",
+      "Batch accounted for",
+      "Actions"
+    ]);
+    const supply = within(row.closest("table") as HTMLElement);
+    for (const label of labels.filter((name) => name && name !== "Actions")) {
+      expect(supply.getByRole("columnheader", { name: label as string })).toBeInTheDocument();
+    }
   });
 });

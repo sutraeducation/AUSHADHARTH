@@ -15,7 +15,10 @@ import {
   SCHEDULE_X_STATUS_LABELS,
   confirmScheduleXEntry,
   finalizeScheduleXEntry,
+  SCHEDULE_X_LOT_PROVENANCE_LABELS,
   getScheduleXPrescriptionAnnotations,
+  getScheduleXSupplyPreparation,
+  prepareScheduleXSupplyEntry,
   getScheduleXRegister,
   listProfessionals,
   recordScheduleXPrescriptionAnnotation,
@@ -92,6 +95,13 @@ export function ScheduleXRegisterPage() {
       rule 65(9)(a) duplicate-copy confirmation because the two are independent requirements.
     */}
     <ScheduleXAnnotationsSection canMutate={canMutate} />
+
+    {/*
+      Phase 1M-D3-B — the batch behind a future supply. Kept beside the prescription-side facts
+      because both are things that must be true before anything leaves the shelf, and separate from
+      the receipt entries below, which are a record of what came in.
+    */}
+    <ScheduleXSupplySection canMutate={canMutate} />
 
     {register.isPending ? <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>Loading the working record…</b></div>
       : register.isError ? <div className="empty-state" role="alert"><h3>The working record could not be loaded</h3><p>The Local Store Service did not complete this request.</p><button className="button button--secondary" type="button" onClick={() => void register.refetch()}>Retry</button></div>
@@ -337,6 +347,89 @@ function AnnotationDialog({ occasion, sellerName, sellerAddress, onClose, onSave
   </CatalogDialog>;
 }
 
+
+/**
+ * Phase 1M-D3-B — the lot behind a Schedule X supply.
+ *
+ * Rule 65(21) keeps a running account of what came in and what went out, so a Schedule X drug may
+ * only be supplied from a batch whose every sellable unit arrived on a purchase that was written
+ * into the bound register. This screen shows that verdict per batch, and lets a working record be
+ * prepared for the ones that are accounted for.
+ *
+ * It does NOT sell anything. There is no action here that dispenses, and Schedule X dispensing at
+ * the counter is still refused.
+ */
+function ScheduleXSupplySection({ canMutate }: { canMutate: boolean }) {
+  const queryClient = useQueryClient();
+  const preparation = useQuery({
+    queryKey: ["schedule-x-supply-preparation"],
+    queryFn: getScheduleXSupplyPreparation,
+    retry: false
+  });
+  const [error, setError] = useState<string | null>(null);
+  const prepare = useMutation({
+    mutationFn: (saleLineId: string) => prepareScheduleXSupplyEntry(saleLineId),
+    onSuccess: () => {
+      setError(null);
+      void queryClient.invalidateQueries({ queryKey: ["schedule-x-supply-preparation"] });
+      void queryClient.invalidateQueries({ queryKey: ["schedule-x-register"] });
+    },
+    onError: (caught) => setError(describe(caught))
+  });
+
+  return <section className="master-panel" aria-labelledby="schedule-x-supply-title" data-testid="schedule-x-supply">
+    <div className="panel-header">
+      <div>
+        <h2 id="schedule-x-supply-title">Batches behind a Schedule X supply</h2>
+        <p>Rule 65(21) accounts for what came in and what went out, so a Schedule X medicine can only be supplied from a batch whose stock all arrived on a purchase you have written into your register. Preparing a working record here gathers the particulars; it does not dispense anything, and Schedule X dispensing at the counter is not yet available.</p>
+      </div>
+    </div>
+
+    {preparation.isPending ? <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>Loading batches…</b></div>
+      : preparation.isError ? <div className="empty-state" role="alert"><h3>Batches could not be loaded</h3><p>The Local Store Service did not complete this request.</p><button className="button button--secondary" type="button" onClick={() => void preparation.refetch()}>Retry</button></div>
+      : preparation.data.candidates.length === 0
+        ? <p className="panel-note">No draft sale is drawing on a Schedule X batch. One appears here when a draft sale carries a Schedule X line linked to a prescription.</p>
+        : <>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <ScrollableTable hint="Scroll sideways for the rest of the particulars">
+            <table className="data-table schedule-x-table">
+              <thead><tr>
+                <th scope="col">Prescription</th>
+                <th scope="col">Date</th>
+                <th scope="col">Drug</th>
+                <th scope="col">Batch</th>
+                <th scope="col">Quantity</th>
+                <th scope="col">Batch accounted for</th>
+                {canMutate && <th scope="col"><span className="visually-hidden">Actions</span></th>}
+              </tr></thead>
+              <tbody>{preparation.data.candidates.map((candidate) => {
+                const qualified = candidate.lotProvenance.state === "qualified";
+                return <tr key={candidate.saleLineId} data-testid={`schedule-x-supply-${candidate.saleLineId}`}>
+                  <td data-label="Prescription" className="cell-reference"><span className="register-reference">{candidate.prescriptionReference}</span><small>Prescription reference</small></td>
+                  <td data-label="Date">{candidate.businessDate}</td>
+                  <td data-label="Drug" className="cell-wide">{candidate.drugName}</td>
+                  <td data-label="Batch">{candidate.batchNumber}</td>
+                  <td data-label="Quantity">{candidate.quantityAtoms} units</td>
+                  {/* The verdict in words, never colour alone. */}
+                  <td data-label="Batch accounted for" className="cell-status">
+                    <span className={`status-badge status-badge--${qualified ? "posted" : "void"}`}>
+                      {SCHEDULE_X_LOT_PROVENANCE_LABELS[candidate.lotProvenance.state]}
+                    </span>
+                    {candidate.entryStatus && <small>Working record: {SCHEDULE_X_STATUS_LABELS[candidate.entryStatus]}</small>}
+                  </td>
+                  {canMutate && <td className="table-actions cell-actions" data-label="Actions">
+                    {candidate.entryId
+                      ? <small>Prepared</small>
+                      : <button className="button button--secondary" type="button" disabled={!qualified || prepare.isPending} onClick={() => { setError(null); prepare.mutate(candidate.saleLineId); }}>Prepare working record</button>}
+                  </td>}
+                </tr>;
+              })}</tbody>
+            </table>
+          </ScrollableTable>
+        </>}
+  </section>;
+}
+
 function FinalizeButton({ entry, onDone }: { entry: ScheduleXRegisterEntry; onDone: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const mutation = useMutation({
@@ -442,6 +535,8 @@ function describe(caught: unknown): string {
     if (caught.code === "schedule_x_seller_particulars_unavailable") return "Record the pharmacy's name and address in Store Profile first. AUSHADHARTH will not guess what was written.";
     if (caught.code === "schedule_x_prescription_annotation_not_confirmed") return "Tick the confirmation to record that the note was written.";
     if (caught.code === "schedule_x_prescription_annotation_already_recorded") return "This dispensing occasion already has a confirmation.";
+    if (caught.code === "schedule_x_lot_provenance_unresolved") return caught.issues?.[0]?.message ?? "This batch is not fully accounted for, so it cannot be supplied under Schedule X.";
+    if (caught.code === "schedule_x_supply_finalization_unavailable") return "This supply record is closed by the sale it records, and Schedule X dispensing is not yet available.";
     if (caught.code === "schedule_x_dispensing_date_in_future") return "This sale's date is later than today, so the prescription cannot yet have been dispensed.";
     return caught.message;
   }

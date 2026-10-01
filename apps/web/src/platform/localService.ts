@@ -227,6 +227,9 @@ export function safeErrorMessage(code?: string): string {
     case "schedule_x_prescription_annotation_not_confirmed": return "Tick the confirmation to record that the note was written on the prescription.";
     case "schedule_x_prescription_annotation_already_recorded": return "This dispensing occasion already has a prescription annotation confirmation.";
     case "schedule_x_dispensing_date_in_future": return "This sale's date is later than today, so the prescription cannot yet have been dispensed.";
+    // Phase 1M-D3-B: rule 65(21) lot provenance and the supply working record.
+    case "schedule_x_lot_provenance_unresolved": return "This batch cannot be supplied under Schedule X: not all of its stock traces to a purchase recorded in the Schedule X register.";
+    case "schedule_x_supply_finalization_unavailable": return "A Schedule X supply record can only be closed by the sale it records, and Schedule X dispensing is not yet available.";
     case "prescription_requirements_incomplete": return "This prescription sale is missing prescription requirements.";
     case "prescription_record_election_unresolved": return "The pharmacy's rule 65(3)(2) prescription-supply record election is not recorded. The owner records it in Drug Compliance.";
     case "prescription_record_prepared": return "This sale's prescription-supply entry is prepared, so the sale cannot be changed. Void the entry to change it; its serial is not reused.";

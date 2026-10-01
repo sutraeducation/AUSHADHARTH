@@ -9410,3 +9410,653 @@ async fn real_service_carries_the_prescription_annotation_through_backup_and_res
     assert_eq!(schemes, 0);
     reopened.close().await;
 }
+
+// ==============================================================================================
+// Phase 1M-D3-B — Schedule X lot provenance and the supply working entry
+// ==============================================================================================
+
+async fn supply_preparation_over_http(service: &Service, cookie: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        "/api/v1/store/schedule-x/supply-preparation",
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body
+}
+
+async fn prepare_supply_over_http(service: &Service, cookie: &str, line: &str) -> Reply {
+    call(
+        service,
+        "POST",
+        "/api/v1/store/schedule-x/supply-preparation",
+        Some(json!({ "saleLineId": line })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// A draft Schedule X sale of one pack drawing on a NAMED lot, linked to a prescription item and
+/// supervised. Mirrors `prepared_sale_over_http`, which always uses the world's seed lot.
+async fn prepared_sale_on_lot_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    batch: &str,
+    item: &str,
+    professional: &str,
+) -> (String, String, i64) {
+    let sale_id = sale_draft(service, world, None).await;
+    let with_line = call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "productId": world.product,
+            "productPackId": world.pack,
+            "batchId": batch,
+            "quantityBasis": "pack",
+            "quantity": 1,
+            "sellingRatePaise": 8000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let line_id = with_line.body["lines"][0]["id"]
+        .as_str()
+        .expect("line id")
+        .to_owned();
+    let linked = call(
+        service,
+        "PUT",
+        &format!("/api/v1/sale-lines/{line_id}/prescription"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "prescriptionItemId": item,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(linked.status, 200, "{:?}", linked.body);
+    let supplied = call(
+        service,
+        "PUT",
+        &format!("/api/v1/sales/{sale_id}/supply"),
+        Some(json!({
+            "expectedRevision": linked.body["revision"],
+            "supervisingProfessionalId": professional,
+            "prescriptionEndorsementConfirmed": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(supplied.status, 200, "{:?}", supplied.body);
+    (
+        sale_id,
+        line_id,
+        supplied.body["revision"].as_i64().expect("revision"),
+    )
+}
+
+/// Receives a lot AFTER the Schedule X finding is recorded, then writes its receipt into the
+/// physical register. That lot is the only one in these tests that can lawfully be supplied from.
+async fn qualified_lot_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    professional: &str,
+) -> String {
+    let batch = receive_lot(
+        service,
+        world,
+        "BX-QUALIFIED",
+        9550,
+        "INV-D3B-1",
+        "01997a00-0000-7000-8000-000000000e21",
+    )
+    .await;
+    let register = register_over_http(service, &world.cookie).await;
+    let entry = register["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["batchNumber"] == "BX-QUALIFIED")
+        .expect("receipt entry for the new lot")
+        .clone();
+    let confirmed = call(
+        service,
+        "POST",
+        &format!(
+            "/api/v1/store/schedule-x/register/{}/confirm",
+            entry["id"].as_str().expect("entry id")
+        ),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    batch
+}
+
+/// D3B-1. The provenance verdict across a real socket: the lot bought before anybody classified the
+/// drug cannot be supplied from, and the lot bought after — and written into the register — can.
+#[tokio::test]
+async fn real_service_supplies_only_from_a_lot_written_into_the_schedule_x_register_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+
+    // The world's seed lot arrived BEFORE the Schedule X finding existed, so no receipt working
+    // entry was ever prepared for it. It is exactly the legacy stock Phase 1M-D3-B holds back.
+    let (_, legacy_line, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &world.batch, &item, &professional).await;
+    let listed = supply_preparation_over_http(&service, &world.cookie).await;
+    let legacy = listed["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|candidate| candidate["saleLineId"] == legacy_line.as_str())
+        .expect("the legacy line is listed")
+        .clone();
+    assert_eq!(
+        legacy["lotProvenance"]["state"], "no_qualifying_receipt",
+        "{legacy:?}"
+    );
+    let refused = prepare_supply_over_http(&service, &world.cookie, &legacy_line).await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_lot_provenance_unresolved");
+
+    // A lot received after the finding, with its receipt written into the bound register, qualifies.
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (_, good_line, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let listed = supply_preparation_over_http(&service, &world.cookie).await;
+    let good = listed["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|candidate| candidate["saleLineId"] == good_line.as_str())
+        .expect("the qualified line is listed")
+        .clone();
+    assert_eq!(good["lotProvenance"]["state"], "qualified", "{good:?}");
+
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &good_line).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    assert_eq!(prepared.body["entryKind"], "supply");
+    assert_eq!(prepared.body["status"], "prepared");
+    assert_eq!(prepared.body["supplyBasis"], "prescription");
+    assert_eq!(prepared.body["batchNumber"], "BX-QUALIFIED");
+    // Neither physical act is asserted by preparing a working record.
+    assert_eq!(prepared.body["particularsEnteredInPhysicalRegister"], false);
+    assert_eq!(prepared.body["physicalEntryAuthenticated"], false);
+
+    // A retry after a client timeout is handed the same working entry, not a second one.
+    let retried = prepare_supply_over_http(&service, &world.cookie, &good_line).await;
+    assert_eq!(retried.status, 200, "{:?}", retried.body);
+    assert_eq!(retried.body["id"], prepared.body["id"]);
+
+    // The list carries no patient and no prescriber.
+    let text = listed.to_string();
+    for private in ["Sita Kulkarni", "Lakshmi Road", "Anjali Rao", "Rao Clinic"] {
+        assert!(!text.contains(private), "{private} leaked: {listed}");
+    }
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let supplies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply' AND status<>'void'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("supplies");
+    assert_eq!(supplies, 1, "a retry wrote a second working entry");
+    pool.close().await;
+}
+
+/// D3B-2. Two preparations of the same line at the same instant. Exactly one durable working entry
+/// survives, and one reference is issued.
+#[tokio::test]
+async fn real_service_keeps_one_schedule_x_supply_entry_under_a_race_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (_, line_id, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+
+    let (first, second) = tokio::join!(
+        prepare_supply_over_http(&service, &world.cookie, &line_id),
+        prepare_supply_over_http(&service, &world.cookie, &line_id),
+    );
+    for reply in [&first, &second] {
+        assert!(
+            reply.status == 201 || reply.status == 200,
+            "{:?}",
+            reply.body
+        );
+    }
+    assert_eq!(
+        first.body["id"], second.body["id"],
+        "two entries were written"
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply' AND sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows, 1);
+    // One reference issued, never two for one supply.
+    let references: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT reference) FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("references");
+    assert_eq!(references, 1);
+    pool.close().await;
+}
+
+/// D3B-3. The physical register acts can be attested for a supply entry, and the entry still cannot
+/// be closed: a supply record is closed by the sale it records, and that sale cannot post.
+#[tokio::test]
+async fn real_service_confirms_but_never_closes_a_schedule_x_supply_entry_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (_, line_id, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+
+    // The same confirmation the receipt side uses: both physical acts, and a named registered
+    // pharmacist whose record covers the day.
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    assert_eq!(confirmed.body["status"], "confirmed");
+
+    // And closing it is refused, in words rather than as a constraint name.
+    let closed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/finalize"),
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(closed.status, 409, "{:?}", closed.body);
+    assert_eq!(
+        closed.body["code"],
+        "schedule_x_supply_finalization_unavailable"
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let finalized: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply' AND status='finalized'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("finalized");
+    assert_eq!(
+        finalized, 0,
+        "a supply entry was closed with no sale behind it"
+    );
+    pool.close().await;
+}
+
+/// D3B-4. Schedule X regulatory records stay with the owner and the pharmacist. A cashier can
+/// neither read the provenance surface nor prepare a supply record.
+#[tokio::test]
+async fn real_service_refuses_schedule_x_supply_preparation_to_a_cashier_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (_, line_id, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "till-d3b",
+        "01997a00-0000-7000-8000-0000000003b1",
+    )
+    .await;
+    let read = call(
+        &service,
+        "GET",
+        "/api/v1/store/schedule-x/supply-preparation",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(read.status, 403, "{:?}", read.body);
+    let write = prepare_supply_over_http(&service, &cashier, &line_id).await;
+    assert_eq!(write.status, 403, "{:?}", write.body);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE entry_kind='supply'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows, 0);
+    pool.close().await;
+}
+
+/// D3B-5, item 35 — THE HARD SCHEDULE X BOUNDARY, with every D3-B fact added.
+///
+/// Every favourable fact this software can record now exists: the classification, Form 20-F
+/// authority with the drug covered, a lot whose provenance traces to a posted purchase whose
+/// receipt is written and authenticated in the bound register, a valid prescription for the exact
+/// product, the retained duplicate copy, the rule 65(11)(c) annotation, a date-valid supervising
+/// pharmacist, AND a Schedule X SUPPLY working entry prepared and confirmed against the physical
+/// register.
+///
+/// The sale is still refused. Compliance preparation is not an authority to dispense.
+#[tokio::test]
+async fn real_service_keeps_schedule_x_refused_with_every_d3b_fact_present_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    assert_eq!(
+        authority_over_http(&service, &world, SALE_DATE).await["state"],
+        "established"
+    );
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, sale_revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // Everything this software can record is recorded. The counter still refuses.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-0000000002fb",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let outflow: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("movements");
+    assert_eq!(outflow, 0, "a refused Schedule X sale moved stock");
+    let dispensings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("dispensings");
+    assert_eq!(dispensings, 0);
+    // The supply working entry exists and is CONFIRMED — the physical register was written — but it
+    // is not FINALIZED, because no supply happened. That is the designed lifecycle.
+    let states: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status,dispensing_id FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("supply states");
+    assert_eq!(states, vec![("confirmed".to_owned(), None)], "{states:?}");
+    pool.close().await;
+
+    let text = refused.body.to_string().to_lowercase();
+    for word in ["banned", "prohibit", "illegal"] {
+        assert!(!text.contains(word), "{word}: {:?}", refused.body);
+    }
+}
+
+/// D3B-6, item 31. Migration 0028 adds durable provenance evidence, so the existing backup path has
+/// to carry it — the lot identity, the lifecycle state, and the receipt linkage that qualified it.
+#[tokio::test]
+async fn real_service_carries_schedule_x_supply_provenance_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_sale_world(service, 1).await;
+    schedule_over_http(service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(service, &world).await;
+    let (_, item) = prescription_over_http(service, &world, None, 20).await;
+    let batch = qualified_lot_over_http(service, &world, &professional).await;
+    let (_, line_id, _) =
+        prepared_sale_on_lot_over_http(service, &world, &batch, &item, &professional).await;
+    let prepared = prepare_supply_over_http(service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let reference = prepared.body["reference"]
+        .as_str()
+        .expect("reference")
+        .to_owned();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let resolved = call(
+        service,
+        "GET",
+        &format!(
+            "/api/v1/backups/{}/download",
+            created.body["backupId"].as_str().expect("backup id")
+        ),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(resolved.status, 200, "{:?}", resolved.body);
+    let (status, _, downloaded) = get_bytes(
+        service,
+        resolved.body["url"].as_str().expect("url"),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Something after the backup that the restore must undo.
+    let after = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Post-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(after.status, 201, "{:?}", after.body);
+
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &downloaded,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared_restore: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({
+            "candidateToken": prepared_restore["candidateToken"].as_str().expect("token"),
+            "password": "Integration-Password-42"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    let post_backup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM parties WHERE display_name='Post-Backup Supplier'",
+    )
+    .fetch_one(&reopened)
+    .await
+    .expect("parties");
+    assert_eq!(post_backup, 0, "the restore did not roll the pharmacy back");
+
+    // The supply working entry came back with its lot identity, its reference and its state.
+    let restored: (String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT reference,status,batch_id,dispensing_id FROM store_schedule_x_register_entries \
+         WHERE id=?",
+    )
+    .bind(&entry_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("the supply working entry did not survive the restore");
+    assert_eq!(restored.0, reference);
+    assert_eq!(restored.1, "prepared");
+    assert_eq!(restored.2, batch);
+    assert_eq!(restored.3, None);
+
+    // And the provenance that qualified it is still derivable: the lot's every sellable inward
+    // movement is a purchase whose receipt entry is confirmed.
+    let unresolved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements inward \
+         WHERE inward.batch_id=? AND inward.stock_status='sellable' \
+           AND inward.quantity_delta_atoms>0 \
+           AND NOT (inward.movement_type='purchase' AND EXISTS (\
+               SELECT 1 FROM store_schedule_x_register_entries receipt \
+               WHERE receipt.entry_kind='receipt' \
+                 AND receipt.purchase_line_id=inward.purchase_line_id \
+                 AND receipt.status IN ('confirmed','finalized')))",
+    )
+    .bind(&batch)
+    .fetch_one(&reopened)
+    .await
+    .expect("provenance");
+    assert_eq!(unresolved, 0, "the lot's provenance did not survive intact");
+    reopened.close().await;
+}

@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::api::auth::{self, AuthError, AuthenticatedActor};
 use crate::api::reference_masters::ReferenceState;
 use crate::domain::catalog::{optional_text, required_text, validate_uuid_v7};
-use crate::domain::{prescriptions, store_profile};
+use crate::domain::{prescriptions, schedule_x, store_profile};
 
 #[derive(Debug)]
 enum ScheduleXError {
@@ -60,6 +60,13 @@ enum ScheduleXError {
     /// Two requests raced for the same occasion. The winner's row is the one fact, and the loser is
     /// told so rather than being handed a second.
     AnnotationAlreadyRecorded,
+    /// The exact lot this sale line draws on does not trace to a purchase whose Schedule X receipt
+    /// was written into the physical register. Rule 65(21) keeps a running account of what came in
+    /// and what went out, and stock that cannot be accounted for cannot be supplied from.
+    LotProvenanceUnresolved(schedule_x::LotProvenance),
+    /// A supply working entry records a supply that HAPPENED. It cannot be closed while a Schedule X
+    /// sale cannot post, because there would be nothing for it to be a record of.
+    SupplyFinalizationUnavailable,
     Internal,
 }
 
@@ -187,6 +194,28 @@ impl IntoResponse for ScheduleXError {
                     "This sale's date is later than today, so the prescription cannot yet have been dispensed.",
                 ),
             ),
+            Self::LotProvenanceUnresolved(provenance) => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "schedule_x_lot_provenance_unresolved",
+                    message: "This batch cannot be supplied under Schedule X: not all of its stock traces to a purchase recorded in the Schedule X register.",
+                    issues: vec![ErrorIssue {
+                        field: "saleLineId".to_owned(),
+                        message: match provenance {
+                            schedule_x::LotProvenance::NoQualifyingReceipt => "No purchase of this batch has a confirmed Schedule X register entry. Record the receipt in your register first, or use a batch that has one.".to_owned(),
+                            schedule_x::LotProvenance::UnresolvedInwardMovement => "Some stock in this batch did not arrive on a recorded purchase — opening stock, a correction, a count, or goods released back from quarantine. Stock in one batch cannot be told apart, so the whole batch is held back.".to_owned(),
+                            schedule_x::LotProvenance::Qualified => "This batch is accounted for.".to_owned(),
+                        },
+                    }],
+                },
+            ),
+            Self::SupplyFinalizationUnavailable => (
+                StatusCode::CONFLICT,
+                simple(
+                    "schedule_x_supply_finalization_unavailable",
+                    "A Schedule X supply record can only be closed by the sale it records, and Schedule X dispensing is not yet available.",
+                ),
+            ),
             Self::AnnotationAlreadyRecorded => (
                 StatusCode::CONFLICT,
                 simple(
@@ -210,6 +239,14 @@ impl IntoResponse for ScheduleXError {
 /// an error string is not a place to widen exposure.
 fn map_database_error(error: sqlx::Error) -> ScheduleXError {
     let text = error.to_string();
+    // Phase 1M-D3-B: the 0028 lot guard, refused by the database whoever wrote the statement. The
+    // reason is not re-derived here — the service checks provenance first and names it, so reaching
+    // this line means something bypassed that path.
+    if text.contains("schedule_x_supply_lot_provenance_unresolved") {
+        return ScheduleXError::LotProvenanceUnresolved(
+            crate::domain::schedule_x::LotProvenance::UnresolvedInwardMovement,
+        );
+    }
     if text.contains("schedule_x_register_entry_immutable") {
         return ScheduleXError::Finalized;
     }
@@ -311,6 +348,17 @@ struct RegisterEntryResponse {
     supplier_address: Option<String>,
     supplier_licence_state: Option<String>,
     supplier_licence_number: Option<String>,
+    // Phase 1M-D3-B — the supply side's own linkage. The patient's name and address are rule
+    // 65(21)(b)(vii) particulars and are deliberately NOT here: this list is read beside the
+    // receipt entries, and a working record cannot be transcribed in full yet anyway, because rule
+    // 65(21)(b)(ix) wants the bill number of a supply that has not happened.
+    supply_basis: Option<String>,
+    sale_document_id: Option<String>,
+    sale_line_id: Option<String>,
+    prescription_id: Option<String>,
+    prescription_reference: Option<String>,
+    batch_id: Option<String>,
+    dispensing_id: Option<String>,
     status: String,
     particulars_entered_in_physical_register: bool,
     physical_entry_authenticated: bool,
@@ -352,7 +400,9 @@ struct ScheduleXRegisterResponse {
 const ENTRY_COLUMNS: &str = "id,entry_kind,reference,transaction_date,drug_name,product_id,\
      batch_state,batch_number,manufacturer_state,manufacturer_name,quantity_atoms,quantity_packs,\
      bill_number,bill_date,purchase_document_id,purchase_line_id,supplier_name,\
-     supplier_address_state,supplier_address,supplier_licence_state,supplier_licence_number,status,\
+     supplier_address_state,supplier_address,supplier_licence_state,supplier_licence_number,\
+     supply_basis,sale_document_id,sale_line_id,prescription_id,prescription_reference,batch_id,\
+     dispensing_id,status,\
      particulars_entered_in_physical_register,physical_entry_authenticated,\
      supervising_professional_id,supervising_professional_name,confirmed_at_utc,finalized_at_utc,\
      voided_at_utc,void_reason,created_at_utc";
@@ -611,6 +661,21 @@ async fn finalize_entry(
     let status = load_mutable(&mut transaction, &id, &store_id).await?;
     if status != "confirmed" {
         return Err(ScheduleXError::PhysicalConfirmationRequired);
+    }
+    // Phase 1M-D3-B. A SUPPLY entry is a record of a supply that happened, so it is closed by the
+    // sale it records, in the same transaction that posts that sale. Schedule X sales cannot post,
+    // so there is nothing for it to be a record of yet; the 0028 trigger refuses this independently
+    // and this says so in words instead of as a constraint name.
+    let kind: String = sqlx::query_scalar(
+        "SELECT entry_kind FROM store_schedule_x_register_entries WHERE id=? AND store_id=?",
+    )
+    .bind(&id)
+    .bind(&store_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+    if kind == "supply" {
+        return Err(ScheduleXError::SupplyFinalizationUnavailable);
     }
     let now = database_now(&mut transaction).await?;
     sqlx::query(
@@ -1149,6 +1214,10 @@ pub fn routes() -> Router<ReferenceState> {
             get(get_annotations).post(record_annotation),
         )
         .route(
+            "/api/v1/store/schedule-x/supply-preparation",
+            get(get_supply_preparation).post(prepare_supply_entry),
+        )
+        .route(
             "/api/v1/store/schedule-x/register/{id}/confirm",
             post(confirm_entry),
         )
@@ -1164,4 +1233,335 @@ pub fn routes() -> Router<ReferenceState> {
             "/api/v1/prescriptions/{id}/schedule-x-duplicate-copy",
             post(attest_duplicate_copy),
         )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-D3-B — lot provenance and the Schedule X supply working entry
+// ---------------------------------------------------------------------------------------------
+
+/// A draft Schedule X sale line, with the verdict on the lot it is drawing from.
+///
+/// Carries the prescription's own reference and never the patient's or the prescriber's name: this
+/// surface exists to decide whether stock may lawfully leave a shelf, and a name would widen
+/// exposure for no purpose.
+#[derive(Debug, Serialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SupplyCandidateRow {
+    sale_document_id: String,
+    sale_line_id: String,
+    prescription_id: String,
+    prescription_item_id: String,
+    product_id: String,
+    drug_name: String,
+    batch_id: String,
+    batch_number: String,
+    quantity_atoms: i64,
+    business_date: String,
+    prescription_reference: String,
+    /// The live supply working entry for this line, when one has been prepared.
+    entry_id: Option<String>,
+    entry_status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SupplyCandidate {
+    #[serde(flatten)]
+    row: SupplyCandidateRow,
+    /// Whether the exact lot this line draws on traces to a qualifying purchase receipt.
+    lot_provenance: schedule_x::LotProvenance,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SupplyPreparationResponse {
+    candidates: Vec<SupplyCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareSupplyRequest {
+    sale_line_id: String,
+}
+
+/// Every draft Schedule X sale line of this store, with its lot and any supply entry it already has.
+///
+/// "Schedule X" is the owner's effective-dated finding as at the Sale's own business date, resolved
+/// the same way the 0026 and 0028 triggers resolve it, so this list and those guards cannot
+/// disagree about which lines belong here.
+const SUPPLY_SOURCE_FROM: &str = "FROM sale_documents document \
+     JOIN sale_lines line ON line.sale_document_id=document.id \
+     JOIN prescription_items item ON item.id=line.prescription_item_id \
+     JOIN prescriptions prescription ON prescription.id=item.prescription_id \
+     JOIN products product ON product.id=line.product_id \
+     JOIN product_batches batch ON batch.id=line.batch_id \
+     WHERE document.store_id=? AND document.status='draft' AND prescription.status='active' \
+       AND EXISTS (SELECT 1 FROM product_regulatory_classifications finding \
+           WHERE finding.product_id=line.product_id AND finding.scheme='schedule_x' \
+             AND finding.status='active' AND finding.applies=1 \
+             AND finding.effective_from<=document.business_date \
+             AND (finding.effective_to IS NULL OR finding.effective_to>document.business_date))";
+
+/// The columns both the listing and the preparation read, so they cannot describe the same line
+/// differently.
+const SUPPLY_SOURCE_COLUMNS: &str = "document.id AS sale_document_id,\
+     line.id AS sale_line_id,prescription.id AS prescription_id,\
+     item.id AS prescription_item_id,line.product_id AS product_id,\
+     product.display_name AS drug_name,line.batch_id AS batch_id,\
+     batch.batch_number AS batch_number,line.quantity_atoms AS quantity_atoms,\
+     document.business_date AS business_date,prescription.reference AS prescription_reference";
+
+async fn get_supply_preparation(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+) -> Result<Json<SupplyPreparationResponse>, ScheduleXError> {
+    require_regulatory_reader(&state, &headers).await?;
+    let store_id = current_store(&state).await?;
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    let rows: Vec<SupplyCandidateRow> = sqlx::query_as(&format!(
+        "SELECT {SUPPLY_SOURCE_COLUMNS},\
+         (SELECT entry.id FROM store_schedule_x_register_entries entry \
+            WHERE entry.entry_kind='supply' AND entry.sale_line_id=line.id \
+              AND entry.status<>'void') AS entry_id,\
+         (SELECT entry.status FROM store_schedule_x_register_entries entry \
+            WHERE entry.entry_kind='supply' AND entry.sale_line_id=line.id \
+              AND entry.status<>'void') AS entry_status \
+         {SUPPLY_SOURCE_FROM} ORDER BY document.business_date,line.line_number"
+    ))
+    .bind(&store_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let lot_provenance =
+            schedule_x::resolve_lot_provenance(&mut connection, &store_id, &row.batch_id)
+                .await
+                .map_err(map_database_error)?;
+        candidates.push(SupplyCandidate {
+            row,
+            lot_provenance,
+        });
+    }
+    Ok(Json(SupplyPreparationResponse { candidates }))
+}
+
+/// The particulars a supply working entry freezes, gathered from the draft Sale and its prescription.
+#[derive(Debug, FromRow)]
+struct SupplySource {
+    sale_document_id: String,
+    sale_line_id: String,
+    prescription_id: String,
+    prescription_item_id: String,
+    product_id: String,
+    drug_name: String,
+    batch_id: String,
+    batch_number: String,
+    quantity_atoms: i64,
+    business_date: String,
+    prescription_reference: String,
+    subject_kind: String,
+    subject_name: String,
+    subject_address: String,
+}
+
+/// Prepares the Schedule X supply working entry for one draft sale line.
+///
+/// What this is: the rule 65(21)(b) supply particulars gathered so a person can write them into the
+/// bound register. What it is not: a supply. Nothing here moves stock, dispenses anything, or makes
+/// a Schedule X sale possible — the sale gate is untouched and still refuses.
+///
+/// The lot the line draws on must trace to a posted purchase whose own Schedule X receipt entry has
+/// been written into the physical register and authenticated. The 0028 trigger enforces that
+/// independently; this checks it first so the operator gets a reason rather than a constraint name.
+async fn prepare_supply_entry(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Json(request): Json<PrepareSupplyRequest>,
+) -> Result<(StatusCode, Json<RegisterEntryResponse>), ScheduleXError> {
+    let actor = require_regulatory_writer(&state, &headers).await?;
+    validate_uuid_v7(&request.sale_line_id, "saleLineId")
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let store_id = current_store(&state).await?;
+
+    // BEGIN IMMEDIATE: this reads the lot's whole inward history and then writes an entry that
+    // asserts something about it. A deferred begin would let two preparations race to upgrade a
+    // read lock, and would let a movement land between the verdict and the row that records it.
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    let outcome =
+        prepare_supply_within(&mut connection, &store_id, &actor.id, &request.sale_line_id).await;
+    let statement = if outcome.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    sqlx::query(statement)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    let (status, id) = outcome?;
+    let created: RegisterEntryResponse = sqlx::query_as(&format!(
+        "SELECT {ENTRY_COLUMNS} FROM store_schedule_x_register_entries WHERE id=?"
+    ))
+    .bind(&id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    Ok((status, Json(created)))
+}
+
+async fn prepare_supply_within(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    actor_id: &str,
+    sale_line_id: &str,
+) -> Result<(StatusCode, String), ScheduleXError> {
+    // Already prepared? Then this is a retry, and the existing working entry is the answer.
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply' AND sale_line_id=? AND store_id=? AND status<>'void'",
+    )
+    .bind(sale_line_id)
+    .bind(store_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    if let Some(id) = existing {
+        return Ok((StatusCode::OK, id));
+    }
+
+    let source: Option<SupplySource> = sqlx::query_as(&format!(
+        "SELECT {SUPPLY_SOURCE_COLUMNS},\
+         prescription.subject_kind AS subject_kind,prescription.subject_name AS subject_name,\
+         prescription.subject_address AS subject_address \
+         {SUPPLY_SOURCE_FROM} AND line.id=?"
+    ))
+    .bind(store_id)
+    .bind(sale_line_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    let Some(source) = source else {
+        // Not a Schedule X line of a draft Sale of this store with an active prescription. Said as
+        // "not found" rather than enumerating which limb failed, which would let a caller probe
+        // another store's documents.
+        return Err(ScheduleXError::NotFound);
+    };
+
+    // The lot. Checked here so the operator is told WHY, and again by the 0028 trigger so a script
+    // that never calls this endpoint is refused just the same.
+    let provenance =
+        schedule_x::resolve_lot_provenance(&mut *connection, store_id, &source.batch_id)
+            .await
+            .map_err(map_database_error)?;
+    if !provenance.is_qualified() {
+        return Err(ScheduleXError::LotProvenanceUnresolved(provenance));
+    }
+
+    // The manufacturer as recorded for this product on the date of supply. A particular the store
+    // never recorded stays absent: `not_recorded` is the truth about the record, and filling it in
+    // from somewhere else would be a fabrication dressed as history.
+    let manufacturer: Option<(String, String)> = sqlx::query_as(
+        "SELECT company.id,company.display_name FROM product_company_roles role \
+         JOIN pharmaceutical_companies company ON company.id=role.company_id \
+         WHERE role.product_id=? AND role.role='manufacturer' AND role.status='active' \
+           AND (role.effective_from IS NULL OR role.effective_from<=?) \
+           AND (role.effective_to IS NULL OR role.effective_to>?) \
+         ORDER BY COALESCE(role.effective_from,'') DESC, role.id DESC LIMIT 1",
+    )
+    .bind(&source.product_id)
+    .bind(&source.business_date)
+    .bind(&source.business_date)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    let manufacturer_name = manufacturer.map(|(_, name)| name);
+    let manufacturer_state = if manufacturer_name.is_some() {
+        "recorded"
+    } else {
+        "not_recorded"
+    };
+
+    let reference_value: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(reference_value),0)+1 FROM store_schedule_x_register_entries \
+         WHERE store_id=?",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    let reference = format!("AXR-{reference_value:06}");
+    let id = Uuid::now_v7().to_string();
+    let now = database_now(&mut *connection).await?;
+
+    // `bill_number` and `bill_date` stay NULL. Rule 65(21)(b)(ix) asks for the bill of the supply,
+    // and a draft Sale has no document number — it acquires one only when it posts. Recording the
+    // draft's id there would be inventing a bill that does not exist. The slice that enables
+    // posting is where that particular can truthfully be written.
+    sqlx::query(
+        "INSERT INTO store_schedule_x_register_entries (id,store_id,entry_kind,reference_value,\
+         reference,transaction_date,drug_name,product_id,batch_state,batch_number,batch_id,\
+         manufacturer_state,manufacturer_name,quantity_atoms,supply_basis,sale_document_id,\
+         sale_line_id,prescription_id,prescription_item_id,subject_kind,purchaser_name,\
+         purchaser_address,prescription_reference,status,prepared_by_user_id,prepared_at_utc,\
+         created_at_utc,updated_at_utc) \
+         VALUES (?,?,'supply',?,?,?,?,?,'recorded',?,?,?,?,?,'prescription',?,?,?,?,?,?,?,?,\
+         'prepared',?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(store_id)
+    .bind(reference_value)
+    .bind(&reference)
+    .bind(&source.business_date)
+    .bind(&source.drug_name)
+    .bind(&source.product_id)
+    .bind(&source.batch_number)
+    .bind(&source.batch_id)
+    .bind(manufacturer_state)
+    .bind(&manufacturer_name)
+    .bind(source.quantity_atoms)
+    .bind(&source.sale_document_id)
+    .bind(&source.sale_line_id)
+    .bind(&source.prescription_id)
+    .bind(&source.prescription_item_id)
+    .bind(&source.subject_kind)
+    .bind(&source.subject_name)
+    .bind(&source.subject_address)
+    .bind(&source.prescription_reference)
+    .bind(actor_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+
+    // Identifiers and the transition. No patient, no prescriber, no dose, no address.
+    record_event(
+        &mut *connection,
+        "schedule_x_register_entry",
+        &id,
+        "created",
+        None,
+        serde_json::json!({
+            "entryKind": "supply",
+            "reference": reference,
+            "saleDocumentId": source.sale_document_id,
+            "saleLineId": source.sale_line_id,
+            "prescriptionId": source.prescription_id,
+            "prescriptionItemId": source.prescription_item_id,
+            "productId": source.product_id,
+            "batchId": source.batch_id,
+            "transactionDate": source.business_date,
+            "lotProvenance": "qualified",
+        }),
+        actor_id,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, id))
 }

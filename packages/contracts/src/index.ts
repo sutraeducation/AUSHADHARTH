@@ -3178,6 +3178,19 @@ export const ScheduleXRegisterEntrySchema = z.object({
   supplierAddress: z.string().nullable(),
   supplierLicenceState: ScheduleXParticularStateSchema.nullable(),
   supplierLicenceNumber: z.string().nullable(),
+  /**
+   * Phase 1M-D3-B — the supply side's own linkage. The patient's name and address are rule
+   * 65(21)(b)(vii) particulars and are deliberately absent: a working record cannot be transcribed
+   * in full until the sale it records has a bill number, which rule 65(21)(b)(ix) asks for.
+   */
+  supplyBasis: z.literal("prescription").nullable(),
+  saleDocumentId: z.string().nullable(),
+  saleLineId: z.string().nullable(),
+  prescriptionId: z.string().nullable(),
+  prescriptionReference: z.string().nullable(),
+  /** The lot itself, beside the printed batch number rule 65(21)(b)(vi) asks for. */
+  batchId: z.string().nullable(),
+  dispensingId: z.string().nullable(),
   status: ScheduleXEntryStatusSchema,
   particularsEnteredInPhysicalRegister: z.boolean(),
   physicalEntryAuthenticated: z.boolean(),
@@ -3299,6 +3312,42 @@ export const RecordScheduleXPrescriptionAnnotationRequestSchema = z.object({
   note: z.string().nullable().optional()
 });
 
+/**
+ * Phase 1M-D3-B — whether the exact lot a draft Schedule X sale line draws on traces to a purchase
+ * whose receipt was written into the bound register.
+ *
+ * `unresolvedInwardMovement` is the harder case: stock entered the lot from outside the purchase
+ * path — opening stock, a correction, a count, or goods released back from quarantine — and stock
+ * inside one lot cannot be told apart, so the whole lot is held back.
+ */
+export const ScheduleXLotProvenanceSchema = z.object({
+  state: z.enum(["qualified", "no_qualifying_receipt", "unresolved_inward_movement"])
+});
+
+export const ScheduleXSupplyCandidateSchema = z.object({
+  saleDocumentId: z.string(),
+  saleLineId: z.string(),
+  prescriptionId: z.string(),
+  prescriptionItemId: z.string(),
+  productId: z.string(),
+  drugName: z.string(),
+  batchId: z.string(),
+  batchNumber: z.string(),
+  quantityAtoms: z.number().int(),
+  businessDate: z.string(),
+  prescriptionReference: z.string(),
+  /** The live supply working entry for this line, when one has been prepared. */
+  entryId: z.string().nullable(),
+  entryStatus: ScheduleXEntryStatusSchema.nullable(),
+  lotProvenance: ScheduleXLotProvenanceSchema
+});
+
+export const ScheduleXSupplyPreparationSchema = z.object({
+  candidates: z.array(ScheduleXSupplyCandidateSchema)
+});
+
+export const PrepareScheduleXSupplyRequestSchema = z.object({ saleLineId: z.string() });
+
 export type ScheduleXEntryKind = z.infer<typeof ScheduleXEntryKindSchema>;
 export type ScheduleXEntryStatus = z.infer<typeof ScheduleXEntryStatusSchema>;
 export type ScheduleXParticularState = z.infer<typeof ScheduleXParticularStateSchema>;
@@ -3321,3 +3370,7 @@ export type ScheduleXPrescriptionAnnotations = z.infer<
 export type RecordScheduleXPrescriptionAnnotationRequest = z.infer<
   typeof RecordScheduleXPrescriptionAnnotationRequestSchema
 >;
+export type ScheduleXLotProvenance = z.infer<typeof ScheduleXLotProvenanceSchema>;
+export type ScheduleXSupplyCandidate = z.infer<typeof ScheduleXSupplyCandidateSchema>;
+export type ScheduleXSupplyPreparation = z.infer<typeof ScheduleXSupplyPreparationSchema>;
+export type PrepareScheduleXSupplyRequest = z.infer<typeof PrepareScheduleXSupplyRequestSchema>;

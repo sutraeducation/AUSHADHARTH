@@ -8,12 +8,15 @@ import {
   ScheduleXRegisterEntrySchema,
   ScheduleXPrescriptionAnnotationSchema,
   ScheduleXPrescriptionAnnotationsSchema,
+  ScheduleXRegisterEntrySchema as ScheduleXEntrySchema,
+  ScheduleXSupplyPreparationSchema,
   type ConfirmScheduleXEntryRequest,
   type ScheduleXEntryKind,
   type ScheduleXEntryStatus,
   type ScheduleXRegister,
   type RecordScheduleXPrescriptionAnnotationRequest,
   type ScheduleXPrescriptionAnnotations,
+  type ScheduleXSupplyPreparation,
   type VoidScheduleXEntryRequest,
   LicenceDrugCoverageSchema,
   RecordElectionSchema,
@@ -407,3 +410,34 @@ export async function recordScheduleXPrescriptionAnnotation(
     })
   );
 }
+
+// --- Phase 1M-D3-B: lot provenance and the supply working entry -------------------------------
+
+/**
+ * Every draft Schedule X sale line, with the verdict on the exact lot it draws on.
+ *
+ * Rule 65(21) keeps a running account of what came in and what went out, so stock that cannot be
+ * accounted for cannot be supplied from. This reads that verdict; it does not sell anything.
+ */
+export async function getScheduleXSupplyPreparation(): Promise<ScheduleXSupplyPreparation> {
+  return ScheduleXSupplyPreparationSchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/supply-preparation")
+  );
+}
+
+/** Gathers the rule 65(21)(b) supply particulars for one line so a person can write the register. */
+export async function prepareScheduleXSupplyEntry(saleLineId: string) {
+  return ScheduleXEntrySchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/supply-preparation", {
+      method: "POST",
+      body: JSON.stringify({ saleLineId })
+    })
+  );
+}
+
+/** Said to a pharmacy operator standing at a shelf, not to a lawyer. */
+export const SCHEDULE_X_LOT_PROVENANCE_LABELS: Record<string, string> = {
+  qualified: "Traced to a recorded purchase",
+  no_qualifying_receipt: "Purchase not yet written in the register",
+  unresolved_inward_movement: "Stock in this batch is not accounted for"
+};

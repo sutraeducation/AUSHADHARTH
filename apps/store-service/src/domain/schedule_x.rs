@@ -272,3 +272,122 @@ pub async fn prepare_receipt_entries(
     }
     Ok(outcome)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-D3-B — lot provenance
+// ---------------------------------------------------------------------------------------------
+
+/// Why a lot cannot support a Schedule X supply.
+///
+/// Named reasons, not a boolean, because "you may not sell this" is a thing an operator has to act
+/// on, and "some stock in this lot did not come from a recorded purchase" tells them what to look
+/// at. No reason carries a patient, a prescriber or a price.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "reason")]
+pub enum LotProvenance {
+    /// Every sellable unit in this lot arrived on a posted purchase whose Schedule X receipt entry
+    /// has been written into the physical register and authenticated.
+    Qualified,
+    /// Nothing qualifying ever brought this lot in. Legacy stock, or stock whose receipt entry is
+    /// still only prepared, or was withdrawn.
+    NoQualifyingReceipt,
+    /// Something other than a qualifying purchase added sellable stock to this lot — opening stock,
+    /// an adjustment, a counted surplus, or goods released back from quarantine after a return.
+    /// Stock inside a lot is fungible, so this disqualifies the whole lot, not part of it.
+    UnresolvedInwardMovement,
+}
+
+impl LotProvenance {
+    pub fn is_qualified(&self) -> bool {
+        matches!(self, Self::Qualified)
+    }
+}
+
+/// The one qualifying-purchase test, written once.
+///
+/// This is the exact predicate the 0028 trigger enforces. It lives here as a string so the service
+/// and the database cannot drift into two different ideas of what a qualifying receipt is: if this
+/// changes, the trigger has to change with it, and the migration test compares them.
+const QUALIFYING_RECEIPT_SQL: &str = "inward.movement_type = 'purchase' AND EXISTS (\
+     SELECT 1 FROM store_schedule_x_register_entries receipt \
+     JOIN purchase_documents source ON source.id = receipt.purchase_document_id \
+     WHERE receipt.entry_kind = 'receipt' \
+       AND receipt.purchase_line_id = inward.purchase_line_id \
+       AND receipt.store_id = ?1 \
+       AND receipt.status IN ('confirmed', 'finalized') \
+       AND receipt.particulars_entered_in_physical_register = 1 \
+       AND receipt.physical_entry_authenticated = 1 \
+       AND source.store_id = ?1 \
+       AND source.status = 'posted')";
+
+/// Whether a specific inventory lot may support a Schedule X supply.
+///
+/// THE INVARIANT: every movement that ADDS to the SELLABLE balance of this lot, in this store, must
+/// be a posted purchase whose Schedule X receipt working entry has been written into the physical
+/// register and authenticated.
+///
+/// It is written as "nothing disqualifying entered", not "something qualifying entered", because
+/// stock inside one lot is fungible. A lot holding fifty qualifying units and fifty units of
+/// opening stock cannot say which fifty are being handed over, so the whole lot fails. One good
+/// delivery never launders a bad one.
+///
+/// Quantity is deliberately NOT re-derived here. A purchase return lowers the lot's sellable
+/// balance without being an inward movement, and the Phase 1H posting path already refuses a sale
+/// line that exceeds the sellable balance of its lot. A second opinion about the arithmetic would
+/// eventually disagree with the first.
+pub async fn resolve_lot_provenance(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    batch_id: &str,
+) -> Result<LotProvenance, sqlx::Error> {
+    // Stock that entered from outside the purchase path entirely: opening stock, a correction, a
+    // counted surplus, or goods released back from quarantine. Reported first because it is the
+    // harder problem — there is no receipt to go and record.
+    let foreign: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM inventory_movements inward \
+         WHERE inward.store_id = ?1 AND inward.batch_id = ?2 \
+           AND inward.stock_status = 'sellable' AND inward.quantity_delta_atoms > 0 \
+           AND inward.movement_type <> 'purchase' LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(batch_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if foreign.is_some() {
+        return Ok(LotProvenance::UnresolvedInwardMovement);
+    }
+
+    // Everything came in on a purchase, but at least one of those purchases has no Schedule X
+    // receipt entry written into the physical register. That is a receipt somebody can still go and
+    // record, so it is worth saying so rather than lumping it in above.
+    let unrecorded: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT 1 FROM inventory_movements inward \
+         WHERE inward.store_id = ?1 AND inward.batch_id = ?2 \
+           AND inward.stock_status = 'sellable' AND inward.quantity_delta_atoms > 0 \
+           AND NOT ({QUALIFYING_RECEIPT_SQL}) LIMIT 1"
+    ))
+    .bind(store_id)
+    .bind(batch_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if unrecorded.is_some() {
+        return Ok(LotProvenance::NoQualifyingReceipt);
+    }
+
+    // And at least one qualifying purchase actually brought it in, so a lot with no inward history
+    // cannot pass by having nothing to disqualify it.
+    let qualifying: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT 1 FROM inventory_movements inward \
+         WHERE inward.store_id = ?1 AND inward.batch_id = ?2 \
+           AND inward.stock_status = 'sellable' AND inward.quantity_delta_atoms > 0 \
+           AND ({QUALIFYING_RECEIPT_SQL}) LIMIT 1"
+    ))
+    .bind(store_id)
+    .bind(batch_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(match qualifying {
+        Some(_) => LotProvenance::Qualified,
+        None => LotProvenance::NoQualifyingReceipt,
+    })
+}

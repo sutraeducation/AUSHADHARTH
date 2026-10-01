@@ -15760,8 +15760,119 @@ mod tests {
         assert_eq!(reversals, 0);
     }
 
+    /// What one side of the B-56 race may legitimately answer.
+    ///
+    /// Both the return and the sale posting open their work with `BEGIN IMMEDIATE`, so SQLite
+    /// SERIALISES them: whichever takes the write lock first runs to completion and the other waits.
+    /// These four outcomes are correct, and nothing else is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RaceOutcome {
+        /// It took the lock and committed.
+        Committed,
+        /// It lost on the merits: the prescription's quantity authority was already consumed.
+        /// Rule 65(10)(c) is the thing refusing, not the scheduler.
+        AuthorityExhausted,
+        /// The rule 65(3)(1) register entry for this Sale is not in a state that permits posting.
+        /// In this test that is itself a consequence of the authority being consumed: with nothing
+        /// left to dispense, the entry could not be prepared, so the posting has no book to be
+        /// written in. One of the enumerated `RECORD_STATE_ISSUES`, by exact code.
+        PreconditionUnmet,
+        /// It lost the write lock for longer than `busy_timeout`. The service answers 503
+        /// `service_busy` and asks the caller to retry, which is a CORRECT answer under contention
+        /// and not a defect — nothing was written.
+        ServiceBusy,
+    }
+
+    /// Classifies one racing request by its exact structured outcome. Anything outside the
+    /// documented set fails the test loudly, so this can never become `is_ok() || is_err()`.
+    fn classify_race(label: &str, status: StatusCode, body: &Value) -> RaceOutcome {
+        if status == StatusCode::OK || status == StatusCode::CREATED {
+            return RaceOutcome::Committed;
+        }
+        if status == StatusCode::SERVICE_UNAVAILABLE && body["code"] == "service_busy" {
+            return RaceOutcome::ServiceBusy;
+        }
+        let codes = prescription_issue_codes(body);
+        if codes
+            .iter()
+            .any(|code| code.ends_with("prescription_quantity_exceeded"))
+        {
+            return RaceOutcome::AuthorityExhausted;
+        }
+        if codes.iter().any(|code| {
+            RECORD_STATE_ISSUES
+                .iter()
+                .any(|issue| code.ends_with(issue))
+        }) {
+            return RaceOutcome::PreconditionUnmet;
+        }
+        panic!("{label}: undocumented outcome {status}: {body}");
+    }
+
+    /// The same three-step return as `return_first_line`, with each step classified instead of
+    /// asserted.
+    ///
+    /// `return_first_line` demands 201 from its first two steps, which is right for every test that
+    /// runs it alone. Here it races a posting, so losing the write lock is one of the documented
+    /// answers; this helper exists so B-56 can say that without weakening the shared one for
+    /// everybody else. A return reverses nothing unless ALL THREE steps commit.
+    async fn return_first_line_racing(f: &Fixture, sale: &str, packs: i64) -> RaceOutcome {
+        let sale_line = first_line_id(f, sale).await;
+        let (status, draft) = request(
+            f.pool.clone(),
+            "POST",
+            "/api/v1/returns",
+            json!({ "returnKind": "sales_return", "originalDocumentId": sale, "businessDate": TODAY }),
+        )
+        .await;
+        match classify_race("return draft", status, &draft) {
+            RaceOutcome::Committed => {}
+            other => return other,
+        }
+        let return_id = draft["id"].as_str().unwrap().to_owned();
+        let (status, withline) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/lines"),
+            json!({
+                "expectedRevision": 1,
+                "originalLineId": sale_line,
+                "quantity": packs,
+                "disposition": "quarantined",
+            }),
+        )
+        .await;
+        match classify_race("return line", status, &withline) {
+            RaceOutcome::Committed => {}
+            other => return other,
+        }
+        let (status, posted) = request(
+            f.pool.clone(),
+            "POST",
+            &format!("/api/v1/returns/{return_id}/post"),
+            json!({
+                "expectedRevision": 2,
+                "idempotencyKey": Uuid::now_v7().to_string(),
+                "taxAdjustmentStatus": "commercial_only",
+            }),
+        )
+        .await;
+        classify_race("return post", status, &posted)
+    }
+
     /// B-56. A return and a new dispensing racing each other never create authority the
     /// prescription did not give.
+    ///
+    /// The prescription allows 20 atoms with no stated repeat count, and the first sale dispenses
+    /// all 20. The second sale's 10 atoms are therefore lawful ONLY if the return's 10-atom
+    /// reversal has already committed — which is what makes this race worth running: the two
+    /// requests contend for the same write lock, and which one wins decides whether the second sale
+    /// has any authority at all.
+    ///
+    /// The assertions come from the COMMITTED DATABASE STATE, never from which task finished first.
+    /// The causal invariant is the heart of it: the redispensing may have succeeded only if the
+    /// reversal is in the database. A redispensing that succeeded without one would be authority
+    /// this prescription never gave, which is exactly what the test name forbids.
     #[tokio::test]
     async fn b56_a_return_racing_a_redispensing_never_exceeds_the_authority() {
         let (f, professional) = schedule_h_fixture().await;
@@ -15779,10 +15890,21 @@ mod tests {
         let (status, _) = post_as_quoted(&f, &first).await;
         assert_eq!(status, StatusCode::OK);
         let next = prepared_sale(&f, &item, &professional, 1).await;
-        // The entry is prepared and confirmed first, so the race is the return against the posting.
-        prepare_and_confirm(&f, &next).await;
-        let (returned, redispensed) =
-            tokio::join!(return_first_line(&f, &first, 1), post_confirmed(&f, &next));
+
+        // The rule 65(3)(1) entry is prepared and confirmed BEFORE the race, so the race is the
+        // return against the posting and nothing else. Whether it could be prepared at all is
+        // itself observable: with the authority already consumed, preparing is refused and
+        // `prepare_and_confirm` writes nothing. Capturing that here removes the only hidden
+        // non-determinism this test had, so the expected outcomes below are exact.
+        let prepared = prepare_and_confirm(&f, &next).await;
+        let record_ready = !prepared.is_empty();
+
+        let (returned, redispensed) = tokio::join!(
+            return_first_line_racing(&f, &first, 1),
+            post_confirmed(&f, &next)
+        );
+        let redispensed = classify_race("redispensing", redispensed.0, &redispensed.1);
+
         let (dispensed, reversed): (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensings),\
              (SELECT COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensing_reversals)",
@@ -15790,16 +15912,95 @@ mod tests {
         .fetch_one(&f.pool)
         .await
         .unwrap();
+
+        // THE INVARIANT, whoever won: the authority is never exceeded.
         assert!(
             dispensed - reversed <= 20,
             "net {dispensed}-{reversed} over authority: {returned:?} {redispensed:?}"
         );
-        if redispensed.0 == StatusCode::OK {
-            assert_eq!(returned.0, StatusCode::OK, "{returned:?}");
-            assert_eq!((dispensed, reversed), (30, 10));
+
+        // THE CAUSAL INVARIANT. The second sale could only have posted on authority the reversal
+        // released, so a committed redispensing must be accompanied by a committed reversal.
+        if redispensed == RaceOutcome::Committed {
+            assert_eq!(
+                returned,
+                RaceOutcome::Committed,
+                "the redispensing consumed authority the return never released"
+            );
+            assert_eq!(
+                (dispensed, reversed),
+                (30, 10),
+                "a committed redispensing must leave exactly the reversal's room consumed"
+            );
+            assert!(
+                record_ready,
+                "the redispensing posted without its rule 65(3) entry"
+            );
         } else {
-            assert_eq!(dispensed, 20, "{redispensed:?}");
+            // Refused, for one of the documented reasons. Nothing extra was dispensed, and the
+            // reversal is present exactly when the return committed.
+            assert_eq!(
+                dispensed, 20,
+                "a refused redispensing still dispensed: {redispensed:?}"
+            );
+            let expected_reversal = if returned == RaceOutcome::Committed {
+                10
+            } else {
+                0
+            };
+            assert_eq!(
+                reversed, expected_reversal,
+                "return {returned:?} left reversed={reversed}"
+            );
+            // A return gives quantity back, so it can never be refused for exceeding a
+            // prescription's quantity nor for a Sale's register state.
+            assert!(
+                matches!(returned, RaceOutcome::Committed | RaceOutcome::ServiceBusy),
+                "a return was refused on a Sale-side reason: {returned:?}"
+            );
+            // Which refusal is reported is NOT asserted here. With the authority consumed and no
+            // register entry prepared, both the quantity refusal and the record-state refusal are
+            // true at once, and which one the API names first is an implementation detail rather
+            // than a property of the race. `classify_race` has already refused anything outside the
+            // documented set, so the refusal is known to be one of the three lawful classes.
         }
+
+        // The ledger stays coherent whichever way it went: every reversal belongs to a real
+        // dispensing of this item, and no quantity is counted twice.
+        let orphaned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_dispensing_reversals reversal \
+             WHERE NOT EXISTS (SELECT 1 FROM prescription_dispensings dispensing \
+                 WHERE dispensing.id = reversal.dispensing_id \
+                   AND dispensing.prescription_item_id = ?)",
+        )
+        .bind(&item)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            orphaned, 0,
+            "a reversal points at no dispensing of this item"
+        );
+        let (dispensings, reversals): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM prescription_dispensings),\
+             (SELECT COUNT(*) FROM prescription_dispensing_reversals)",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dispensings,
+            if redispensed == RaceOutcome::Committed {
+                2
+            } else {
+                1
+            },
+            "one dispensing per posted line"
+        );
+        assert!(
+            reversals <= dispensings,
+            "{reversals} reversals of {dispensings} dispensings"
+        );
     }
 
     /// B-57. Professional validity is inclusive at both ends and judged on the actual posting day.

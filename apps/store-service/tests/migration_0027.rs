@@ -870,8 +870,9 @@ async fn the_earlier_migrations_are_unchanged() {
         .filter(|name| name.ends_with(".sql"))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 27, "expected exactly 27 migrations: {names:?}");
+    assert_eq!(names.len(), 28, "expected exactly 28 migrations: {names:?}");
     assert_eq!(names[26], "0027_schedule_x_prescription_compliance.sql");
+    assert_eq!(names[27], "0028_schedule_x_supply_foundations.sql");
     // Every earlier file is still the committed one, as `git status` also proves.
     for name in &names[..26] {
         let bytes = std::fs::read(directory.join(name)).expect("read migration");
