@@ -10060,3 +10060,733 @@ async fn real_service_carries_schedule_x_supply_provenance_through_backup_and_re
     assert_eq!(unresolved, 0, "the lot's provenance did not survive intact");
     reopened.close().await;
 }
+
+// ==============================================================================================
+// Phase 1M-D3-C1 — supplier Schedule X purchase-source authority
+// ==============================================================================================
+
+async fn supplier_authorities_over_http(service: &Service, cookie: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        "/api/v1/store/schedule-x/supplier-authorities",
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_authority_over_http(
+    service: &Service,
+    cookie: &str,
+    supplier: &str,
+    kind: &str,
+    number: &str,
+    from: &str,
+    to: Option<&str>,
+    basis: &str,
+    status: &str,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        "/api/v1/store/schedule-x/supplier-authorities",
+        Some(json!({
+            "supplierPartyId": supplier,
+            "authorityKind": kind,
+            "authorityNumber": number,
+            "issuingAuthority": "State Drugs Control Administration",
+            "legalStatus": status,
+            "validityBasis": basis,
+            "effectiveFrom": from,
+            "effectiveTo": to,
+            "sourceCitation": "Licence copy inspected at the counter",
+            "note": Value::Null,
+        })),
+        Some(cookie),
+    )
+    .await
+}
+
+async fn record_coverage_over_http(
+    service: &Service,
+    cookie: &str,
+    authority: &str,
+    product: &str,
+    from: &str,
+) -> Reply {
+    call(
+        service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/supplier-authorities/{authority}/coverage"),
+        Some(json!({
+            "productId": product,
+            "effectiveFrom": from,
+            "effectiveTo": Value::Null,
+            "sourceCitation": "Drug endorsed on the licence copy",
+            "reason": Value::Null,
+        })),
+        Some(cookie),
+    )
+    .await
+}
+
+/// The ordinary qualifying evidence for the sale world's own supplier: a Form 20-G Schedule X
+/// wholesale licence, in force and perpetual from 2020, covering the world's product.
+async fn authorise_supplier_over_http(service: &Service, world: &SaleWorld) -> String {
+    let recorded = record_authority_over_http(
+        service,
+        &world.cookie,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-5511",
+        "2020-01-01",
+        None,
+        "perpetual",
+        "in_force",
+    )
+    .await;
+    assert_eq!(recorded.status, 201, "{:?}", recorded.body);
+    let authority = recorded.body["id"]
+        .as_str()
+        .expect("authority id")
+        .to_owned();
+    let covered = record_coverage_over_http(
+        service,
+        &world.cookie,
+        &authority,
+        &world.product,
+        "2020-01-01",
+    )
+    .await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+    authority
+}
+
+/// D3C1-1. The evidence across a real socket, and what it does and does not claim.
+#[tokio::test]
+async fn real_service_records_supplier_schedule_x_authority_evidence_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+
+    // Nothing recorded yet.
+    let empty = supplier_authorities_over_http(&service, &world.cookie).await;
+    assert!(empty["authorities"].as_array().expect("array").is_empty());
+
+    // An unsupported form is refused: Form 20-F is the RETAIL Schedule X licence, Form 28-B belongs
+    // to Schedule C/C(1) manufacture, and an ordinary wholesale licence is not Schedule X authority.
+    for kind in ["form_20f", "form_28b", "form_20b", "wholesale"] {
+        let refused = record_authority_over_http(
+            &service,
+            &world.cookie,
+            &world.supplier,
+            kind,
+            "X-1",
+            "2020-01-01",
+            None,
+            "perpetual",
+            "in_force",
+        )
+        .await;
+        assert_eq!(refused.status, 422, "{kind}: {:?}", refused.body);
+        assert_eq!(refused.body["code"], "validation_failed", "{kind}");
+    }
+
+    // A fixed term with no end date, and a perpetual authority with one, are each refused in words.
+    let no_end = record_authority_over_http(
+        &service,
+        &world.cookie,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-1",
+        "2020-01-01",
+        None,
+        "fixed_term",
+        "in_force",
+    )
+    .await;
+    assert_eq!(no_end.status, 422, "{:?}", no_end.body);
+    let perpetual_with_end = record_authority_over_http(
+        &service,
+        &world.cookie,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-1",
+        "2020-01-01",
+        Some("2027-01-01"),
+        "perpetual",
+        "in_force",
+    )
+    .await;
+    assert_eq!(
+        perpetual_with_end.status, 422,
+        "{:?}",
+        perpetual_with_end.body
+    );
+
+    let authority = authorise_supplier_over_http(&service, &world).await;
+    let listed = supplier_authorities_over_http(&service, &world.cookie).await;
+    let recorded = listed["authorities"][0].clone();
+    assert_eq!(recorded["authorityKind"], "form_20g");
+    assert_eq!(recorded["legalStatus"], "in_force");
+    assert_eq!(recorded["validityBasis"], "perpetual");
+    assert_eq!(recorded["effectiveFrom"], "2020-01-01");
+    assert_eq!(recorded["effectiveTo"], Value::Null);
+    assert_eq!(
+        recorded["sourceCitation"],
+        "Licence copy inspected at the counter"
+    );
+    // The moment of recording is its own fact, kept apart from the period the document asserts.
+    assert!(
+        recorded["recordedAtUtc"].as_str().expect("recorded at") > "2026-01-01",
+        "{recorded:?}"
+    );
+    assert_eq!(listed["coverage"][0]["productId"], world.product.as_str());
+
+    // NOTHING here claims the licence was verified with a government.
+    let text = listed.to_string().to_lowercase();
+    for forbidden in ["government", "verified", "valid licence", "validlicence"] {
+        assert!(!text.contains(forbidden), "{forbidden} appeared: {listed}");
+    }
+
+    // Overlapping evidence of the same kind for the same supplier is refused rather than resolved.
+    let overlap = record_authority_over_http(
+        &service,
+        &world.cookie,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-9999",
+        "2024-01-01",
+        None,
+        "perpetual",
+        "in_force",
+    )
+    .await;
+    assert_eq!(overlap.status, 409, "{:?}", overlap.body);
+
+    // Archiving withdraws it without deleting it.
+    let archived = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/supplier-authorities/{authority}/archive"),
+        Some(json!({ "expectedRevision": 1, "reason": "entered against the wrong supplier" })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(archived.status, 200, "{:?}", archived.body);
+    assert_eq!(archived.body["status"], "archived");
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supplier_schedule_x_authorities")
+        .fetch_one(&pool)
+        .await
+        .expect("kept");
+    assert_eq!(kept, 1, "archiving deleted compliance evidence");
+    let refused = sqlx::query("DELETE FROM supplier_schedule_x_authorities")
+        .execute(&pool)
+        .await;
+    assert!(refused.is_err(), "direct SQL deleted compliance evidence");
+    pool.close().await;
+}
+
+/// D3C1-2. Recording a supplier's authority is the owner's job. A pharmacist may read it for the
+/// compliance workflow; a cashier can neither read nor write it, and so can never self-attest a
+/// supplier's licence to make a future sale pass.
+#[tokio::test]
+async fn real_service_keeps_supplier_authority_management_with_the_owner_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+
+    let pharmacist = sign_in_as(
+        &service,
+        "pharmacist",
+        "rx-d3c1",
+        "01997a00-0000-7000-8000-0000000004c1",
+    )
+    .await;
+    let cashier = sign_in_as(
+        &service,
+        "cashier",
+        "till-d3c1",
+        "01997a00-0000-7000-8000-0000000004c2",
+    )
+    .await;
+
+    // A pharmacist reads.
+    let read = call(
+        &service,
+        "GET",
+        "/api/v1/store/schedule-x/supplier-authorities",
+        None,
+        Some(&pharmacist),
+    )
+    .await;
+    assert_eq!(read.status, 200, "{:?}", read.body);
+
+    // A pharmacist does not record.
+    let pharmacist_write = record_authority_over_http(
+        &service,
+        &pharmacist,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-5511",
+        "2020-01-01",
+        None,
+        "perpetual",
+        "in_force",
+    )
+    .await;
+    assert_eq!(pharmacist_write.status, 403, "{:?}", pharmacist_write.body);
+
+    // A cashier neither reads nor records.
+    let cashier_read = call(
+        &service,
+        "GET",
+        "/api/v1/store/schedule-x/supplier-authorities",
+        None,
+        Some(&cashier),
+    )
+    .await;
+    assert_eq!(cashier_read.status, 403, "{:?}", cashier_read.body);
+    let cashier_write = record_authority_over_http(
+        &service,
+        &cashier,
+        &world.supplier,
+        "form_20g",
+        "20G-MH-5511",
+        "2020-01-01",
+        None,
+        "perpetual",
+        "in_force",
+    )
+    .await;
+    assert_eq!(cashier_write.status, 403, "{:?}", cashier_write.body);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supplier_schedule_x_authorities")
+        .fetch_one(&pool)
+        .await
+        .expect("rows");
+    assert_eq!(rows, 0);
+    pool.close().await;
+}
+
+/// D3C1-3. Two simultaneous recordings of the same authority. One survives; the other is told the
+/// period overlaps rather than being allowed to create an ambiguity.
+#[tokio::test]
+async fn real_service_refuses_a_second_overlapping_authority_under_a_race_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+
+    let (first, second) = tokio::join!(
+        record_authority_over_http(
+            &service,
+            &world.cookie,
+            &world.supplier,
+            "form_20g",
+            "20G-MH-5511",
+            "2020-01-01",
+            None,
+            "perpetual",
+            "in_force"
+        ),
+        record_authority_over_http(
+            &service,
+            &world.cookie,
+            &world.supplier,
+            "form_20g",
+            "20G-MH-5511",
+            "2020-01-01",
+            None,
+            "perpetual",
+            "in_force"
+        ),
+    );
+    // Exactly one committed; the loser was refused on the overlap or told the service was busy.
+    let created = [&first, &second]
+        .iter()
+        .filter(|reply| reply.status == 201)
+        .count();
+    assert_eq!(
+        created, 1,
+        "first={:?} second={:?}",
+        first.body, second.body
+    );
+    for reply in [&first, &second] {
+        assert!(
+            reply.status == 201 || reply.status == 409 || reply.status == 503,
+            "{:?}",
+            reply.body
+        );
+    }
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM supplier_schedule_x_authorities WHERE status='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows, 1, "a race created overlapping authority");
+    pool.close().await;
+}
+
+/// D3C1-4, item 27. The provenance surface reports the authority verdict BESIDE the lot verdict,
+/// with a precise reason, and the Phase 1M-D3-B lot verdict is untouched by any of it.
+#[tokio::test]
+async fn real_service_reports_supplier_authority_beside_the_lot_verdict_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+    let (_, item) = prescription_over_http(&service, &world, None, 20).await;
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    let (_, line_id, _) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+
+    // The lot is accounted for by D3-B, and its source has no authority evidence yet. The two
+    // verdicts are reported separately, and D3-B's one still says qualified.
+    let listed = supply_preparation_over_http(&service, &world.cookie).await;
+    let candidate = listed["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|entry| entry["saleLineId"] == line_id.as_str())
+        .expect("the line is listed")
+        .clone();
+    assert_eq!(candidate["lotProvenance"]["state"], "qualified");
+    assert_eq!(candidate["everySourceAuthorised"], false);
+    assert_eq!(
+        candidate["sourceAuthorities"][0]["authority"]["state"], "unresolved",
+        "{candidate:?}"
+    );
+    assert_eq!(
+        candidate["sourceAuthorities"][0]["authority"]["reason"], "no_authority_recorded",
+        "{candidate:?}"
+    );
+
+    // Because D3-C1 does not gate preparation, the D3-B workflow is unchanged: the working record
+    // still prepares. The authority predicate is reported, not yet enforced.
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+
+    // Record the evidence; the verdict changes and the lot verdict does not.
+    authorise_supplier_over_http(&service, &world).await;
+    let after = supply_preparation_over_http(&service, &world.cookie).await;
+    let candidate = after["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|entry| entry["saleLineId"] == line_id.as_str())
+        .expect("the line is listed")
+        .clone();
+    assert_eq!(candidate["lotProvenance"]["state"], "qualified");
+    assert_eq!(candidate["everySourceAuthorised"], true);
+    assert_eq!(
+        candidate["sourceAuthorities"][0]["authority"]["state"],
+        "established"
+    );
+    assert_eq!(
+        candidate["sourceAuthorities"][0]["authority"]["authorityKind"],
+        "form_20g"
+    );
+
+    // And the surface never calls any of this legal, compliant or verified.
+    let text = after.to_string().to_lowercase();
+    for forbidden in ["\"legal\"", "compliant", "sale_allowed", "government"] {
+        assert!(!text.contains(forbidden), "{forbidden} appeared: {after}");
+    }
+}
+
+/// D3C1-5, item 35 — THE HARD SCHEDULE X BOUNDARY, with supplier authority added.
+///
+/// Every favourable fact this software can now record exists, including documentary evidence that
+/// the purchase source held Schedule X authority covering the drug on the purchase date. The sale
+/// is still refused: evidence is not an authority to dispense.
+#[tokio::test]
+async fn real_service_keeps_schedule_x_refused_with_every_d3c1_fact_present_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    // The new fact: the purchase source's own Schedule X authority evidence.
+    authorise_supplier_over_http(&service, &world).await;
+
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, sale_revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // Every verdict this software can give is favourable.
+    let listed = supply_preparation_over_http(&service, &world.cookie).await;
+    let candidate = listed["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|entry| entry["saleLineId"] == line_id.as_str())
+        .expect("listed")
+        .clone();
+    assert_eq!(candidate["lotProvenance"]["state"], "qualified");
+    assert_eq!(candidate["everySourceAuthorised"], true);
+
+    // And the counter still refuses.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-0000000002fc",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+
+    let detail = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.body["status"], "draft");
+    assert_eq!(detail.body["documentNumber"], Value::Null);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let outflow: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("movements");
+    assert_eq!(outflow, 0, "a refused Schedule X sale moved stock");
+    let dispensings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("dispensings");
+    assert_eq!(dispensings, 0);
+    let finalized: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE entry_kind='supply' AND status='finalized'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("finalized");
+    assert_eq!(
+        finalized, 0,
+        "a supply entry was closed with no sale behind it"
+    );
+    pool.close().await;
+
+    let text = refused.body.to_string().to_lowercase();
+    for word in ["banned", "prohibit", "illegal"] {
+        assert!(!text.contains(word), "{word}: {:?}", refused.body);
+    }
+}
+
+/// D3C1-6, item 32. The authority evidence is durable compliance data, so the existing backup path
+/// has to carry it — identity, supplier linkage, kind, number, period, coverage, lifecycle and the
+/// moment of recording.
+#[tokio::test]
+async fn real_service_carries_supplier_authority_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let world = seed_sale_world(service, 1).await;
+    schedule_over_http(service, &world, &["schedule_x"]).await;
+    let authority = authorise_supplier_over_http(service, &world).await;
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let resolved = call(
+        service,
+        "GET",
+        &format!(
+            "/api/v1/backups/{}/download",
+            created.body["backupId"].as_str().expect("backup id")
+        ),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(resolved.status, 200, "{:?}", resolved.body);
+    let (status, _, downloaded) = get_bytes(
+        service,
+        resolved.body["url"].as_str().expect("url"),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let after = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Post-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(after.status, 201, "{:?}", after.body);
+
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &downloaded,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({
+            "candidateToken": prepared["candidateToken"].as_str().expect("token"),
+            "password": "Integration-Password-42"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+
+    let post_backup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM parties WHERE display_name='Post-Backup Supplier'",
+    )
+    .fetch_one(&reopened)
+    .await
+    .expect("parties");
+    assert_eq!(post_backup, 0, "the restore did not roll the pharmacy back");
+
+    let restored: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT supplier_party_id,authority_kind,authority_number,effective_from,effective_to,\
+             legal_status,status FROM supplier_schedule_x_authorities WHERE id=?",
+    )
+    .bind(&authority)
+    .fetch_one(&reopened)
+    .await
+    .expect("the authority did not survive the restore");
+    assert_eq!(restored.0, world.supplier);
+    assert_eq!(restored.1, "form_20g");
+    assert_eq!(restored.2, "20G-MH-5511");
+    assert_eq!(restored.3, "2020-01-01");
+    assert_eq!(restored.4, None);
+    assert_eq!(restored.5, "in_force");
+    assert_eq!(restored.6, "active");
+
+    let coverage: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM supplier_schedule_x_authority_coverage \
+         WHERE authority_id=? AND status='active'",
+    )
+    .bind(&authority)
+    .fetch_one(&reopened)
+    .await
+    .expect("coverage");
+    assert_eq!(coverage, 1, "the drug coverage did not survive the restore");
+
+    // And the restored database still refuses to delete the evidence.
+    let refused = sqlx::query("DELETE FROM supplier_schedule_x_authorities WHERE id=?")
+        .bind(&authority)
+        .execute(&reopened)
+        .await;
+    assert!(
+        refused.is_err(),
+        "the restored database lost its no-delete guard"
+    );
+    reopened.close().await;
+}

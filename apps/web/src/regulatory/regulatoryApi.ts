@@ -10,6 +10,8 @@ import {
   ScheduleXPrescriptionAnnotationsSchema,
   ScheduleXRegisterEntrySchema as ScheduleXEntrySchema,
   ScheduleXSupplyPreparationSchema,
+  SupplierAuthoritiesSchema,
+  SupplierAuthoritySchema,
   type ConfirmScheduleXEntryRequest,
   type ScheduleXEntryKind,
   type ScheduleXEntryStatus,
@@ -17,6 +19,8 @@ import {
   type RecordScheduleXPrescriptionAnnotationRequest,
   type ScheduleXPrescriptionAnnotations,
   type ScheduleXSupplyPreparation,
+  type RecordSupplierAuthorityRequest,
+  type SupplierAuthorities,
   type VoidScheduleXEntryRequest,
   LicenceDrugCoverageSchema,
   RecordElectionSchema,
@@ -440,4 +444,77 @@ export const SCHEDULE_X_LOT_PROVENANCE_LABELS: Record<string, string> = {
   qualified: "Traced to a recorded purchase",
   no_qualifying_receipt: "Purchase not yet written in the register",
   unresolved_inward_movement: "Stock in this batch is not accounted for"
+};
+
+// --- Phase 1M-D3-C1: the supplier's Schedule X purchase-source authority ----------------------
+
+/**
+ * The documentary evidence the operator has recorded about each supplier's Schedule X authority.
+ *
+ * This is EVIDENCE, not verification: AUSHADHARTH contacts no licensing authority and cannot know
+ * that a licence is genuine, current or unsuspended.
+ */
+export async function getSupplierAuthorities(): Promise<SupplierAuthorities> {
+  return SupplierAuthoritiesSchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/supplier-authorities")
+  );
+}
+
+/** Records what a supplier's Schedule X licence document says, and when it was read. */
+export async function recordSupplierAuthority(input: RecordSupplierAuthorityRequest) {
+  return SupplierAuthoritySchema.parse(
+    await localServiceRequest("/api/v1/store/schedule-x/supplier-authorities", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
+}
+
+/** Records which Schedule X drug the operator says that authority covered, and from when. */
+export async function recordSupplierAuthorityCoverage(
+  authorityId: string,
+  input: { productId: string; effectiveFrom: string; sourceCitation: string }
+) {
+  return localServiceRequest(
+    `/api/v1/store/schedule-x/supplier-authorities/${authorityId}/coverage`,
+    { method: "POST", body: JSON.stringify({ ...input, effectiveTo: null, reason: null }) }
+  );
+}
+
+/** Withdraws evidence entered in error. The record is kept; historical resolution is not rewritten. */
+export async function archiveSupplierAuthority(
+  authorityId: string,
+  input: { expectedRevision: number; reason: string }
+) {
+  return SupplierAuthoritySchema.parse(
+    await localServiceRequest(
+      `/api/v1/store/schedule-x/supplier-authorities/${authorityId}/archive`,
+      { method: "POST", body: JSON.stringify(input) }
+    )
+  );
+}
+
+/** The legal basis, in the words a pharmacy operator uses. */
+export const SUPPLIER_AUTHORITY_KIND_LABELS: Record<string, string> = {
+  form_20g: "Form 20-G — Schedule X wholesale licence",
+  form_25f: "Form 25-F — Schedule X manufacturing licence"
+};
+
+/** Said to an operator, never to a lawyer, and never claiming verification. */
+export const SUPPLIER_AUTHORITY_VERDICT_LABELS: Record<string, string> = {
+  established: "Authority evidence recorded",
+  not_established: "Evidence does not cover this purchase",
+  unresolved: "No authority evidence recorded",
+  conflicting: "Conflicting evidence on file"
+};
+
+export const SUPPLIER_AUTHORITY_REASON_LABELS: Record<string, string> = {
+  no_authority_recorded: "No Schedule X authority recorded for this supplier",
+  authority_status_unknown: "Nobody recorded whether the authority was in force",
+  authority_suspended: "The authority is recorded as suspended for this period",
+  authority_cancelled: "The authority is recorded as cancelled for this period",
+  validity_basis_unknown: "Nobody recorded whether the authority is perpetual or fixed-term",
+  outside_effective_period: "The recorded period does not cover the purchase date",
+  drug_not_covered: "The authority does not cover this drug",
+  conflicting_authorities: "Two records overlap, so neither is relied on"
 };

@@ -28,7 +28,10 @@ const IDs = {
   prescriptionItem: "01997c00-0000-7000-8000-0000000000a3",
   annotation: "01997c00-0000-7000-8000-0000000000a4",
   otherSaleLine: "01997c00-0000-7000-8000-0000000000a5",
-  supplyEntry: "01997c00-0000-7000-8000-0000000000a6"
+  supplyEntry: "01997c00-0000-7000-8000-0000000000a6",
+  supplier: "01997c00-0000-7000-8000-0000000000a7",
+  authority: "01997c00-0000-7000-8000-0000000000a8",
+  authorityCoverage: "01997c00-0000-7000-8000-0000000000a9"
 };
 const system = {
   status: "ok",
@@ -156,6 +159,66 @@ function candidate(overrides: Record<string, unknown> = {}) {
     entryId: null,
     entryStatus: null,
     lotProvenance: { state: "qualified" },
+    sourceAuthorities: [sourceAuthority()],
+    everySourceAuthorised: true,
+    ...overrides
+  };
+}
+
+/** Phase 1M-D3-C1 — one purchase source behind the lot, with its authority verdict. */
+function sourceAuthority(overrides: Record<string, unknown> = {}) {
+  return {
+    purchaseDocumentId: IDs.purchase,
+    purchaseLineId: IDs.purchaseLine,
+    supplierPartyId: IDs.supplier,
+    invoiceDate: "2026-09-10",
+    authority: {
+      state: "established",
+      authorityId: IDs.authority,
+      authorityKind: "form_20g",
+      authorityNumber: "20G-MH-5511",
+      coverageId: IDs.authorityCoverage
+    },
+    ...overrides
+  };
+}
+
+/** One recorded authority, as the evidence panel reads it. */
+function authorityRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: IDs.authority,
+    supplierPartyId: IDs.supplier,
+    supplierDisplayName: "Sunrise Distributors Private Limited",
+    authorityKind: "form_20g",
+    authorityNumber: "20G-MH-5511",
+    issuingAuthority: "State Drugs Control Administration",
+    legalStatus: "in_force",
+    validityBasis: "perpetual",
+    effectiveFrom: "2020-01-01",
+    effectiveTo: null,
+    sourceCitation: "Licence copy inspected at the counter",
+    note: null,
+    recordedByUserId: IDs.user,
+    recordedAtUtc: "2026-09-20T06:00:00Z",
+    revision: 1,
+    status: "active",
+    ...overrides
+  };
+}
+
+function authorityCoverageRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: IDs.authorityCoverage,
+    authorityId: IDs.authority,
+    productId: IDs.product,
+    productDisplayName: "Schedule X Test Medicine A",
+    effectiveFrom: "2020-01-01",
+    effectiveTo: null,
+    sourceCitation: "Drug endorsed on the licence copy",
+    reason: null,
+    recordedAtUtc: "2026-09-20T06:00:00Z",
+    revision: 1,
+    status: "active",
     ...overrides
   };
 }
@@ -165,6 +228,7 @@ type Options = {
   register?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
   supply?: Record<string, unknown>;
+  supplierAuthorities?: Record<string, unknown>;
 };
 
 function service(options: Options = {}) {
@@ -185,6 +249,15 @@ function service(options: Options = {}) {
       return response({ entries: [entry()], legacyReceipts: [], ...options.register });
     }
     if (url.pathname === "/api/v1/store/professionals") return response([pharmacist]);
+    // Phase 1M-D3-C1 — supplier purchase-source authority evidence.
+    if (url.pathname === "/api/v1/store/schedule-x/supplier-authorities") {
+      if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
+      return response({
+        authorities: [authorityRow()],
+        coverage: [authorityCoverageRow()],
+        ...options.supplierAuthorities
+      });
+    }
     // Phase 1M-D3-B — lot provenance and the supply working record.
     if (url.pathname === "/api/v1/store/schedule-x/supply-preparation") {
       if (role !== "owner_admin" && role !== "pharmacist") return failure("authorization_denied", 403);
@@ -907,11 +980,116 @@ describe("the Schedule X supply batch check", () => {
       "Batch",
       "Quantity",
       "Batch accounted for",
+      "Purchase source authority",
       "Actions"
     ]);
     const supply = within(row.closest("table") as HTMLElement);
     for (const label of labels.filter((name) => name && name !== "Actions")) {
       expect(supply.getByRole("columnheader", { name: label as string })).toBeInTheDocument();
     }
+  });
+});
+
+/**
+ * Phase 1M-D3-C1 — the supplier's Schedule X purchase-source authority.
+ *
+ * The attack here is a screen that turns an operator typing a number into a government's word. The
+ * sale licence Forms require Schedule X stock to come from a duly licensed dealer or manufacturer;
+ * this software can record that somebody read such a document, and nothing more. These tests check
+ * the wording as carefully as the behaviour.
+ */
+describe("the supplier Schedule X authority evidence", () => {
+  const awaitAuthority = async () => {
+    await screen.findByRole("heading", { name: "Supplier Schedule X authority" }, { timeout: 3000 });
+    const section = screen.getByTestId("schedule-x-supplier-authority");
+    await waitFor(
+      () => expect(within(section).queryByText("Loading supplier authority…")).not.toBeInTheDocument(),
+      { timeout: 3000 }
+    );
+    return section;
+  };
+
+  it("says this is recorded evidence and never claims verification", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = within(await awaitAuthority());
+    expect(section.getByText("This is documentary evidence you recorded.")).toBeInTheDocument();
+    expect(
+      section.getByText(/has not verified these licences with any licensing authority/)
+    ).toBeInTheDocument();
+    const text = ((await awaitAuthority()).textContent ?? "").toLowerCase();
+    for (const forbidden of ["verified supplier", "government verified", "licence valid", "licence is valid"]) {
+      expect(text).not.toContain(forbidden);
+    }
+  });
+
+  it("names the legal basis by its form, not as free text", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = within(await awaitAuthority());
+    expect(section.getByText("Form 20-G — Schedule X wholesale licence")).toBeInTheDocument();
+    expect(section.getByText("20G-MH-5511")).toBeInTheDocument();
+    expect(section.getByText("Schedule X Test Medicine A from 2020-01-01")).toBeInTheDocument();
+  });
+
+  it("keeps the moment of recording apart from the period the document asserts", async () => {
+    renderApp("/app/settings/schedule-x");
+    const section = within(await awaitAuthority());
+    // The document speaks from 2020; the pharmacy recorded it in 2026.
+    expect(section.getByText("2020-01-01")).toBeInTheDocument();
+    expect(section.getByText("2026-09-20")).toBeInTheDocument();
+    expect(section.getByText(/as read from: Licence copy inspected at the counter/)).toBeInTheDocument();
+    // A perpetual authority says no end date was recorded, never that it is currently valid.
+    expect(section.getByText("No end date recorded")).toBeInTheDocument();
+  });
+
+  it("says plainly when nothing has been recorded", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({ supplierAuthorities: { authorities: [], coverage: [] } })
+    );
+    const section = within(await awaitAuthority());
+    expect(
+      section.getByText(/Until one covers a purchase's supplier, date and drug, that purchase's source stays unaccounted for/)
+    ).toBeInTheDocument();
+  });
+
+  it("reports the source verdict beside the batch verdict, never merged with it", async () => {
+    renderApp(
+      "/app/settings/schedule-x",
+      service({
+        supply: {
+          candidates: [
+            candidate({
+              everySourceAuthorised: false,
+              sourceAuthorities: [
+                sourceAuthority({
+                  authority: { state: "unresolved", reason: "no_authority_recorded" }
+                })
+              ]
+            })
+          ]
+        }
+      })
+    );
+    await screen.findByRole("heading", { name: "Batches behind a Schedule X supply" }, { timeout: 3000 });
+    const row = await screen.findByTestId(`schedule-x-supply-${IDs.saleLine}`, undefined, { timeout: 3000 });
+    // The batch verdict is untouched by the authority verdict: Phase 1M-D3-B still says qualified.
+    expect(within(row).getByText("Traced to a recorded purchase")).toBeInTheDocument();
+    expect(within(row).getByText("Authority evidence incomplete")).toBeInTheDocument();
+    expect(
+      within(row).getByText(/No Schedule X authority recorded for this supplier/)
+    ).toBeInTheDocument();
+    // And nothing anywhere calls the lot legal, compliant or allowed to sell.
+    const text = (row.textContent ?? "").toLowerCase();
+    for (const forbidden of ["compliant", "sale allowed", "legal"]) {
+      expect(text).not.toContain(forbidden);
+    }
+  });
+
+  it("keeps supplier authority evidence away from a cashier", async () => {
+    renderApp("/app/settings/schedule-x", service({ role: "cashier" }));
+    expect(
+      await screen.findByRole("heading", { name: "This record is not available to your role" }, { timeout: 3000 })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Supplier Schedule X authority" })).not.toBeInTheDocument();
   });
 });

@@ -391,3 +391,318 @@ pub async fn resolve_lot_provenance(
         None => LotProvenance::NoQualifyingReceipt,
     })
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-D3-C1 — the supplier's Schedule X purchase-source authority
+// ---------------------------------------------------------------------------------------------
+
+/// The legal basis a Schedule X purchase source can hold, as the Rules name it.
+///
+/// Rule 61(3): a licence to sell, stock, exhibit or offer for sale or distribute drugs specified in
+/// Schedule X by retail or by wholesale is issued in Form 20-F or Form 20-G. A DEALER supplying by
+/// wholesale therefore holds Form 20-G. Rule 70: licences to manufacture drugs included in
+/// Schedule X are granted in Form 25-F. Those are the two sources this software can represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupplierAuthorityKind {
+    /// Rule 61(3) — the Schedule X wholesale licence a dealer supplies under.
+    Form20g,
+    /// Rule 70 — the licence to manufacture drugs included in Schedule X.
+    Form25f,
+}
+
+impl SupplierAuthorityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Form20g => "form_20g",
+            Self::Form25f => "form_25f",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "form_20g" => Some(Self::Form20g),
+            "form_25f" => Some(Self::Form25f),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the operator has recorded documentary evidence that a purchase source held Schedule X
+/// authority covering a given drug on a given date.
+///
+/// THIS IS NOT VERIFICATION. `Established` means "the operator recorded evidence that says so", not
+/// "the government confirms this licence is genuine and current". No column, variant or message in
+/// this module claims otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "state"
+)]
+pub enum SupplierAuthority {
+    /// Evidence on file: an authority recorded as in force across the purchase date, with coverage
+    /// naming this product on that date.
+    Established {
+        authority_id: String,
+        authority_kind: String,
+        authority_number: String,
+        coverage_id: String,
+    },
+    /// Everything needed was recorded and it does not add up to authority on that date.
+    NotEstablished { reason: SupplierAuthorityGap },
+    /// Nobody has recorded enough to answer at all.
+    Unresolved { reason: SupplierAuthorityGap },
+    /// Two or more active records could answer and they disagree. Never settled by picking one.
+    Conflicting { reason: SupplierAuthorityGap },
+}
+
+/// The specific thing missing or in the way. Named, because "no" is not an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupplierAuthorityGap {
+    /// No Schedule X authority has been recorded for this supplier at all.
+    NoAuthorityRecorded,
+    /// An authority exists but nobody recorded whether it was in force.
+    AuthorityStatusUnknown,
+    /// The authority is recorded as suspended for the period covering this purchase.
+    AuthoritySuspended,
+    /// The authority is recorded as cancelled for the period covering this purchase.
+    AuthorityCancelled,
+    /// Nobody recorded whether the authority runs perpetually or to a date.
+    ValidityBasisUnknown,
+    /// Authority was recorded, but no period covers the purchase date.
+    OutsideEffectivePeriod,
+    /// The authority covers the date, but no coverage names this drug on it.
+    DrugNotCovered,
+    /// Overlapping active records could both answer. Fail closed.
+    ConflictingAuthorities,
+}
+
+impl SupplierAuthority {
+    pub fn is_established(&self) -> bool {
+        matches!(self, Self::Established { .. })
+    }
+
+    /// The gap, for a caller that only needs to say why not.
+    pub fn gap(&self) -> Option<SupplierAuthorityGap> {
+        match self {
+            Self::Established { .. } => None,
+            Self::NotEstablished { reason }
+            | Self::Unresolved { reason }
+            | Self::Conflicting { reason } => Some(*reason),
+        }
+    }
+}
+
+/// One recorded authority, as the resolver reads it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AuthorityRow {
+    id: String,
+    authority_kind: String,
+    authority_number: String,
+    legal_status: String,
+    validity_basis: String,
+}
+
+/// Whether a purchase source held recorded Schedule X authority covering `product_id` on
+/// `purchase_date`.
+///
+/// Evaluated ENTIRELY on the historical purchase date against the recorded effective periods. The
+/// current Party master's licence text is never consulted, and neither is the D1-A snapshot frozen
+/// on the Purchase: that snapshot discharges the record-keeping duty of rule 65(4)(4)(i) and says
+/// nothing about whether the source was duly licensed.
+///
+/// Fail-closed throughout. Two overlapping active authorities are a `Conflicting` answer, not a
+/// choice between them — the 0029 triggers refuse to create that state, and this refuses to resolve
+/// it if one ever exists.
+pub async fn resolve_supplier_schedule_x_authority(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    supplier_party_id: &str,
+    purchase_date: &str,
+    product_id: &str,
+) -> Result<SupplierAuthority, sqlx::Error> {
+    // Every ACTIVE authority of this store for this supplier whose recorded period covers the day.
+    // Half-open, exactly as every other effective-dated model here: `effective_to` is exclusive.
+    let candidates: Vec<AuthorityRow> = sqlx::query_as(
+        "SELECT id,authority_kind,authority_number,legal_status,validity_basis \
+         FROM supplier_schedule_x_authorities \
+         WHERE store_id = ?1 AND supplier_party_id = ?2 AND status = 'active' \
+           AND effective_from <= ?3 \
+           AND (effective_to IS NULL OR effective_to > ?3) \
+         ORDER BY effective_from, id",
+    )
+    .bind(store_id)
+    .bind(supplier_party_id)
+    .bind(purchase_date)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    if candidates.len() > 1 {
+        return Ok(SupplierAuthority::Conflicting {
+            reason: SupplierAuthorityGap::ConflictingAuthorities,
+        });
+    }
+
+    let Some(authority) = candidates.into_iter().next() else {
+        // Nothing covers the day. Distinguish "nobody recorded anything" from "something was
+        // recorded but not for this date", because the two need different actions.
+        let any: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM supplier_schedule_x_authorities \
+             WHERE store_id = ?1 AND supplier_party_id = ?2 AND status = 'active' LIMIT 1",
+        )
+        .bind(store_id)
+        .bind(supplier_party_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        return Ok(match any {
+            Some(_) => SupplierAuthority::NotEstablished {
+                reason: SupplierAuthorityGap::OutsideEffectivePeriod,
+            },
+            None => SupplierAuthority::Unresolved {
+                reason: SupplierAuthorityGap::NoAuthorityRecorded,
+            },
+        });
+    };
+
+    // What the document says about the period it covers. `unknown` never establishes: a nullable
+    // "probably fine" is exactly the ambiguity a fail-closed gate must not inherit.
+    match authority.legal_status.as_str() {
+        "in_force" => {}
+        "suspended" => {
+            return Ok(SupplierAuthority::NotEstablished {
+                reason: SupplierAuthorityGap::AuthoritySuspended,
+            });
+        }
+        "cancelled" => {
+            return Ok(SupplierAuthority::NotEstablished {
+                reason: SupplierAuthorityGap::AuthorityCancelled,
+            });
+        }
+        _ => {
+            return Ok(SupplierAuthority::Unresolved {
+                reason: SupplierAuthorityGap::AuthorityStatusUnknown,
+            });
+        }
+    }
+    if authority.validity_basis == "unknown" {
+        return Ok(SupplierAuthority::Unresolved {
+            reason: SupplierAuthorityGap::ValidityBasisUnknown,
+        });
+    }
+
+    // And the drug. A Schedule X authority is not a blanket permission, so coverage is named per
+    // product by stable identity — never by drug name.
+    let coverage: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM supplier_schedule_x_authority_coverage \
+         WHERE authority_id = ?1 AND store_id = ?2 AND product_id = ?3 AND status = 'active' \
+           AND effective_from <= ?4 \
+           AND (effective_to IS NULL OR effective_to > ?4) \
+         ORDER BY effective_from, id",
+    )
+    .bind(&authority.id)
+    .bind(store_id)
+    .bind(product_id)
+    .bind(purchase_date)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    match coverage.len() {
+        0 => Ok(SupplierAuthority::NotEstablished {
+            reason: SupplierAuthorityGap::DrugNotCovered,
+        }),
+        1 => Ok(SupplierAuthority::Established {
+            authority_id: authority.id,
+            authority_kind: authority.authority_kind,
+            authority_number: authority.authority_number,
+            coverage_id: coverage.into_iter().next().expect("one coverage row"),
+        }),
+        _ => Ok(SupplierAuthority::Conflicting {
+            reason: SupplierAuthorityGap::ConflictingAuthorities,
+        }),
+    }
+}
+
+/// Every purchase source that contributed sellable stock to a lot, with its authority verdict.
+///
+/// Phase 1M-D3-B established the chain from a sale line to its batch to every sellable inward
+/// movement to the purchase line behind it. This walks the same chain and asks the authority
+/// question of EACH contributing source, because one authorised supplier must never legalise
+/// another whose authority is unresolved.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LotSourceAuthority {
+    pub purchase_document_id: String,
+    pub purchase_line_id: String,
+    pub supplier_party_id: String,
+    pub invoice_date: String,
+    pub authority: SupplierAuthority,
+}
+
+/// The authority verdict for every source behind a lot.
+///
+/// Reported BESIDE the Phase 1M-D3-B lot verdict, never folded into it: D3-B decides whether the
+/// stock is accounted for, and this decides whether its sources were recorded as authorised. A
+/// later slice combines them into one sale predicate; this phase only answers the question.
+pub async fn resolve_lot_source_authorities(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    batch_id: &str,
+    product_id: &str,
+) -> Result<Vec<LotSourceAuthority>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct SourceRow {
+        purchase_document_id: String,
+        purchase_line_id: String,
+        supplier_party_id: String,
+        invoice_date: String,
+    }
+    // One row per distinct purchase line that added sellable stock to this lot, with the supplier
+    // and the date as the POSTED document froze them.
+    let sources: Vec<SourceRow> = sqlx::query_as(
+        "SELECT DISTINCT document.id AS purchase_document_id,line.id AS purchase_line_id,\
+         document.supplier_party_id AS supplier_party_id,document.invoice_date AS invoice_date \
+         FROM inventory_movements inward \
+         JOIN purchase_lines line ON line.id = inward.purchase_line_id \
+         JOIN purchase_documents document ON document.id = line.purchase_document_id \
+         WHERE inward.store_id = ?1 AND inward.batch_id = ?2 \
+           AND inward.stock_status = 'sellable' AND inward.quantity_delta_atoms > 0 \
+           AND inward.movement_type = 'purchase' AND document.status = 'posted' \
+         ORDER BY document.invoice_date,line.id",
+    )
+    .bind(store_id)
+    .bind(batch_id)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    let mut out = Vec::with_capacity(sources.len());
+    for source in sources {
+        let authority = resolve_supplier_schedule_x_authority(
+            &mut *connection,
+            store_id,
+            &source.supplier_party_id,
+            &source.invoice_date,
+            product_id,
+        )
+        .await?;
+        out.push(LotSourceAuthority {
+            purchase_document_id: source.purchase_document_id,
+            purchase_line_id: source.purchase_line_id,
+            supplier_party_id: source.supplier_party_id,
+            invoice_date: source.invoice_date,
+            authority,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether EVERY contributing source of a lot has recorded authority evidence.
+///
+/// `None` when there are no contributing sources at all, which is not an authorised lot — it is a
+/// lot Phase 1M-D3-B already refuses, and this does not pretend otherwise.
+pub fn every_source_authorised(sources: &[LotSourceAuthority]) -> bool {
+    !sources.is_empty()
+        && sources
+            .iter()
+            .all(|source| source.authority.is_established())
+}

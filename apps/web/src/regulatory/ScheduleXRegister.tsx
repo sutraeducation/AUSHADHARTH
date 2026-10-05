@@ -16,6 +16,10 @@ import {
   confirmScheduleXEntry,
   finalizeScheduleXEntry,
   SCHEDULE_X_LOT_PROVENANCE_LABELS,
+  SUPPLIER_AUTHORITY_KIND_LABELS,
+  SUPPLIER_AUTHORITY_REASON_LABELS,
+  SUPPLIER_AUTHORITY_VERDICT_LABELS,
+  getSupplierAuthorities,
   getScheduleXPrescriptionAnnotations,
   getScheduleXSupplyPreparation,
   prepareScheduleXSupplyEntry,
@@ -102,6 +106,12 @@ export function ScheduleXRegisterPage() {
       the receipt entries below, which are a record of what came in.
     */}
     <ScheduleXSupplySection canMutate={canMutate} />
+
+    {/*
+      Phase 1M-D3-C1 — the purchase-source side of the same question, kept in its own panel
+      because it is evidence about a supplier rather than about a batch on the shelf.
+    */}
+    <SupplierAuthoritySection />
 
     {register.isPending ? <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>Loading the working record…</b></div>
       : register.isError ? <div className="empty-state" role="alert"><h3>The working record could not be loaded</h3><p>The Local Store Service did not complete this request.</p><button className="button button--secondary" type="button" onClick={() => void register.refetch()}>Retry</button></div>
@@ -359,6 +369,80 @@ function AnnotationDialog({ occasion, sellerName, sellerAddress, onClose, onSave
  * It does NOT sell anything. There is no action here that dispenses, and Schedule X dispensing at
  * the counter is still refused.
  */
+/**
+ * Phase 1M-D3-C1 — the supplier's Schedule X purchase-source authority, as documentary evidence.
+ *
+ * The sale licence Forms require Schedule X stock to have been purchased under cash or credit memo
+ * from a duly licensed dealer or a duly licensed manufacturer. Rule 61(3) makes a dealer's
+ * Schedule X wholesale licence Form 20-G; rule 70 makes a manufacturer's Form 25-F. This screen
+ * records what the operator read off such a document, and says plainly that AUSHADHARTH has not
+ * checked it with anybody.
+ */
+function SupplierAuthoritySection() {
+  const authorities = useQuery({
+    queryKey: ["schedule-x-supplier-authorities"],
+    queryFn: getSupplierAuthorities,
+    retry: false
+  });
+
+  return <section className="master-panel" aria-labelledby="schedule-x-authority-title" data-testid="schedule-x-supplier-authority">
+    <div className="panel-header">
+      <div>
+        <h2 id="schedule-x-authority-title">Supplier Schedule X authority</h2>
+        <p>Schedule X stock must have been purchased under cash or credit memo from a dealer or manufacturer holding the licence the Rules require for Schedule X. Record here what the supplier's licence document shows — a Form 20-G wholesale licence, or a Form 25-F manufacturing licence — and which drugs it covers.</p>
+      </div>
+    </div>
+
+    {/*
+      Said once, calmly, and never contradicted further down. This is the operator's reading of a
+      document, not a check against any government register.
+    */}
+    <section className="register-advisory" data-testid="schedule-x-authority-advisory">
+      <strong>This is documentary evidence you recorded.</strong>
+      <p>AUSHADHARTH has not verified these licences with any licensing authority and cannot tell you whether one is currently genuine, in force or unsuspended. What is stored is what you read on a document, and when you recorded it.</p>
+    </section>
+
+    {authorities.isPending ? <div className="table-loading" role="status" aria-live="polite"><span /><span /><span /><b>Loading supplier authority…</b></div>
+      : authorities.isError ? <div className="empty-state" role="alert"><h3>Supplier authority could not be loaded</h3><p>The Local Store Service did not complete this request.</p><button className="button button--secondary" type="button" onClick={() => void authorities.refetch()}>Retry</button></div>
+      : authorities.data.authorities.length === 0
+        ? <p className="panel-note">No supplier Schedule X authority recorded yet. Until one covers a purchase's supplier, date and drug, that purchase's source stays unaccounted for.</p>
+        : <ScrollableTable hint="Scroll sideways for the rest of the particulars">
+            <table className="data-table schedule-x-table">
+              <thead><tr>
+                <th scope="col">Supplier</th>
+                <th scope="col">Authority</th>
+                <th scope="col">Number</th>
+                <th scope="col">Issuing authority</th>
+                <th scope="col">Period</th>
+                <th scope="col">Drugs covered</th>
+                <th scope="col">Recorded</th>
+                <th scope="col">State</th>
+              </tr></thead>
+              <tbody>{authorities.data.authorities.map((authority) => {
+                const covered = authorities.data.coverage.filter(
+                  (row) => row.authorityId === authority.id && row.status === "active"
+                );
+                return <tr key={authority.id} data-testid={`schedule-x-authority-${authority.id}`}>
+                  <td data-label="Supplier" className="cell-wide">{authority.supplierDisplayName}</td>
+                  <td data-label="Authority" className="cell-wide">{SUPPLIER_AUTHORITY_KIND_LABELS[authority.authorityKind]}</td>
+                  <td data-label="Number" className="cell-reference"><span className="register-reference">{authority.authorityNumber}</span></td>
+                  <td data-label="Issuing authority" className="cell-wide">{authority.issuingAuthority ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
+                  <td data-label="Period">{authority.effectiveFrom}<small>{authority.validityBasis === "perpetual" ? "No end date recorded" : authority.effectiveTo ? `until ${authority.effectiveTo}` : "End date not recorded"}</small></td>
+                  <td data-label="Drugs covered" className="cell-wide">{covered.length === 0 ? <span className="not-recorded">No drug recorded</span> : covered.map((row) => <small key={row.id}>{row.productDisplayName} from {row.effectiveFrom}</small>)}</td>
+                  {/* The moment of recording, kept apart from the period the document asserts. */}
+                  <td data-label="Recorded">{authority.recordedAtUtc.slice(0, 10)}<small>as read from: {authority.sourceCitation}</small></td>
+                  <td data-label="State" className="cell-status">
+                    <span className={`status-badge status-badge--${authority.status === "active" && authority.legalStatus === "in_force" ? "posted" : "void"}`}>
+                      {authority.status === "archived" ? "Withdrawn" : authority.legalStatus === "in_force" ? "Recorded in force" : authority.legalStatus === "unknown" ? "Status not recorded" : authority.legalStatus === "suspended" ? "Recorded suspended" : "Recorded cancelled"}
+                    </span>
+                  </td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </ScrollableTable>}
+  </section>;
+}
+
 function ScheduleXSupplySection({ canMutate }: { canMutate: boolean }) {
   const queryClient = useQueryClient();
   const preparation = useQuery({
@@ -400,6 +484,7 @@ function ScheduleXSupplySection({ canMutate }: { canMutate: boolean }) {
                 <th scope="col">Batch</th>
                 <th scope="col">Quantity</th>
                 <th scope="col">Batch accounted for</th>
+                <th scope="col">Purchase source authority</th>
                 {canMutate && <th scope="col"><span className="visually-hidden">Actions</span></th>}
               </tr></thead>
               <tbody>{preparation.data.candidates.map((candidate) => {
@@ -416,6 +501,29 @@ function ScheduleXSupplySection({ canMutate }: { canMutate: boolean }) {
                       {SCHEDULE_X_LOT_PROVENANCE_LABELS[candidate.lotProvenance.state]}
                     </span>
                     {candidate.entryStatus && <small>Working record: {SCHEDULE_X_STATUS_LABELS[candidate.entryStatus]}</small>}
+                  </td>
+                  {/*
+                    Phase 1M-D3-C1. Reported BESIDE the batch verdict, never merged with it: the
+                    batch verdict says whether the stock is accounted for, this says whether the
+                    operator recorded evidence that its purchase sources were authorised. Neither
+                    is called legal or compliant, and neither means a government has verified
+                    anything.
+                  */}
+                  <td data-label="Purchase source authority" className="cell-status">
+                    <span className={`status-badge status-badge--${candidate.everySourceAuthorised ? "posted" : "void"}`}>
+                      {candidate.everySourceAuthorised
+                        ? "Authority evidence recorded"
+                        : "Authority evidence incomplete"}
+                    </span>
+                    {candidate.sourceAuthorities.length === 0
+                      ? <small>No purchase source traced</small>
+                      : candidate.sourceAuthorities
+                          .filter((source) => source.authority.state !== "established")
+                          .map((source) => <small key={source.purchaseLineId}>
+                            {source.invoiceDate}: {source.authority.state === "established"
+                              ? SUPPLIER_AUTHORITY_VERDICT_LABELS.established
+                              : SUPPLIER_AUTHORITY_REASON_LABELS[source.authority.reason] ?? SUPPLIER_AUTHORITY_VERDICT_LABELS[source.authority.state]}
+                          </small>)}
                   </td>
                   {canMutate && <td className="table-actions cell-actions" data-label="Actions">
                     {candidate.entryId

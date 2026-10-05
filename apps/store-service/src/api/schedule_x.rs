@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::api::auth::{self, AuthError, AuthenticatedActor};
 use crate::api::reference_masters::ReferenceState;
-use crate::domain::catalog::{optional_text, required_text, validate_uuid_v7};
+use crate::domain::catalog::{optional_text, required_text, validate_date, validate_uuid_v7};
 use crate::domain::{prescriptions, schedule_x, store_profile};
 
 #[derive(Debug)]
@@ -57,6 +57,9 @@ enum ScheduleXError {
     /// A dispensing date after the day the confirmation is made would say the prescription was
     /// dispensed on a day that has not happened.
     DispensingDateInFuture,
+    /// Phase 1M-D3-C1: evidence already on file covers part of this period. An ambiguity is never
+    /// settled by picking whichever record was written last.
+    AuthorityPeriodOverlaps,
     /// Two requests raced for the same occasion. The winner's row is the one fact, and the loser is
     /// told so rather than being handed a second.
     AnnotationAlreadyRecorded,
@@ -216,6 +219,13 @@ impl IntoResponse for ScheduleXError {
                     "A Schedule X supply record can only be closed by the sale it records, and Schedule X dispensing is not yet available.",
                 ),
             ),
+            Self::AuthorityPeriodOverlaps => (
+                StatusCode::CONFLICT,
+                simple(
+                    "schedule_x_authority_period_overlaps",
+                    "Evidence already on file covers part of this period. Close the existing record first, or record a period that does not overlap it.",
+                ),
+            ),
             Self::AnnotationAlreadyRecorded => (
                 StatusCode::CONFLICT,
                 simple(
@@ -242,6 +252,18 @@ fn map_database_error(error: sqlx::Error) -> ScheduleXError {
     // Phase 1M-D3-B: the 0028 lot guard, refused by the database whoever wrote the statement. The
     // reason is not re-derived here — the service checks provenance first and names it, so reaching
     // this line means something bypassed that path.
+    // Phase 1M-D3-C1: overlapping authority evidence is an ambiguity refused at the door, said in
+    // words rather than as a constraint name.
+    if text.contains("supplier_schedule_x_authority_period_overlaps")
+        || text.contains("supplier_schedule_x_coverage_period_overlaps")
+    {
+        return ScheduleXError::AuthorityPeriodOverlaps;
+    }
+    if text.contains("supplier_schedule_x_authority_incoherent")
+        || text.contains("supplier_schedule_x_coverage_incoherent")
+    {
+        return ScheduleXError::NotFound;
+    }
     if text.contains("schedule_x_supply_lot_provenance_unresolved") {
         return ScheduleXError::LotProvenanceUnresolved(
             crate::domain::schedule_x::LotProvenance::UnresolvedInwardMovement,
@@ -1218,6 +1240,18 @@ pub fn routes() -> Router<ReferenceState> {
             get(get_supply_preparation).post(prepare_supply_entry),
         )
         .route(
+            "/api/v1/store/schedule-x/supplier-authorities",
+            get(get_supplier_authorities).post(create_supplier_authority),
+        )
+        .route(
+            "/api/v1/store/schedule-x/supplier-authorities/{id}/coverage",
+            post(create_authority_coverage),
+        )
+        .route(
+            "/api/v1/store/schedule-x/supplier-authorities/{id}/archive",
+            post(archive_supplier_authority),
+        )
+        .route(
             "/api/v1/store/schedule-x/register/{id}/confirm",
             post(confirm_entry),
         )
@@ -1270,6 +1304,14 @@ struct SupplyCandidate {
     row: SupplyCandidateRow,
     /// Whether the exact lot this line draws on traces to a qualifying purchase receipt.
     lot_provenance: schedule_x::LotProvenance,
+    /// Phase 1M-D3-C1 — whether EVERY purchase source behind the lot has recorded Schedule X
+    /// authority evidence. Reported BESIDE the lot verdict, never folded into it: the lot
+    /// verdict decides whether the stock is accounted for, and this decides whether its sources
+    /// were recorded as authorised. A later slice combines them into one sale predicate; this
+    /// phase only answers the question, so Phase 1M-D3-B behaviour is unchanged.
+    source_authorities: Vec<schedule_x::LotSourceAuthority>,
+    /// True only when there is at least one source and every one of them is established.
+    every_source_authorised: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1339,9 +1381,20 @@ async fn get_supply_preparation(
             schedule_x::resolve_lot_provenance(&mut connection, &store_id, &row.batch_id)
                 .await
                 .map_err(map_database_error)?;
+        let source_authorities = schedule_x::resolve_lot_source_authorities(
+            &mut connection,
+            &store_id,
+            &row.batch_id,
+            &row.product_id,
+        )
+        .await
+        .map_err(map_database_error)?;
+        let every_source_authorised = schedule_x::every_source_authorised(&source_authorities);
         candidates.push(SupplyCandidate {
             row,
             lot_provenance,
+            source_authorities,
+            every_source_authorised,
         });
     }
     Ok(Json(SupplyPreparationResponse { candidates }))
@@ -1564,4 +1617,507 @@ async fn prepare_supply_within(
     )
     .await?;
     Ok((StatusCode::CREATED, id))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 1M-D3-C1 — supplier Schedule X purchase-source authority evidence
+// ---------------------------------------------------------------------------------------------
+
+/// Recording what a supplier's licence document says is the owner's job, not a pharmacist's and
+/// certainly not a cashier's: a till operator must never be able to self-attest a supplier's
+/// authority in order to make a future sale pass. Reading it stays with the owner and the
+/// pharmacist, who need it for the compliance workflow.
+async fn require_authority_manager(
+    state: &ReferenceState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActor, ScheduleXError> {
+    auth::validate_mutation_request(headers)?;
+    let actor = auth::require_authenticated_actor(&state.pool, headers).await?;
+    if actor.role != "owner_admin" {
+        return Err(AuthError::AuthorizationDenied.into());
+    }
+    Ok(actor)
+}
+
+#[derive(Debug, Serialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SupplierAuthorityRow {
+    id: String,
+    supplier_party_id: String,
+    supplier_display_name: String,
+    authority_kind: String,
+    authority_number: String,
+    issuing_authority: Option<String>,
+    legal_status: String,
+    validity_basis: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    source_citation: String,
+    note: Option<String>,
+    recorded_by_user_id: String,
+    /// When AUSHADHARTH learned the fact, which is not when the document says it began.
+    recorded_at_utc: String,
+    revision: i64,
+    status: String,
+}
+
+#[derive(Debug, Serialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SupplierAuthorityCoverageRow {
+    id: String,
+    authority_id: String,
+    product_id: String,
+    product_display_name: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    source_citation: String,
+    reason: Option<String>,
+    recorded_at_utc: String,
+    revision: i64,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SupplierAuthoritiesResponse {
+    authorities: Vec<SupplierAuthorityRow>,
+    coverage: Vec<SupplierAuthorityCoverageRow>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSupplierAuthorityRequest {
+    supplier_party_id: String,
+    authority_kind: String,
+    authority_number: String,
+    issuing_authority: Option<String>,
+    legal_status: String,
+    validity_basis: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    /// The document the operator inspected. Required: an authority nobody can say where they read
+    /// is not evidence.
+    source_citation: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCoverageRequest {
+    product_id: String,
+    effective_from: String,
+    effective_to: Option<String>,
+    source_citation: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveRequest {
+    expected_revision: i64,
+    reason: String,
+}
+
+const AUTHORITY_COLUMNS: &str = "authority.id,authority.supplier_party_id,\
+     supplier.display_name AS supplier_display_name,authority.authority_kind,\
+     authority.authority_number,authority.issuing_authority,authority.legal_status,\
+     authority.validity_basis,authority.effective_from,authority.effective_to,\
+     authority.source_citation,authority.note,authority.recorded_by_user_id,\
+     authority.recorded_at_utc,authority.revision,authority.status";
+
+async fn get_supplier_authorities(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+) -> Result<Json<SupplierAuthoritiesResponse>, ScheduleXError> {
+    require_regulatory_reader(&state, &headers).await?;
+    let store_id = current_store(&state).await?;
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    let authorities: Vec<SupplierAuthorityRow> = sqlx::query_as(&format!(
+        "SELECT {AUTHORITY_COLUMNS} FROM supplier_schedule_x_authorities authority \
+         JOIN parties supplier ON supplier.id = authority.supplier_party_id \
+         WHERE authority.store_id = ? \
+         ORDER BY supplier.display_name, authority.effective_from DESC, authority.id"
+    ))
+    .bind(&store_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    let coverage: Vec<SupplierAuthorityCoverageRow> = sqlx::query_as(
+        "SELECT coverage.id,coverage.authority_id,coverage.product_id,\
+         product.display_name AS product_display_name,coverage.effective_from,\
+         coverage.effective_to,coverage.source_citation,coverage.reason,coverage.recorded_at_utc,\
+         coverage.revision,coverage.status \
+         FROM supplier_schedule_x_authority_coverage coverage \
+         JOIN products product ON product.id = coverage.product_id \
+         WHERE coverage.store_id = ? \
+         ORDER BY product.display_name, coverage.effective_from DESC, coverage.id",
+    )
+    .bind(&store_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    Ok(Json(SupplierAuthoritiesResponse {
+        authorities,
+        coverage,
+    }))
+}
+
+/// Records what a supplier's Schedule X licence document says.
+///
+/// AUSHADHARTH does not contact any licensing authority. What this stores is one operator's reading
+/// of one document, with the moment of recording kept separate from the period the document speaks
+/// about, so a retrospective record is visibly retrospective.
+async fn create_supplier_authority(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSupplierAuthorityRequest>,
+) -> Result<(StatusCode, Json<SupplierAuthorityRow>), ScheduleXError> {
+    let actor = require_authority_manager(&state, &headers).await?;
+    validate_uuid_v7(&request.supplier_party_id, "supplierPartyId")
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let kind = schedule_x::SupplierAuthorityKind::parse(&request.authority_kind).ok_or_else(|| {
+        validation(
+            "authorityKind",
+            "Choose the Schedule X wholesale licence (Form 20-G) or the Schedule X manufacturing licence (Form 25-F).",
+        )
+    })?;
+    if !matches!(
+        request.legal_status.as_str(),
+        "in_force" | "suspended" | "cancelled" | "unknown"
+    ) {
+        return Err(validation(
+            "legalStatus",
+            "Record what the document states.",
+        ));
+    }
+    if !matches!(
+        request.validity_basis.as_str(),
+        "perpetual" | "fixed_term" | "unknown"
+    ) {
+        return Err(validation(
+            "validityBasis",
+            "Record whether the document states a perpetual authority or a fixed term.",
+        ));
+    }
+    let number = required_text(&request.authority_number, "authorityNumber", 100)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let citation = required_text(&request.source_citation, "sourceCitation", 300)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let issuing = optional_text(
+        request.issuing_authority.as_deref(),
+        "issuingAuthority",
+        160,
+    )
+    .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let note = optional_text(request.note.as_deref(), "note", 500)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let effective_from = validate_date(Some(&request.effective_from), "effectiveFrom")
+        .map_err(|issue| validation(&issue.field, &issue.message))?
+        .ok_or_else(|| validation("effectiveFrom", "Record the date the document states."))?;
+    let effective_to: Option<String> = match request.effective_to.as_deref() {
+        Some(value) => validate_date(Some(value), "effectiveTo")
+            .map_err(|issue| validation(&issue.field, &issue.message))?,
+        None => None,
+    };
+    // The end date and the basis must agree, said here so the operator reads a sentence rather than
+    // a constraint name. The 0029 CHECK says the same thing against direct SQL.
+    match (request.validity_basis.as_str(), effective_to.as_deref()) {
+        ("fixed_term", None) => {
+            return Err(validation(
+                "effectiveTo",
+                "A fixed-term authority needs the end date the document states.",
+            ));
+        }
+        ("perpetual", Some(_)) => {
+            return Err(validation(
+                "effectiveTo",
+                "A perpetual authority has no end date. Record a fixed term instead if the document states one.",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(end) = effective_to.as_deref()
+        && end <= effective_from.as_str()
+    {
+        return Err(validation(
+            "effectiveTo",
+            "The end date must be after the start date.",
+        ));
+    }
+    let normalized: String = number
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(validation(
+            "authorityNumber",
+            "Record the authority number as it appears on the document.",
+        ));
+    }
+    let store_id = current_store(&state).await?;
+
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    let id = Uuid::now_v7().to_string();
+    let outcome = async {
+        let now = database_now(&mut connection).await?;
+        sqlx::query(
+            "INSERT INTO supplier_schedule_x_authorities (id,store_id,supplier_party_id,\
+             authority_kind,authority_number,normalized_authority_number,issuing_authority,\
+             legal_status,validity_basis,effective_from,effective_to,source_citation,note,\
+             recorded_by_user_id,recorded_at_utc,created_at_utc,updated_at_utc) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&id)
+        .bind(&store_id)
+        .bind(&request.supplier_party_id)
+        .bind(kind.as_str())
+        .bind(&number)
+        .bind(&normalized)
+        .bind(&issuing)
+        .bind(&request.legal_status)
+        .bind(&request.validity_basis)
+        .bind(&effective_from)
+        .bind(&effective_to)
+        .bind(&citation)
+        .bind(&note)
+        .bind(&actor.id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        // Identifiers, the legal basis and the period. The document text the operator typed stays
+        // on the row and is not copied into a log.
+        record_event(
+            &mut connection,
+            "supplier_schedule_x_authority",
+            &id,
+            "created",
+            None,
+            serde_json::json!({
+                "supplierPartyId": request.supplier_party_id,
+                "authorityKind": kind.as_str(),
+                "legalStatus": request.legal_status,
+                "validityBasis": request.validity_basis,
+                "effectiveFrom": effective_from,
+                "effectiveTo": effective_to,
+            }),
+            &actor.id,
+        )
+        .await?;
+        Ok::<(), ScheduleXError>(())
+    }
+    .await;
+    let statement = if outcome.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    sqlx::query(statement)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    outcome?;
+
+    let created = load_authority(&state, &store_id, &id).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn load_authority(
+    state: &ReferenceState,
+    store_id: &str,
+    id: &str,
+) -> Result<SupplierAuthorityRow, ScheduleXError> {
+    sqlx::query_as(&format!(
+        "SELECT {AUTHORITY_COLUMNS} FROM supplier_schedule_x_authorities authority \
+         JOIN parties supplier ON supplier.id = authority.supplier_party_id \
+         WHERE authority.id = ? AND authority.store_id = ?"
+    ))
+    .bind(id)
+    .bind(store_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(map_database_error)?
+    .ok_or(ScheduleXError::NotFound)
+}
+
+/// Records which Schedule X drug the operator says that authority covered, and when.
+async fn create_authority_coverage(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(authority_id): Path<String>,
+    Json(request): Json<CreateCoverageRequest>,
+) -> Result<(StatusCode, Json<SupplierAuthorityCoverageRow>), ScheduleXError> {
+    let actor = require_authority_manager(&state, &headers).await?;
+    validate_uuid_v7(&authority_id, "authorityId")
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    validate_uuid_v7(&request.product_id, "productId")
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let citation = required_text(&request.source_citation, "sourceCitation", 300)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let reason = optional_text(request.reason.as_deref(), "reason", 300)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let effective_from = validate_date(Some(&request.effective_from), "effectiveFrom")
+        .map_err(|issue| validation(&issue.field, &issue.message))?
+        .ok_or_else(|| validation("effectiveFrom", "Record the date the document states."))?;
+    let effective_to: Option<String> = match request.effective_to.as_deref() {
+        Some(value) => validate_date(Some(value), "effectiveTo")
+            .map_err(|issue| validation(&issue.field, &issue.message))?,
+        None => None,
+    };
+    if let Some(end) = effective_to.as_deref()
+        && end <= effective_from.as_str()
+    {
+        return Err(validation(
+            "effectiveTo",
+            "The end date must be after the start date.",
+        ));
+    }
+    let store_id = current_store(&state).await?;
+
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    let id = Uuid::now_v7().to_string();
+    let outcome = async {
+        let now = database_now(&mut connection).await?;
+        sqlx::query(
+            "INSERT INTO supplier_schedule_x_authority_coverage (id,store_id,authority_id,\
+             product_id,effective_from,effective_to,source_citation,reason,recorded_by_user_id,\
+             recorded_at_utc,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&id)
+        .bind(&store_id)
+        .bind(&authority_id)
+        .bind(&request.product_id)
+        .bind(&effective_from)
+        .bind(&effective_to)
+        .bind(&citation)
+        .bind(&reason)
+        .bind(&actor.id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+        record_event(
+            &mut connection,
+            "supplier_schedule_x_authority_coverage",
+            &id,
+            "created",
+            None,
+            serde_json::json!({
+                "authorityId": authority_id,
+                "productId": request.product_id,
+                "effectiveFrom": effective_from,
+                "effectiveTo": effective_to,
+            }),
+            &actor.id,
+        )
+        .await?;
+        Ok::<(), ScheduleXError>(())
+    }
+    .await;
+    let statement = if outcome.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    sqlx::query(statement)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    outcome?;
+
+    let created: SupplierAuthorityCoverageRow = sqlx::query_as(
+        "SELECT coverage.id,coverage.authority_id,coverage.product_id,\
+         product.display_name AS product_display_name,coverage.effective_from,\
+         coverage.effective_to,coverage.source_citation,coverage.reason,coverage.recorded_at_utc,\
+         coverage.revision,coverage.status \
+         FROM supplier_schedule_x_authority_coverage coverage \
+         JOIN products product ON product.id = coverage.product_id WHERE coverage.id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(map_database_error)?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Withdraws an authority record entered in error.
+///
+/// Archiving does not delete evidence and does not rewrite history: a purchase whose date fell
+/// inside this record's period while it was active keeps resolving on what was recorded, because an
+/// archived record is a record of what the pharmacy believed and when. A document that shows the
+/// authority actually ceased from a date is a different fact — recorded by closing the period.
+async fn archive_supplier_authority(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ArchiveRequest>,
+) -> Result<Json<SupplierAuthorityRow>, ScheduleXError> {
+    let actor = require_authority_manager(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(|issue| validation(&issue.field, &issue.message))?;
+    let reason = required_text(&request.reason, "reason", 500)
+        .map_err(|issue| validation(&issue.field, &issue.message))?;
+    let store_id = current_store(&state).await?;
+
+    let mut connection = state.pool.acquire().await.map_err(map_database_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    let outcome = async {
+        let now = database_now(&mut connection).await?;
+        let affected = sqlx::query(
+            "UPDATE supplier_schedule_x_authorities SET status='archived',revision=revision+1,\
+             archived_at_utc=?,archive_reason=?,updated_at_utc=? \
+             WHERE id=? AND store_id=? AND revision=? AND status='active'",
+        )
+        .bind(&now)
+        .bind(&reason)
+        .bind(&now)
+        .bind(&id)
+        .bind(&store_id)
+        .bind(request.expected_revision)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(ScheduleXError::NotFound);
+        }
+        record_event(
+            &mut connection,
+            "supplier_schedule_x_authority",
+            &id,
+            "archived",
+            Some(&reason),
+            serde_json::json!({ "transition": "active_to_archived" }),
+            &actor.id,
+        )
+        .await?;
+        Ok::<(), ScheduleXError>(())
+    }
+    .await;
+    let statement = if outcome.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    sqlx::query(statement)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+    outcome?;
+    Ok(Json(load_authority(&state, &store_id, &id).await?))
 }

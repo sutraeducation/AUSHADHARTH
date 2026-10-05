@@ -3320,6 +3320,127 @@ export const RecordScheduleXPrescriptionAnnotationRequestSchema = z.object({
  * path — opening stock, a correction, a count, or goods released back from quarantine — and stock
  * inside one lot cannot be told apart, so the whole lot is held back.
  */
+/**
+ * Phase 1M-D3-C1 — the legal basis a Schedule X purchase source can hold.
+ *
+ * Rule 61(3): a licence to sell, stock, exhibit or offer for sale or distribute drugs specified in
+ * Schedule X by retail or by wholesale is issued in Form 20-F or Form 20-G. A dealer supplying by
+ * wholesale therefore holds Form 20-G. Rule 70: licences to manufacture drugs included in
+ * Schedule X are granted in Form 25-F. Those are the two, and nothing else is accepted.
+ */
+export const SupplierAuthorityKindSchema = z.enum(["form_20g", "form_25f"]);
+
+/** What the document the operator inspected says about the period it covers. */
+export const SupplierAuthorityLegalStatusSchema = z.enum([
+  "in_force",
+  "suspended",
+  "cancelled",
+  "unknown"
+]);
+
+export const SupplierAuthorityValidityBasisSchema = z.enum([
+  "perpetual",
+  "fixed_term",
+  "unknown"
+]);
+
+/**
+ * Whether the operator has recorded documentary evidence that a purchase source held Schedule X
+ * authority covering a drug on a date.
+ *
+ * `established` means "the operator recorded evidence that says so" — NOT that any government has
+ * confirmed the licence is genuine, current or unsuspended. AUSHADHARTH contacts no licensing
+ * authority and cannot know that.
+ */
+export const SupplierAuthorityVerdictSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("established"),
+    authorityId: z.string(),
+    authorityKind: SupplierAuthorityKindSchema,
+    authorityNumber: z.string(),
+    coverageId: z.string()
+  }),
+  z.object({ state: z.literal("not_established"), reason: z.string() }),
+  z.object({ state: z.literal("unresolved"), reason: z.string() }),
+  z.object({ state: z.literal("conflicting"), reason: z.string() })
+]);
+
+/** One purchase source behind a lot, with its authority verdict. */
+export const LotSourceAuthoritySchema = z.object({
+  purchaseDocumentId: z.string(),
+  purchaseLineId: z.string(),
+  supplierPartyId: z.string(),
+  invoiceDate: z.string(),
+  authority: SupplierAuthorityVerdictSchema
+});
+
+export const SupplierAuthoritySchema = z.object({
+  id: z.string(),
+  supplierPartyId: z.string(),
+  supplierDisplayName: z.string(),
+  authorityKind: SupplierAuthorityKindSchema,
+  authorityNumber: z.string(),
+  issuingAuthority: z.string().nullable(),
+  legalStatus: SupplierAuthorityLegalStatusSchema,
+  validityBasis: SupplierAuthorityValidityBasisSchema,
+  /** What the document asserts. Half-open: the end date is exclusive. */
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  /** The document the operator inspected. */
+  sourceCitation: z.string(),
+  note: z.string().nullable(),
+  recordedByUserId: z.string(),
+  /** When AUSHADHARTH learned the fact, which is not when the document says it began. */
+  recordedAtUtc: z.string(),
+  revision: z.number().int(),
+  status: z.enum(["active", "archived"])
+});
+
+export const SupplierAuthorityCoverageSchema = z.object({
+  id: z.string(),
+  authorityId: z.string(),
+  productId: z.string(),
+  productDisplayName: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable(),
+  recordedAtUtc: z.string(),
+  revision: z.number().int(),
+  status: z.enum(["active", "archived"])
+});
+
+export const SupplierAuthoritiesSchema = z.object({
+  authorities: z.array(SupplierAuthoritySchema),
+  coverage: z.array(SupplierAuthorityCoverageSchema)
+});
+
+export const RecordSupplierAuthorityRequestSchema = z.object({
+  supplierPartyId: z.string(),
+  authorityKind: SupplierAuthorityKindSchema,
+  authorityNumber: z.string(),
+  issuingAuthority: z.string().nullable().optional(),
+  legalStatus: SupplierAuthorityLegalStatusSchema,
+  validityBasis: SupplierAuthorityValidityBasisSchema,
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable().optional(),
+  sourceCitation: z.string(),
+  note: z.string().nullable().optional()
+});
+
+export const RecordSupplierAuthorityCoverageRequestSchema = z.object({
+  productId: z.string(),
+  effectiveFrom: z.string(),
+  effectiveTo: z.string().nullable().optional(),
+  sourceCitation: z.string(),
+  reason: z.string().nullable().optional()
+});
+
+export const ArchiveSupplierAuthorityRequestSchema = z.object({
+  expectedRevision: z.number().int(),
+  reason: z.string()
+});
+
 export const ScheduleXLotProvenanceSchema = z.object({
   state: z.enum(["qualified", "no_qualifying_receipt", "unresolved_inward_movement"])
 });
@@ -3339,7 +3460,13 @@ export const ScheduleXSupplyCandidateSchema = z.object({
   /** The live supply working entry for this line, when one has been prepared. */
   entryId: z.string().nullable(),
   entryStatus: ScheduleXEntryStatusSchema.nullable(),
-  lotProvenance: ScheduleXLotProvenanceSchema
+  lotProvenance: ScheduleXLotProvenanceSchema,
+  /**
+   * Phase 1M-D3-C1 — reported BESIDE the lot verdict, never folded into it. The lot verdict says
+   * whether the stock is accounted for; this says whether its sources were recorded as authorised.
+   */
+  sourceAuthorities: z.array(LotSourceAuthoritySchema),
+  everySourceAuthorised: z.boolean()
 });
 
 export const ScheduleXSupplyPreparationSchema = z.object({
@@ -3374,3 +3501,10 @@ export type ScheduleXLotProvenance = z.infer<typeof ScheduleXLotProvenanceSchema
 export type ScheduleXSupplyCandidate = z.infer<typeof ScheduleXSupplyCandidateSchema>;
 export type ScheduleXSupplyPreparation = z.infer<typeof ScheduleXSupplyPreparationSchema>;
 export type PrepareScheduleXSupplyRequest = z.infer<typeof PrepareScheduleXSupplyRequestSchema>;
+export type SupplierAuthorityKind = z.infer<typeof SupplierAuthorityKindSchema>;
+export type SupplierAuthorityVerdict = z.infer<typeof SupplierAuthorityVerdictSchema>;
+export type LotSourceAuthority = z.infer<typeof LotSourceAuthoritySchema>;
+export type SupplierAuthority = z.infer<typeof SupplierAuthoritySchema>;
+export type SupplierAuthorityCoverage = z.infer<typeof SupplierAuthorityCoverageSchema>;
+export type SupplierAuthorities = z.infer<typeof SupplierAuthoritiesSchema>;
+export type RecordSupplierAuthorityRequest = z.infer<typeof RecordSupplierAuthorityRequestSchema>;
