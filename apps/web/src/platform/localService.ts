@@ -220,7 +220,13 @@ export function safeErrorMessage(code?: string): string {
     case "schedule_h1_ndps_workflow_not_available": return "This Schedule H1 drug is, or may be, within the NDPS Act, and AUSHADHARTH does not support that combined workflow (an unsupported NDPS-intersection workflow).";
     case "state_restricted_drug_workflow_not_available": return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
     case "state_regulatory_position_unresolved": return "This medicine's position under the Punjab drug-control boundary is not recorded, or the store's premises State is not recorded.";
-    case "schedule_x_workflow_not_available": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
+    case "schedule_x_workflow_not_available": return "This Schedule X line is outside the supported retail path.";
+    // Phase 1M-D3-C2: the NDPS axis is independent of Schedule X and is never cleared by it.
+    case "schedule_x_ndps_purview_applies": return "This Schedule X drug is recorded as falling within the NDPS Act, and AUSHADHARTH does not support that combined workflow.";
+    case "schedule_x_ndps_purview_unresolved": return "Nobody has recorded whether this Schedule X drug falls within the NDPS Act. Record the product's NDPS position before supplying it.";
+    // Phase 1M-D3-C2: a combination the current Schedule X workflow does not support. It takes no
+    // position on what the law requires of such a drug.
+    case "schedule_x_unsupported_intersecting_regime": return "This regulatory combination is not supported by the current Schedule X workflow. Remove the line to post the rest.";
     // Phase 1M-D3-A: rule 65(11)(c), the note written on the physical prescription.
     case "schedule_x_pharmacist_not_valid_on_date": return "That registered pharmacist's record does not cover the date of this transaction.";
     case "schedule_x_seller_particulars_unavailable": return "Record the pharmacy's name and address in Store Profile before confirming what was written on the prescription.";

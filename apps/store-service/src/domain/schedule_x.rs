@@ -478,6 +478,23 @@ pub enum SupplierAuthorityGap {
     ConflictingAuthorities,
 }
 
+impl SupplierAuthorityGap {
+    /// Phase 1M-D3-C2 — the stable reason a structured refusal carries, so the counter is told which
+    /// purchase to look at rather than being handed one undifferentiated failure.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAuthorityRecorded => "no_authority_recorded",
+            Self::AuthorityStatusUnknown => "authority_status_unknown",
+            Self::AuthoritySuspended => "authority_suspended",
+            Self::AuthorityCancelled => "authority_cancelled",
+            Self::ValidityBasisUnknown => "validity_basis_unknown",
+            Self::OutsideEffectivePeriod => "outside_effective_period",
+            Self::DrugNotCovered => "drug_not_covered",
+            Self::ConflictingAuthorities => "conflicting_authorities",
+        }
+    }
+}
+
 impl SupplierAuthority {
     pub fn is_established(&self) -> bool {
         matches!(self, Self::Established { .. })
@@ -705,4 +722,442 @@ pub fn every_source_authorised(sources: &[LotSourceAuthority]) -> bool {
         && sources
             .iter()
             .all(|source| source.authority.is_established())
+}
+
+// -------------------------------------------------------------------------------------------------
+// Phase 1M-D3-C2 — the Schedule X retail-supply predicates.
+//
+// Each requirement of a supported Schedule X retail supply is resolved on its own and reported on
+// its own. They are deliberately NOT reduced to one "compliant" boolean: the counter has to know
+// which requirement is outstanding, and an operator told only "refused" cannot act.
+//
+// What is NOT here matters as much as what is. The prescription's own authority — exact product
+// under rule 65(11A), the total under rule 65(10)(c), the repeat under rule 65(11)(a), the interval
+// under rule 65(11)(b), and what is left of the authority — is resolved by
+// `domain::prescriptions::check_dispense`, which the posting planner already runs for every
+// supervised line. Schedule X joins that path rather than growing a second copy of it, so one set
+// of rules answers the prescription question for Schedule H, H1 and X alike, and every database
+// protection behind it keeps applying.
+//
+// Likewise the NDPS axis, the Punjab boundary and the Schedule C/C(1) intersection are answered by
+// `domain::regulatory::combined_gate` before any of this is reached, and the Schedule H1 working
+// entry by the posting planner's own H1 layer. They appear in the preflight report because the
+// operator needs to see them, but their verdicts come from those owners, not from here.
+// -------------------------------------------------------------------------------------------------
+
+/// One independent predicate's verdict.
+///
+/// `NotEstablished` and `Unresolved` are kept apart for the reason Phase 1M-D1-B first kept them
+/// apart: "something is recorded and it does not support this supply" and "nobody has recorded
+/// anything" need different actions from different people. `Unsupported` is AUSHADHARTH's own
+/// boundary rather than a statutory refusal, and `OverlayBlocked` names an independent axis that
+/// stops the supply however complete the Schedule X evidence is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "state"
+)]
+pub enum Predicate {
+    Established,
+    NotEstablished {
+        reason: &'static str,
+    },
+    Unresolved {
+        reason: &'static str,
+    },
+    Unsupported {
+        reason: &'static str,
+    },
+    OverlayBlocked {
+        axis: &'static str,
+        reason: &'static str,
+    },
+}
+
+impl Predicate {
+    pub fn is_established(&self) -> bool {
+        matches!(self, Self::Established)
+    }
+
+    /// The stable reason a refusal carries, or `None` when the predicate is established.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Established => None,
+            Self::NotEstablished { reason }
+            | Self::Unresolved { reason }
+            | Self::Unsupported { reason }
+            | Self::OverlayBlocked { reason, .. } => Some(reason),
+        }
+    }
+}
+
+/// A named predicate, the stable code its refusal carries, and its verdict.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedPredicate {
+    /// The predicate's stable name, as the preflight contract reports it.
+    pub predicate: &'static str,
+    /// The structured error code raised when this predicate is not established.
+    pub code: &'static str,
+    pub verdict: Predicate,
+}
+
+impl NamedPredicate {
+    pub fn new(predicate: &'static str, code: &'static str, verdict: Predicate) -> Self {
+        Self {
+            predicate,
+            code,
+            verdict,
+        }
+    }
+}
+
+/// The store's own Schedule X RETAIL authority, and this drug's coverage under it.
+///
+/// Two predicates, never one. Form 20-F is headed "LICENCE TO SELL, STOCK OR EXHIBIT FOR SALE OR
+/// DISTRIBUTE BY RETAIL DRUGS SPECIFIED IN SCHEDULE X" and its item 2 is "Names of drugs", so the
+/// licence is not blanket permission and "no licence" is a different problem from "this drug is not
+/// named on it".
+///
+/// Licence validity is inclusive at both ends, matching how every other licence and registration
+/// date in this repository is read. Coverage is a half-open effective period with `effective_to`
+/// exclusive, matching every other effective-dated model here.
+///
+/// Existence is `EXISTS`, not exactly-one, and that is deliberate: it is the same question the
+/// database's own `sale_documents_schedule_x_register_required` asks, and two implementations of one
+/// predicate must not disagree. It differs from the Phase 1M-D3-C1 supplier authority, where
+/// exactly-one matters because that authority's own number is a recorded register particular; here
+/// the question is only whether this store is authorised for this drug on this day.
+pub async fn resolve_store_retail_authority(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    product_id: &str,
+    business_date: &str,
+) -> Result<(Predicate, Predicate), sqlx::Error> {
+    let licence: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM store_compliance_licences \
+         WHERE store_id = ?1 AND licence_form = 'form_20f' AND status = 'active' \
+           AND (valid_from IS NULL OR valid_from <= ?2) \
+           AND (valid_upto IS NULL OR valid_upto >= ?2) \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(business_date)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    if licence.is_none() {
+        // Distinguish "a Form 20-F is recorded but not for this day" from "none is recorded".
+        let any: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM store_compliance_licences \
+             WHERE store_id = ?1 AND licence_form = 'form_20f' AND status = 'active' LIMIT 1",
+        )
+        .bind(store_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let authority = match any {
+            Some(_) => Predicate::NotEstablished {
+                reason: "authority_outside_validity",
+            },
+            None => Predicate::Unresolved {
+                reason: "no_authority_recorded",
+            },
+        };
+        return Ok((
+            authority,
+            Predicate::Unresolved {
+                reason: "authority_not_established",
+            },
+        ));
+    }
+
+    // The drug, under any Form 20-F of this store that is in force on the day, so a store holding
+    // two licences is not refused because the drug is named on the other one.
+    let covered: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM store_compliance_licences licence \
+         JOIN store_licence_drug_coverage coverage ON coverage.licence_id = licence.id \
+         WHERE licence.store_id = ?1 AND licence.licence_form = 'form_20f' \
+           AND licence.status = 'active' \
+           AND (licence.valid_from IS NULL OR licence.valid_from <= ?2) \
+           AND (licence.valid_upto IS NULL OR licence.valid_upto >= ?2) \
+           AND coverage.store_id = ?1 AND coverage.product_id = ?3 \
+           AND coverage.status = 'active' \
+           AND coverage.effective_from <= ?2 \
+           AND (coverage.effective_to IS NULL OR coverage.effective_to > ?2) \
+         LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(business_date)
+    .bind(product_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    Ok((
+        Predicate::Established,
+        match covered {
+            Some(_) => Predicate::Established,
+            None => Predicate::NotEstablished {
+                reason: "drug_not_covered",
+            },
+        },
+    ))
+}
+
+/// Rule 65(9)(a): the retained duplicate prescription copy.
+///
+/// The attestation records a person's statement about a sheet of paper. A row saying the copy is NOT
+/// held is as meaningful as one saying it is, so a negative attestation is `NotEstablished` while a
+/// missing one is `Unresolved`.
+pub async fn resolve_duplicate_copy(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    prescription_id: &str,
+) -> Result<Predicate, sqlx::Error> {
+    let confirmed: Option<i64> = sqlx::query_scalar(
+        "SELECT retained_duplicate_prescription_copy_confirmed \
+         FROM prescription_duplicate_copy_attestations \
+         WHERE store_id = ?1 AND prescription_id = ?2",
+    )
+    .bind(store_id)
+    .bind(prescription_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(match confirmed {
+        Some(1) => Predicate::Established,
+        Some(_) => Predicate::NotEstablished {
+            reason: "duplicate_copy_not_held",
+        },
+        None => Predicate::Unresolved {
+            reason: "no_attestation_recorded",
+        },
+    })
+}
+
+/// Rule 65(11)(c): the seller's name and address and the date of dispensing, noted on the
+/// prescription above the prescriber's signature.
+pub async fn resolve_annotation(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    sale_document_id: &str,
+    sale_line_id: &str,
+    prescription_item_id: &str,
+    product_id: &str,
+) -> Result<Predicate, sqlx::Error> {
+    let present: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM schedule_x_prescription_annotations \
+         WHERE store_id = ?1 AND sale_document_id = ?2 AND sale_line_id = ?3 \
+           AND prescription_item_id = ?4 AND product_id = ?5 \
+           AND seller_particulars_noted_on_prescription = 1 LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(sale_document_id)
+    .bind(sale_line_id)
+    .bind(prescription_item_id)
+    .bind(product_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(match present {
+        Some(_) => Predicate::Established,
+        None => Predicate::Unresolved {
+            reason: "no_annotation_recorded",
+        },
+    })
+}
+
+/// A confirmed Schedule X supply working entry of one Sale line, as the finalizer needs it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ConfirmedSupplyEntry {
+    pub id: String,
+    pub reference: String,
+    pub prescription_id: String,
+    pub prescription_item_id: String,
+    pub supervising_professional_id: String,
+}
+
+/// Rule 65(21): the working entry whose particulars were written into the bound, serially page
+/// numbered physical register and authenticated by hand.
+///
+/// Both attestations are required, and the table's own CHECK keeps them equal so one cannot be
+/// recorded without the other. What is verified here is the RECORDED ATTESTATION AND ITS LINKAGE —
+/// the same drug, the same lot, the same quantity, the same named registered pharmacist valid on
+/// the day. The physical act itself is outside any database and this does not pretend otherwise.
+///
+/// The three posting bindings are required to be NULL, so an entry already bound to a dispensing or
+/// a bill number is never offered to the finalizer a second time.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_confirmed_supply_entry(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    sale_document_id: &str,
+    sale_line_id: &str,
+    product_id: &str,
+    batch_id: &str,
+    quantity_atoms: i64,
+    business_date: &str,
+) -> Result<(Predicate, Option<ConfirmedSupplyEntry>), sqlx::Error> {
+    let _ = business_date;
+    let entry: Option<ConfirmedSupplyEntry> = sqlx::query_as(
+        "SELECT entry.id,entry.reference,entry.prescription_id,entry.prescription_item_id,\
+         entry.supervising_professional_id \
+         FROM store_schedule_x_register_entries entry \
+         WHERE entry.store_id = ?1 AND entry.sale_document_id = ?2 AND entry.sale_line_id = ?3 \
+           AND entry.entry_kind = 'supply' AND entry.supply_basis = 'prescription' \
+           AND entry.status = 'confirmed' \
+           AND entry.particulars_entered_in_physical_register = 1 \
+           AND entry.physical_entry_authenticated = 1 \
+           AND entry.product_id = ?4 AND entry.batch_id = ?5 AND entry.quantity_atoms = ?6 \
+           AND entry.dispensing_id IS NULL \
+           AND entry.bill_number IS NULL AND entry.bill_date IS NULL \
+         LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(sale_document_id)
+    .bind(sale_line_id)
+    .bind(product_id)
+    .bind(batch_id)
+    .bind(quantity_atoms)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    if let Some(entry) = entry {
+        return Ok((Predicate::Established, Some(entry)));
+    }
+
+    // Nothing usable. Say which of the ordinary situations this is, because each needs a different
+    // next step from a different person.
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM store_schedule_x_register_entries \
+         WHERE store_id = ?1 AND sale_document_id = ?2 AND sale_line_id = ?3 \
+           AND entry_kind = 'supply' AND status IN ('prepared','confirmed','finalized') \
+         ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'prepared' THEN 1 ELSE 2 END LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(sale_document_id)
+    .bind(sale_line_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    Ok((
+        match state.as_deref() {
+            Some("prepared") => Predicate::NotEstablished {
+                reason: "physical_entry_not_confirmed",
+            },
+            // Confirmed, but it did not match this line's drug, lot, quantity or a date-valid
+            // supervising registered pharmacist — or it is already bound.
+            Some("confirmed") => Predicate::NotEstablished {
+                reason: "confirmed_entry_does_not_match_line",
+            },
+            Some("finalized") => Predicate::NotEstablished {
+                reason: "entry_already_finalized",
+            },
+            _ => Predicate::Unresolved {
+                reason: "no_working_entry_prepared",
+            },
+        },
+        None,
+    ))
+}
+
+/// Rule 65(2): the registered pharmacist under whose personal supervision this supply is effected,
+/// as the confirmed working entry names them, still valid on the day.
+///
+/// A predicate of its own, and deliberately not folded into the working-entry predicate above. The
+/// 0028 transition trigger already proves the named professional was an active registered pharmacist
+/// with a registration number, valid on the entry's transaction date, AT THE MOMENT OF CONFIRMATION.
+/// What this answers is whether that is still so when the Sale is posted — a professional can be
+/// archived, or their registration can lapse, between the signature and the till.
+///
+/// Reporting that as "the register entry is missing" would send the operator to rewrite a page of a
+/// bound register that is already correctly written and signed. The paper is not the problem; the
+/// pharmacist's record is.
+pub async fn resolve_entry_supervising_pharmacist(
+    connection: &mut sqlx::SqliteConnection,
+    store_id: &str,
+    sale_document_id: &str,
+    sale_line_id: &str,
+    business_date: &str,
+) -> Result<Predicate, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Named {
+        status: String,
+        capacity: String,
+        registration_number: Option<String>,
+        valid_from: Option<String>,
+        valid_upto: Option<String>,
+        store_id: String,
+    }
+    let named: Option<Named> = sqlx::query_as(
+        "SELECT professional.status,professional.capacity,professional.registration_number,\
+         professional.valid_from,professional.valid_upto,professional.store_id \
+         FROM store_schedule_x_register_entries entry \
+         JOIN store_professionals professional \
+           ON professional.id = entry.supervising_professional_id \
+         WHERE entry.store_id = ?1 AND entry.sale_document_id = ?2 AND entry.sale_line_id = ?3 \
+           AND entry.entry_kind = 'supply' AND entry.status = 'confirmed' \
+         LIMIT 1",
+    )
+    .bind(store_id)
+    .bind(sale_document_id)
+    .bind(sale_line_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    // Nothing to judge until the entry names somebody. The working-entry predicate reports that.
+    let Some(named) = named else {
+        return Ok(Predicate::Unresolved {
+            reason: "no_confirmed_entry",
+        });
+    };
+    if named.store_id != store_id {
+        return Ok(Predicate::NotEstablished {
+            reason: "professional_of_another_store",
+        });
+    }
+    if named.status != "active" {
+        return Ok(Predicate::NotEstablished {
+            reason: "professional_archived",
+        });
+    }
+    // Rule 65(2) names a registered pharmacist. A competent person is not one, whatever they are
+    // called, and the Pharmacy Act registration number is part of being one.
+    if named.capacity != "registered_pharmacist" {
+        return Ok(Predicate::NotEstablished {
+            reason: "not_a_registered_pharmacist",
+        });
+    }
+    if named
+        .registration_number
+        .as_deref()
+        .is_none_or(|number| number.trim().is_empty())
+    {
+        return Ok(Predicate::NotEstablished {
+            reason: "no_registration_number",
+        });
+    }
+    // Valid on the business date AND on the store's actual day, the stricter of the two, exactly as
+    // the Sale path judges its supervising pharmacist. A backdated draft cannot reach past a lapse.
+    let mut days = store_days(&mut *connection).await?;
+    days.push(business_date.to_owned());
+    for day in &days {
+        if named
+            .valid_from
+            .as_deref()
+            .is_some_and(|from| day.as_str() < from)
+        {
+            return Ok(Predicate::NotEstablished {
+                reason: "registration_not_yet_valid",
+            });
+        }
+        if named
+            .valid_upto
+            .as_deref()
+            .is_some_and(|upto| day.as_str() > upto)
+        {
+            return Ok(Predicate::NotEstablished {
+                reason: "registration_lapsed",
+            });
+        }
+    }
+    Ok(Predicate::Established)
 }

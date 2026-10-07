@@ -257,6 +257,8 @@ export const ANSWER_LABELS: Record<RegulatoryAnswer, string> = {
 export const GATE_LABELS: Record<RegulatoryGate, string> = {
   clear: "Sellable",
   prescription_required: "Sellable on a prescription",
+  // Phase 1M-D3-C2 — Schedule X is sellable by retail, and only with the whole rule 65 record.
+  schedule_x_required: "Sellable on a prescription, with the Schedule X record",
   unresolved: "Classification unresolved",
   workflow_unavailable: "Regulated sale — workflow not yet available"
 };

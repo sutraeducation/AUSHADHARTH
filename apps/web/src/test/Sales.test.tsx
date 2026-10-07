@@ -142,6 +142,7 @@ function failure(code: string, status: number, extra: Record<string, unknown> = 
 }
 
 type Options = {
+  preflight?: unknown;
   role?: UserRole;
   documents?: SaleDetail[];
   writeError?: { code: string; status: number; extra?: Record<string, unknown> };
@@ -154,7 +155,7 @@ type Options = {
   /** The quote's flag for a registered customer's mixed taxable/untaxed bill. */
   mixedSupply?: boolean;
   /** Phase 1M-A: what the Drugs Rules gate reports for every line. */
-  regulatoryGate?: "clear" | "prescription_required" | "unresolved" | "workflow_unavailable";
+  regulatoryGate?: "clear" | "prescription_required" | "schedule_x_required" | "unresolved" | "workflow_unavailable";
   /** Phase 1M-B: what the quote says of a linked prescription item, when a line has one. */
   prescriptionIssue?: LinePrescriptionSummary["issue"];
   remainingAtoms?: number;
@@ -232,7 +233,10 @@ function saleService(options: Options = {}) {
 
   // Phase 1M-B, judged the way the Store Service judges it: a Schedule H line needs a linked item,
   // and the supply needs a registered pharmacist and the endorsement confirmation.
-  const prescriptionRequired = options.regulatoryGate === "prescription_required";
+  // Phase 1M-D3-C2 — rule 65(2) supervision is required of a Schedule X supply exactly as it is of a
+  // Schedule H one, so the double must say so too or it drifts from the service.
+  const prescriptionRequired = options.regulatoryGate === "prescription_required"
+    || options.regulatoryGate === "schedule_x_required";
   const prescriptionFor = (each: SaleLine): LinePrescriptionSummary => {
     const linked = each.prescriptionItemId !== null;
     return {
@@ -286,6 +290,15 @@ function saleService(options: Options = {}) {
     if (url.pathname.endsWith("/auth/status")) return response({ setupRequired: false, authenticated: true, user, storeDisplayName: "Care Pharmacy" });
     if (url.pathname.endsWith("/auth/logout")) return response(null, 204);
     if (url.pathname === "/api/v1/store/tax-identity") return response({ storeId: IDs.store, displayName: "Care Pharmacy", revision: 1, gstRegistrationStatus: "registered", gstin: "27AAACX0000A1Z9", normalizedGstin: "27AAACX0000A1Z9", placeOfSupplyStateId: null, complete: true });
+    if (url.pathname.endsWith("/schedule-x-preflight")) {
+      return response(options.preflight ?? {
+        saleDocumentId: IDs.sale,
+        status: "draft",
+        businessDate: "2026-09-12",
+        lines: [],
+        canAttemptPosting: false
+      });
+    }
     if (url.pathname === "/api/v1/reference/units") return response(UNITS);
     if (url.pathname === "/api/v1/reference/state-codes") return response(STATES);
     if (url.pathname === "/api/v1/parties") return response(CUSTOMERS);
@@ -979,7 +992,7 @@ describe("Point of sale", () => {
       regulatoryGate: "workflow_unavailable",
       regulatoryGateScheme: "schedule_x"
     }));
-    expect(await screen.findAllByText("Schedule X dispensing requires the Schedule X workflow, which is not yet available.")).not.toHaveLength(0);
+    expect(await screen.findAllByText("This Schedule X line is outside the supported retail path.")).not.toHaveLength(0);
     expect(screen.getByTestId("regulatory-blocked")).toHaveTextContent("Line 1 cannot be sold yet");
     expect(screen.getByRole("button", { name: "Take 179.20 and post" })).toBeDisabled();
     expect(screen.queryByTestId("prescription-panel")).not.toBeInTheDocument();
@@ -1545,5 +1558,138 @@ describe("Posted invoice", () => {
     }));
     await screen.findByRole("heading", { name: "INV/2627/000001", level: 1 });
     expect(screen.getByText(/notified ceiling in force on the sale date was checked/)).toBeInTheDocument();
+  });
+
+  // Phase 1M-D3-C2 — the Schedule X preflight panel.
+  const preflightLine = (
+    overrides: Array<{ predicate: string; code: string; verdict: Record<string, unknown> }>
+  ) => ({
+    saleDocumentId: IDs.sale,
+    status: "draft",
+    businessDate: "2026-09-12",
+    canAttemptPosting: overrides.every((entry) => entry.verdict.state === "established"),
+    lines: [{
+      saleLineId: IDs.line,
+      lineNumber: 1,
+      productId: IDs.product,
+      productDisplayName: "Alprazolam 0.5 mg Tablet",
+      batchId: IDs.batch,
+      batchNumber: "BX-QUALIFIED",
+      quantityAtoms: 10,
+      prescriptionItemId: IDs.line,
+      prescriptionReference: "RX-000001",
+      predicates: overrides,
+      canAttemptPosting: overrides.every((entry) => entry.verdict.state === "established")
+    }]
+  });
+
+  it("groups every Schedule X requirement and says which action is needed", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({ lines: [line()] })],
+      regulatoryGate: "schedule_x_required",
+      regulatoryGateScheme: "schedule_x",
+      preflight: preflightLine([
+        { predicate: "storeAuthority", code: "schedule_x_store_authority_missing", verdict: { state: "unresolved", reason: "no_authority_recorded" } },
+        { predicate: "lotProvenance", code: "schedule_x_lot_provenance_incomplete", verdict: { state: "established" } },
+        { predicate: "physicalRegisterEntry", code: "schedule_x_register_confirmation_missing", verdict: { state: "not_established", reason: "physical_entry_not_confirmed" } },
+        { predicate: "ndpsOverlay", code: "schedule_x_ndps_purview_unresolved", verdict: { state: "overlay_blocked", axis: "ndps_purview", reason: "ndps_purview_unresolved" } }
+      ])
+    }));
+
+    // The line is not shown as clear, and it is not shown as a dead end either.
+    expect(await screen.findByTestId("schedule-x-preflight")).toBeInTheDocument();
+    // An independent rule outranks the ordinary "action required" headline.
+    expect(screen.getByTestId("schedule-x-line-1-state")).toHaveTextContent("Blocked by another rule");
+
+    // Each requirement is named in the operator's words, grouped, with its own state.
+    expect(screen.getByTestId("predicate-storeAuthority")).toHaveTextContent("Pharmacy's Form 20-F Schedule X retail authority");
+    expect(screen.getByTestId("predicate-storeAuthority")).toHaveTextContent("Not recorded yet");
+    expect(screen.getByTestId("predicate-storeAuthority")).toHaveTextContent("no Form 20-F Schedule X retail authority is recorded for this pharmacy");
+    expect(screen.getByTestId("predicate-lotProvenance")).toHaveTextContent("Done");
+    expect(screen.getByTestId("predicate-physicalRegisterEntry")).toHaveTextContent("Action required");
+    expect(screen.getByTestId("predicate-physicalRegisterEntry")).toHaveTextContent("write the particulars in the bound register, have the registered pharmacist sign it, then confirm");
+    expect(screen.getByTestId("predicate-ndpsOverlay")).toHaveTextContent("Blocked by another rule");
+    expect(screen.getByText("Authority")).toBeInTheDocument();
+    expect(screen.getByText("Stock source")).toBeInTheDocument();
+    expect(screen.getByText("Independent rules")).toBeInTheDocument();
+
+    // Nothing claims verification, legality or a signature by software, and there is no override.
+    const text = document.body.textContent ?? "";
+    for (const forbidden of ["illegal", "banned", "prohibited by law", "government verified", "verified by", "override"]) {
+      expect(text.toLowerCase()).not.toContain(forbidden);
+    }
+    expect(screen.queryByRole("checkbox", { checked: true })).not.toBeInTheDocument();
+  });
+
+  it("shows a Schedule X line as ready only when every requirement is established", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({ lines: [line()] })],
+      regulatoryGate: "schedule_x_required",
+      regulatoryGateScheme: "schedule_x",
+      preflight: preflightLine([
+        { predicate: "storeAuthority", code: "schedule_x_store_authority_missing", verdict: { state: "established" } },
+        { predicate: "productCoverage", code: "schedule_x_store_authority_product_not_covered", verdict: { state: "established" } },
+        { predicate: "lotProvenance", code: "schedule_x_lot_provenance_incomplete", verdict: { state: "established" } },
+        { predicate: "physicalRegisterEntry", code: "schedule_x_register_confirmation_missing", verdict: { state: "established" } },
+        { predicate: "ndpsOverlay", code: "schedule_x_ndps_purview_unresolved", verdict: { state: "established" } }
+      ])
+    }));
+    expect(await screen.findByTestId("schedule-x-line-1-state")).toHaveTextContent("Ready to post");
+    // "Ready" is about the requirements, and the panel says plainly that posting checks them again.
+    expect(screen.getByTestId("schedule-x-preflight")).toHaveTextContent("Posting checks them all again");
+  });
+
+  it("names an unsupported Schedule X combination without claiming anything about the law", async () => {
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({ lines: [line()] })],
+      regulatoryGate: "schedule_x_required",
+      regulatoryGateScheme: "schedule_x",
+      preflight: preflightLine([
+        { predicate: "h1Intersection", code: "schedule_h1_register_not_confirmed", verdict: { state: "unsupported", reason: "schedule_x_h1_intersection" } }
+      ])
+    }));
+    expect(await screen.findByTestId("schedule-x-line-1-state")).toHaveTextContent("Not supported");
+    expect(screen.getByTestId("predicate-h1Intersection")).toHaveTextContent("this regulatory combination is not supported by the current Schedule X workflow");
+    const text = (document.body.textContent ?? "").toLowerCase();
+    for (const forbidden of ["illegal", "banned", "prohibited"]) {
+      expect(text).not.toContain(forbidden);
+    }
+    // And it does not take a position on whether an H1 register is required.
+    expect(text).not.toContain("h1 register is required");
+    expect(text).not.toContain("h1 register is not required");
+  });
+
+  it("never shows a ready Schedule X line beside a contradictory supervision message", async () => {
+    // The owner review caught a screenshot showing "No registered pharmacist is recorded" in the
+    // Prescription Supply panel while the Schedule X panel said supervision was Done. That state
+    // cannot arise in production — the service refuses a supervising professional who is not on the
+    // pharmacy's roster — but nothing stopped the SCREEN rendering it, so this pins the coherence
+    // down in the operator-visible labels rather than in the preflight JSON.
+    renderApp(`/app/sales/${IDs.sale}`, saleService({
+      documents: [sale({
+        lines: [line()],
+        supply: {
+          supervisingProfessionalId: PROFESSIONALS[0].id,
+          prescriptionEndorsementConfirmed: true,
+          prescriptionOriginalContainerConfirmed: false
+        }
+      })],
+      regulatoryGate: "schedule_x_required",
+      regulatoryGateScheme: "schedule_x",
+      preflight: preflightLine([
+        { predicate: "supplySupervision", code: "supervising_pharmacist_required", verdict: { state: "established" } },
+        { predicate: "supervisingPharmacist", code: "schedule_x_supervising_pharmacist_invalid", verdict: { state: "established" } },
+        { predicate: "physicalRegisterEntry", code: "schedule_x_register_confirmation_missing", verdict: { state: "established" } }
+      ])
+    }));
+
+    expect(await screen.findByTestId("schedule-x-line-1-state")).toHaveTextContent("Ready to post");
+    // The two surfaces must agree, in the words an operator actually reads.
+    expect(screen.getByTestId("predicate-supplySupervision")).toHaveTextContent("Done");
+    const visible = document.body.textContent ?? "";
+    expect(visible).not.toContain("No registered pharmacist is recorded");
+    expect(visible).not.toContain("No supervising pharmacist recorded");
+    // And the pharmacist the Store Service accepted is the one named on screen.
+    expect(visible).toContain("Meera Iyer");
   });
 });

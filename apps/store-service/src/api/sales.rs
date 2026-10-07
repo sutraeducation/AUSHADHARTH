@@ -39,6 +39,7 @@ use crate::domain::{
     },
     regulatory,
     sales::{self, QuantityBasis, SaleMoneyError, SaleQuantity},
+    schedule_x,
     store_profile::{self, MissingSellerFact},
     taxation,
 };
@@ -114,8 +115,30 @@ pub(crate) enum SaleError {
         line_number: i64,
     },
     /// Phase 1M-B: Schedule X needs the duplicate prescription and the rule 65(21) register.
+    ///
+    /// Phase 1M-D3-C2 narrowed this: the supported prescription-based retail path now posts, so this
+    /// is raised only for a Schedule X line that is outside that path for a reason the more specific
+    /// errors below do not cover.
     ScheduleXWorkflowNotAvailable {
         line_number: i64,
+    },
+    /// Phase 1M-D3-C2: this Schedule X drug's NDPS purview is recorded as applying. AUSHADHARTH does
+    /// not implement the narcotic/psychotropic regime, so the combined workflow is unsupported.
+    /// Not a statement that the sale is prohibited.
+    ScheduleXNdpsPurviewApplies {
+        line_number: i64,
+    },
+    /// Phase 1M-D3-C2: nobody has recorded whether this Schedule X drug falls within the NDPS Act.
+    /// An unrecorded axis is not a cleared one, so the supply is refused until the finding is made.
+    ScheduleXNdpsPurviewUnresolved {
+        line_number: i64,
+    },
+    /// Phase 1M-D3-C2: a drug in Schedule X AND another regime whose own register this software
+    /// cannot write for a Schedule X supply. Each is supported alone; together they are not. Not a
+    /// statement that the sale is prohibited.
+    ScheduleXUnsupportedIntersectingRegime {
+        line_number: i64,
+        regime: &'static str,
     },
     /// Phase 1M-B: a Schedule H supply whose prescription, supervision or endorsement is not
     /// complete. Carries every unmet requirement.
@@ -339,6 +362,48 @@ impl IntoResponse for SaleError {
                         message: format!(
                             "This line is classified within {scheme}, whose prescription or register requirements are not implemented yet."
                         ),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::ScheduleXNdpsPurviewApplies { line_number } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "schedule_x_ndps_purview_applies",
+                    message: "This Schedule X drug is recorded as falling within the NDPS Act, and AUSHADHARTH does not support that combined workflow.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message: "Unsupported NDPS-intersection workflow: AUSHADHARTH does not implement the narcotic and psychotropic requirements. Remove this line to post the rest.".to_owned(),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::ScheduleXNdpsPurviewUnresolved { line_number } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "schedule_x_ndps_purview_unresolved",
+                    message: "Nobody has recorded whether this Schedule X drug falls within the NDPS Act.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}"),
+                        message: "Record the product's NDPS position before supplying it. An unrecorded position is not a cleared one.".to_owned(),
+                    }],
+                    expected_revision: None,
+                    current_revision: None,
+                    available_atoms: None,
+                },
+            ),
+            Self::ScheduleXUnsupportedIntersectingRegime { line_number, regime } => (
+                StatusCode::CONFLICT,
+                ErrorBody {
+                    code: "schedule_x_unsupported_intersecting_regime",
+                    message: "This drug falls under Schedule X and another schedule together, and AUSHADHARTH does not support that combination.",
+                    issues: vec![ErrorIssue {
+                        field: format!("lines.{line_number}.{regime}"),
+                        message: "Schedule X is supported on its own and so is this other schedule, but not together: the separate register this supply would also need cannot be written for a Schedule X drug. Remove this line to post the rest.".to_owned(),
                     }],
                     expected_revision: None,
                     current_revision: None,
@@ -972,6 +1037,10 @@ pub fn routes() -> Router<ReferenceState> {
         .route("/api/v1/sales/{id}", get(get_sale).put(update_draft))
         .route("/api/v1/sales/{id}/lines", post(add_line))
         .route("/api/v1/sales/{id}/quote", get(quote_sale))
+        .route(
+            "/api/v1/sales/{id}/schedule-x-preflight",
+            get(schedule_x_preflight),
+        )
         .route("/api/v1/sales/{id}/post", post(post_sale))
         .route("/api/v1/sales/{id}/supply", put(put_supply))
         .route(
@@ -2097,6 +2166,7 @@ async fn quote_sale(
             regulatory_gate: match regulatory[index].gate {
                 regulatory::SaleGate::Clear => "clear",
                 regulatory::SaleGate::PrescriptionRequired => "prescription_required",
+                regulatory::SaleGate::ScheduleXRequired => "schedule_x_required",
                 regulatory::SaleGate::Unresolved | regulatory::SaleGate::StateUnresolved { .. } => {
                     "unresolved"
                 }
@@ -2109,6 +2179,7 @@ async fn quote_sale(
                 | regulatory::SaleGate::StateWorkflowUnavailable { scheme }
                 | regulatory::SaleGate::StateUnresolved { scheme } => Some(scheme),
                 regulatory::SaleGate::UnsupportedIntersection { .. } => Some("ndps_purview"),
+                regulatory::SaleGate::ScheduleXRequired => Some("schedule_x"),
                 regulatory::SaleGate::PrescriptionRequired if regulatory[index].h1_any_day => {
                     Some("schedule_h1")
                 }
@@ -2795,6 +2866,33 @@ async fn post_within_transaction(
     // linked to its dispensing and finalized with the Sale, or none of them is.
     if !dispensing.live_h1.is_empty() {
         finalize_h1_entries(connection, id, &dispensing, &dispensing_ids, actor_id, &now).await?;
+    }
+    // Phase 1M-D3-C2 — each Schedule X working entry, written into the bound physical register and
+    // signed by hand before this posting began, is bound to its dispensing and to the bill
+    // particulars rule 65(21)(b)(ix) asks for, and finalized with the Sale, or none of them is.
+    //
+    // The bill number is the number `allocate_document_number` issued a few steps above, in this
+    // same transaction, and the bill date is the Sale's own business date: the document this supply
+    // was billed on. No placeholder, no draft number, and nothing read back from a master later.
+    if dispensing.x_required {
+        // A Schedule X line that reached this point without a plan entry would mean an unmet
+        // predicate had been passed over. `plan_dispensings` refuses before here in that case, so
+        // this is a contradiction rather than a refusal.
+        if dispensing.x_plans.is_empty() {
+            return Err(SaleError::Internal);
+        }
+        finalize_schedule_x_entries(
+            connection,
+            id,
+            &store_id,
+            &dispensing.x_plans,
+            &dispensing_ids,
+            &number.document_number,
+            &business_date,
+            actor_id,
+            &now,
+        )
+        .await?;
     }
 
     for tender in tenders {
@@ -3714,10 +3812,13 @@ fn stricter(first: regulatory::SaleGate, second: regulatory::SaleGate) -> regula
         match gate {
             regulatory::SaleGate::Clear => 0,
             regulatory::SaleGate::PrescriptionRequired => 1,
-            regulatory::SaleGate::Unresolved | regulatory::SaleGate::StateUnresolved { .. } => 2,
+            // Phase 1M-D3-C2: Schedule X outranks the plain prescription requirement, so a drug
+            // scheduled into X between the business date and the posting day is held to X.
+            regulatory::SaleGate::ScheduleXRequired => 2,
+            regulatory::SaleGate::Unresolved | regulatory::SaleGate::StateUnresolved { .. } => 3,
             regulatory::SaleGate::WorkflowUnavailable { .. }
             | regulatory::SaleGate::UnsupportedIntersection { .. }
-            | regulatory::SaleGate::StateWorkflowUnavailable { .. } => 3,
+            | regulatory::SaleGate::StateWorkflowUnavailable { .. } => 4,
         }
     }
     if rank(&second) > rank(&first) {
@@ -3866,6 +3967,33 @@ fn prescription_issue_message(code: &str) -> &'static str {
         "schedule_h1_register_stale" => {
             "The Schedule H1 working entry no longer matches this sale. Void the prescription-supply entry and prepare both again."
         }
+        // Phase 1M-D3-C2 — the Schedule X predicates. Each says what is missing and who can supply
+        // it. None of them calls the drug illegal, banned or prohibited: every one of these is a
+        // record this pharmacy has not made yet.
+        "schedule_x_store_authority_missing" => {
+            "No Form 20-F Schedule X retail authority is recorded for this store on the sale's date. The owner records it from the licence."
+        }
+        "schedule_x_store_authority_product_not_covered" => {
+            "This drug is not named in the store's recorded Form 20-F drug coverage for the sale's date. Form 20-F lists the drugs it covers, so it is not blanket authority."
+        }
+        "schedule_x_lot_provenance_incomplete" => {
+            "This lot's Schedule X stock is not fully accounted for: every sellable unit must have arrived on a posted purchase whose Schedule X receipt entry was written into the physical register and authenticated."
+        }
+        "schedule_x_source_authority_missing" => {
+            "A purchase that brought this lot in has no recorded Schedule X authority evidence for its supplier on its own invoice date. Record it from the supplier's licence, for every contributing purchase."
+        }
+        "schedule_x_duplicate_copy_evidence_missing" => {
+            "Rule 65(9)(a) wants the prescription in duplicate with one copy retained. Record that the retained copy is held."
+        }
+        "schedule_x_prescription_annotation_missing" => {
+            "Rule 65(11)(c) wants the seller's name and address and the date of dispensing noted on the prescription. Record that it has been done."
+        }
+        "schedule_x_register_confirmation_missing" => {
+            "The Schedule X working entry is not confirmed for exactly this drug, lot and quantity: enter the particulars in the bound, serially page numbered Schedule X register, have the registered pharmacist sign that entry by hand, then confirm both."
+        }
+        "schedule_x_supervising_pharmacist_invalid" => {
+            "The registered pharmacist named on the Schedule X working entry is no longer a valid supervising pharmacist on this date. The physical entry is unaffected; the pharmacist's record needs attention, or void the entry and prepare it again under a current registered pharmacist."
+        }
         "schedule_h1_veterinary_workflow_unresolved" => {
             "A Schedule H1 supply for an animal is not supported: rule 65(3)(1)(h) records the name of the patient, and how it applies to veterinary supply is unresolved."
         }
@@ -3933,6 +4061,12 @@ struct DispensingPlan {
     h1_expected: Vec<H1LineFacts>,
     /// Phase 1M-C: this Sale's prepared or confirmed Schedule H1 working entries.
     live_h1: Vec<LiveH1Entry>,
+    /// Phase 1M-D3-C2: a rule 65(21) Schedule X supply is owed by at least one line.
+    x_required: bool,
+    /// Phase 1M-D3-C2: every Schedule X line whose whole chain is established, ready to finalize.
+    /// Empty when any Schedule X line has an unmet predicate, because that line raised an issue
+    /// instead and the posting is already refused.
+    x_plans: Vec<ScheduleXLinePlan>,
 }
 
 /// Which rule 65(3)(1) book, from which election.
@@ -3998,10 +4132,26 @@ async fn plan_dispensings(
     // the same remaining quantity.
     let mut claimed: Vec<(String, i64)> = Vec::new();
     let mut supervision_required = false;
+    // Phase 1M-D3-C2 — three questions, not one.
+    //
+    // `supervision_required` is rule 65(2): a supply on a prescription is effected only under a
+    // registered pharmacist's personal supervision. That covers Schedule H, H1 and X alike.
+    //
+    // `record_required` is rule 65(3)(1), whose own opening words exclude "those specified in
+    // Schedule X". A Sale of nothing but Schedule X needs no entry in the generic prescription
+    // register and must not be held for a rule 65(3)(2) election it does not need — which is
+    // exactly what would happen if this were read off `supervision_required`.
+    //
+    // `x_required` is the rule 65(21) Schedule X register and the rest of the Schedule X chain.
+    let mut record_required = false;
+    let mut x_required = false;
 
     for (line, drugs) in lines.iter().zip(regulatory.iter()) {
-        let required = drugs.gate == regulatory::SaleGate::PrescriptionRequired;
+        let schedule_x = drugs.gate == regulatory::SaleGate::ScheduleXRequired;
+        let required = drugs.gate == regulatory::SaleGate::PrescriptionRequired || schedule_x;
         supervision_required |= required;
+        record_required |= drugs.gate == regulatory::SaleGate::PrescriptionRequired;
+        x_required |= schedule_x;
         let link: Option<String> =
             sqlx::query_scalar("SELECT prescription_item_id FROM sale_lines WHERE id=?")
                 .bind(&line.id)
@@ -4263,6 +4413,7 @@ async fn plan_dispensings(
     let mut live_records = Vec::new();
     let mut h1_expected = Vec::new();
     let mut live_h1 = Vec::new();
+    let mut x_plans = Vec::new();
     if supervision_required {
         original_container_confirmed = sqlx::query_scalar::<_, i64>(
             "SELECT prescription_original_container_confirmed FROM sale_documents WHERE id=?",
@@ -4272,26 +4423,32 @@ async fn plan_dispensings(
         .await
         .map_err(map_database_error)?
             == 1;
-        let mut record_days: Vec<&str> = days.iter().map(String::as_str).collect();
-        record_days.push(business_date);
-        record = resolve_record_election(connection, store_id, &record_days).await?;
-        match &record {
-            None => issues.push(PrescriptionIssue {
-                line_number: None,
-                code: "prescription_record_election_unresolved",
-            }),
-            // First proviso: the memo book is available only for a drug not compounded here and
-            // supplied from or in its original container. Unattested, it is not available — and
-            // the supply is refused rather than entered in a book the Store did not elect.
-            Some(plan)
-                if plan.method == "cash_or_credit_memo_book" && !original_container_confirmed =>
-            {
-                issues.push(PrescriptionIssue {
+        // Phase 1M-D3-C2 — the rule 65(3)(2) election is asked for only when a rule 65(3)(1) entry
+        // is actually owed. A Sale of nothing but Schedule X is excluded from that register by the
+        // sub-rule's own opening words, so it is not held waiting for a book it will never write in.
+        if record_required {
+            let mut record_days: Vec<&str> = days.iter().map(String::as_str).collect();
+            record_days.push(business_date);
+            record = resolve_record_election(connection, store_id, &record_days).await?;
+            match &record {
+                None => issues.push(PrescriptionIssue {
                     line_number: None,
-                    code: "prescription_memo_path_ineligible",
-                })
+                    code: "prescription_record_election_unresolved",
+                }),
+                // First proviso: the memo book is available only for a drug not compounded here and
+                // supplied from or in its original container. Unattested, it is not available — and
+                // the supply is refused rather than entered in a book the Store did not elect.
+                Some(plan)
+                    if plan.method == "cash_or_credit_memo_book"
+                        && !original_container_confirmed =>
+                {
+                    issues.push(PrescriptionIssue {
+                        line_number: None,
+                        code: "prescription_memo_path_ineligible",
+                    })
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
         }
         // Signature before supply. Once every other requirement is met, the last one is the entry
         // itself: prepared, signed by the registered pharmacist's own hand, its serial written on the
@@ -4312,14 +4469,38 @@ async fn plan_dispensings(
                     &mut issues,
                 )
                 .await?;
-                // Phase 1M-C — the second, separate layer: the Schedule H1 working entry of every
-                // H1 line, confirmed (hard copy placed and authenticated) and still exact.
+            }
+            // Phase 1M-C — the second, separate layer: the Schedule H1 working entry of every H1
+            // line, confirmed (hard copy placed and authenticated) and still exact.
+            //
+            // Phase 1M-D3-C2 lifted this out of the rule 65(3) block above. An X ∩ H1 line is held
+            // to Schedule X by the gate, so no rule 65(3) record is owed and `record` is None — but
+            // the H1 working entry is owed all the same, and nesting this inside that block would
+            // have silently excused it.
+            if let Some(snapshot) = supervision.as_ref() {
                 live_h1 = evaluate_h1_entries(
                     connection,
                     sale_id,
                     business_date,
                     snapshot,
                     &h1_expected,
+                    &mut issues,
+                )
+                .await?;
+            }
+            // Phase 1M-D3-C2 — the Schedule X layer: the store's own Form 20-F authority and this
+            // drug's coverage, the exact lot's provenance, every contributing source's authority,
+            // the retained duplicate prescription copy, the rule 65(11)(c) annotation, and the
+            // confirmed rule 65(21) working entry. Each reported on its own.
+            if x_required {
+                x_plans = evaluate_schedule_x_lines(
+                    connection,
+                    store_id,
+                    sale_id,
+                    business_date,
+                    lines,
+                    regulatory,
+                    &planned,
                     &mut issues,
                 )
                 .await?;
@@ -4339,6 +4520,8 @@ async fn plan_dispensings(
         live_records,
         h1_expected,
         live_h1,
+        x_required,
+        x_plans,
     })
 }
 
@@ -4520,6 +4703,13 @@ async fn expected_record_lines(
         else {
             return Err(SaleError::Internal);
         };
+        // Phase 1M-D3-C2 — rule 65(3)(1) governs the supply of a drug "other than those specified
+        // in Schedule X", so a Schedule X line contributes no line to this register. Its supply is
+        // recorded in the rule 65(21) Schedule X register instead, which is a different book with
+        // different particulars.
+        if regulatory[index].gate == regulatory::SaleGate::ScheduleXRequired {
+            continue;
+        }
         let line = &lines[index];
         let manufacturer = regulatory[index]
             .manufacturer
@@ -4721,10 +4911,40 @@ fn refuse_unsupported_schemes(
 ) -> Result<(), SaleError> {
     for (line, resolved) in lines.iter().zip(regulatory.iter()) {
         match resolved.gate {
-            regulatory::SaleGate::Clear | regulatory::SaleGate::PrescriptionRequired => {}
+            // Phase 1M-D3-C2 — a Schedule X line is no longer refused here. Its own requirements
+            // are judged by the prescription planner and the Schedule X recheck below, each of
+            // which names the predicate that is unmet rather than refusing the whole scheme.
+            regulatory::SaleGate::Clear
+            | regulatory::SaleGate::PrescriptionRequired
+            | regulatory::SaleGate::ScheduleXRequired => {}
             regulatory::SaleGate::Unresolved => {
                 return Err(SaleError::RegulatoryClassificationUnresolved {
                     line_number: line.line_number,
+                });
+            }
+            // Phase 1M-D3-C2 — each unsupported intersection is named by its own reason. Reporting a
+            // Schedule X NDPS boundary under the Schedule H1 code would send the counter looking at
+            // the wrong drug and the wrong axis.
+            regulatory::SaleGate::UnsupportedIntersection {
+                reason: "schedule_x_ndps_applies",
+            } => {
+                return Err(SaleError::ScheduleXNdpsPurviewApplies {
+                    line_number: line.line_number,
+                });
+            }
+            regulatory::SaleGate::UnsupportedIntersection {
+                reason: "schedule_x_ndps_unresolved",
+            } => {
+                return Err(SaleError::ScheduleXNdpsPurviewUnresolved {
+                    line_number: line.line_number,
+                });
+            }
+            regulatory::SaleGate::UnsupportedIntersection {
+                reason: "schedule_x_h1",
+            } => {
+                return Err(SaleError::ScheduleXUnsupportedIntersectingRegime {
+                    line_number: line.line_number,
+                    regime: "schedule_h1",
                 });
             }
             regulatory::SaleGate::UnsupportedIntersection { .. } => {
@@ -4786,7 +5006,25 @@ async fn ensure_no_live_record(
     .fetch_optional(&mut *connection)
     .await
     .map_err(map_database_error)?;
-    match live_h1 {
+    if let Some(serial) = live_h1 {
+        return Err(SaleError::PrescriptionRecordPrepared { serial });
+    }
+    // Phase 1M-D3-C2 — a Schedule X working entry pins the draft for the same reason the other two
+    // do, and more strongly. Its particulars name one drug, one lot, one quantity, one prescription
+    // and one patient, and the registered pharmacist has signed a page of a bound register saying
+    // so. Changing the Sale after that would leave the paper describing a supply the software no
+    // longer represents, and the paper cannot be edited. To change the Sale, void the entry first;
+    // its reference is kept and never reused.
+    let live_x: Option<String> = sqlx::query_scalar(
+        "SELECT reference FROM store_schedule_x_register_entries \
+         WHERE sale_document_id=? AND entry_kind='supply' \
+           AND status IN ('prepared','confirmed') LIMIT 1",
+    )
+    .bind(sale_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_database_error)?;
+    match live_x {
         Some(serial) => Err(SaleError::PrescriptionRecordPrepared { serial }),
         None => Ok(()),
     }
@@ -4911,23 +5149,26 @@ async fn prepare_within_transaction(
             ]));
         }
     }
-    let record = plan.record.as_ref().ok_or(SaleError::Internal)?;
     let supervision = plan.supervision.as_ref().ok_or(SaleError::Internal)?;
     let now = sqlx::query_scalar::<_, String>("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')")
         .fetch_one(&mut **connection)
         .await
         .map_err(map_database_error)?;
-    let prefix = if record.method == "prescription_register" {
-        "PR"
-    } else {
-        "PM"
-    };
+    // Phase 1M-D3-C2 — which prescriptions owe a rule 65(3)(1) entry, taken from the expected line
+    // particulars rather than from every planned dispensing. `expected_record_lines` leaves Schedule
+    // X lines out, because rule 65(3)(1) governs the supply of a drug "other than those specified in
+    // Schedule X", so a Sale of nothing but Schedule X owes no entry here and has no rule 65(3)(2)
+    // election to read. Its Schedule H1 layer below is owed exactly the same either way.
     let mut needed: Vec<&str> = Vec::new();
-    for planned in &plan.planned {
-        if !needed.contains(&planned.prescription_id.as_str()) {
-            needed.push(&planned.prescription_id);
+    for (prescription_id, _) in &plan.expected_lines {
+        if !needed.contains(&prescription_id.as_str()) {
+            needed.push(prescription_id);
         }
     }
+    let prefix = match plan.record.as_ref() {
+        Some(record) if record.method == "prescription_register" => "PR",
+        _ => "PM",
+    };
     let mut prepared_any = false;
     // Which rule 65(3)(1) entry records each prescription: the live one, or the one written now.
     let mut record_for: Vec<(String, String)> = plan
@@ -4943,6 +5184,9 @@ async fn prepare_within_transaction(
         {
             continue;
         }
+        // A prescription reached this list only because a non-Schedule-X line is dispensed against
+        // it, which means the rule 65(3)(2) election was required and resolved above.
+        let record = plan.record.as_ref().ok_or(SaleError::Internal)?;
         // The next serial of this book, void entries included, so no serial is ever issued twice.
         let serial_value: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(serial_value),0)+1 FROM prescription_supply_records \
@@ -5145,6 +5389,16 @@ async fn finalize_supply_records(
     now: &str,
 ) -> Result<(), SaleError> {
     for planned in &plan.planned {
+        // Phase 1M-D3-C2 — rule 65(3)(1) excludes "those specified in Schedule X", so a Schedule X
+        // line has no line in this register to link. Its supply is finalized in the rule 65(21)
+        // Schedule X register by `finalize_schedule_x_entries` instead.
+        if plan
+            .x_plans
+            .iter()
+            .any(|x| x.sale_line_id == planned.sale_line_id)
+        {
+            continue;
+        }
         let entry = plan
             .live_records
             .iter()
@@ -5233,6 +5487,335 @@ async fn finalize_h1_entries(
             &entry.id,
             "posted",
             &json!({ "saleDocumentId": sale_id, "dispensingId": dispensing_id, "status": "finalized" }),
+            actor_id,
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Phase 1M-D3-C2 — one Schedule X line that has satisfied every predicate, ready to finalize.
+///
+/// Built only from an evaluation in which nothing was outstanding. A line with any unmet predicate
+/// contributes an issue instead, so this list and the refusal list can never both describe the same
+/// line.
+#[derive(Debug, Clone)]
+struct ScheduleXLinePlan {
+    sale_line_id: String,
+    entry_id: String,
+    entry_reference: String,
+    product_id: String,
+    batch_id: String,
+    quantity_atoms: i64,
+    prescription_id: String,
+    prescription_item_id: String,
+}
+
+/// Every Schedule X predicate this layer owns, for one line, in evaluation order.
+///
+/// The order is the order the counter should work through them: what the store is allowed to sell,
+/// then where the stock came from, then the paperwork of this particular supply. The first unmet
+/// predicate is therefore the most useful thing to report, and `issues` receives all of them so a
+/// counter can clear several at once rather than discovering them one posting at a time.
+async fn schedule_x_line_predicates(
+    connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
+    sale_id: &str,
+    business_date: &str,
+    line: &DraftLine,
+    planned: &PlannedDispensing,
+) -> Result<Vec<schedule_x::NamedPredicate>, SaleError> {
+    let (authority, coverage) = schedule_x::resolve_store_retail_authority(
+        connection,
+        store_id,
+        &line.product_id,
+        business_date,
+    )
+    .await
+    .map_err(map_database_error)?;
+
+    // Phase 1M-D3-B — the exact lot. Reported as its own predicate because "this stock is not
+    // accounted for" is a different problem from "its supplier's authority is not recorded".
+    let provenance = schedule_x::resolve_lot_provenance(connection, store_id, &line.batch_id)
+        .await
+        .map_err(map_database_error)?;
+    let provenance_verdict = match provenance {
+        schedule_x::LotProvenance::Qualified => schedule_x::Predicate::Established,
+        schedule_x::LotProvenance::NoQualifyingReceipt => schedule_x::Predicate::Unresolved {
+            reason: "no_qualifying_receipt",
+        },
+        schedule_x::LotProvenance::UnresolvedInwardMovement => {
+            schedule_x::Predicate::NotEstablished {
+                reason: "unresolved_inward_movement",
+            }
+        }
+    };
+
+    // Phase 1M-D3-C1 — every contributing source, each on its own invoice date. One authorised
+    // supplier never legalises another.
+    let sources = schedule_x::resolve_lot_source_authorities(
+        connection,
+        store_id,
+        &line.batch_id,
+        &line.product_id,
+    )
+    .await
+    .map_err(map_database_error)?;
+    let sources_verdict = if schedule_x::every_source_authorised(&sources) {
+        schedule_x::Predicate::Established
+    } else if sources.is_empty() {
+        schedule_x::Predicate::Unresolved {
+            reason: "no_contributing_source",
+        }
+    } else {
+        // Name the first source that failed, so the operator knows which purchase to look at.
+        let reason = sources
+            .iter()
+            .find(|source| !source.authority.is_established())
+            .and_then(|source| source.authority.gap().map(|gap| gap.as_str()))
+            .unwrap_or("source_authority_not_established");
+        schedule_x::Predicate::NotEstablished { reason }
+    };
+
+    let duplicate =
+        schedule_x::resolve_duplicate_copy(connection, store_id, &planned.prescription_id)
+            .await
+            .map_err(map_database_error)?;
+
+    let annotation = schedule_x::resolve_annotation(
+        connection,
+        store_id,
+        sale_id,
+        &line.id,
+        &planned.prescription_item_id,
+        &line.product_id,
+    )
+    .await
+    .map_err(map_database_error)?;
+
+    // Rule 65(2), judged apart from the paperwork: the entry may be perfectly written and signed
+    // while the professional it names has since been archived or has let their registration lapse.
+    let pharmacist = schedule_x::resolve_entry_supervising_pharmacist(
+        &mut *connection,
+        store_id,
+        sale_id,
+        &line.id,
+        business_date,
+    )
+    .await
+    .map_err(map_database_error)?;
+
+    let (register, _entry) = schedule_x::resolve_confirmed_supply_entry(
+        connection,
+        store_id,
+        sale_id,
+        &line.id,
+        &line.product_id,
+        &line.batch_id,
+        line.quantity_atoms,
+        business_date,
+    )
+    .await
+    .map_err(map_database_error)?;
+
+    Ok(vec![
+        schedule_x::NamedPredicate::new(
+            "storeAuthority",
+            "schedule_x_store_authority_missing",
+            authority,
+        ),
+        schedule_x::NamedPredicate::new(
+            "productCoverage",
+            "schedule_x_store_authority_product_not_covered",
+            coverage,
+        ),
+        schedule_x::NamedPredicate::new(
+            "lotProvenance",
+            "schedule_x_lot_provenance_incomplete",
+            provenance_verdict,
+        ),
+        schedule_x::NamedPredicate::new(
+            "sourceAuthorities",
+            "schedule_x_source_authority_missing",
+            sources_verdict,
+        ),
+        schedule_x::NamedPredicate::new(
+            "duplicatePrescriptionCopy",
+            "schedule_x_duplicate_copy_evidence_missing",
+            duplicate,
+        ),
+        schedule_x::NamedPredicate::new(
+            "prescriptionAnnotation",
+            "schedule_x_prescription_annotation_missing",
+            annotation,
+        ),
+        schedule_x::NamedPredicate::new(
+            "physicalRegisterEntry",
+            "schedule_x_register_confirmation_missing",
+            register,
+        ),
+        schedule_x::NamedPredicate::new(
+            "supervisingPharmacist",
+            "schedule_x_supervising_pharmacist_invalid",
+            pharmacist,
+        ),
+    ])
+}
+
+/// Phase 1M-D3-C2 — the Schedule X layer of the posting plan.
+///
+/// Runs for every planned dispensing whose line is held to Schedule X, records an issue for each
+/// unmet predicate, and returns a plan entry only for lines where nothing was outstanding. The
+/// confirmed working entry is re-read here rather than carried from anywhere earlier, because this
+/// runs inside the posting's own `BEGIN IMMEDIATE` transaction and nothing read before it is
+/// trustworthy by then.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_schedule_x_lines(
+    connection: &mut PoolConnection<Sqlite>,
+    store_id: &str,
+    sale_id: &str,
+    business_date: &str,
+    lines: &[DraftLine],
+    regulatory: &[LineRegulatory],
+    planned: &[PlannedDispensing],
+    issues: &mut Vec<PrescriptionIssue>,
+) -> Result<Vec<ScheduleXLinePlan>, SaleError> {
+    let mut plans = Vec::new();
+    for planned in planned {
+        let Some(index) = lines
+            .iter()
+            .position(|line| line.id == planned.sale_line_id)
+        else {
+            return Err(SaleError::Internal);
+        };
+        if regulatory[index].gate != regulatory::SaleGate::ScheduleXRequired {
+            continue;
+        }
+        let line = &lines[index];
+        let predicates =
+            schedule_x_line_predicates(connection, store_id, sale_id, business_date, line, planned)
+                .await?;
+        let mut unmet = false;
+        for predicate in &predicates {
+            if !predicate.verdict.is_established() {
+                unmet = true;
+                issues.push(PrescriptionIssue {
+                    line_number: Some(line.line_number),
+                    code: predicate.code,
+                });
+            }
+        }
+        if unmet {
+            continue;
+        }
+        // Everything is established, so the confirmed entry exists. Read it once more for its
+        // identity: the finalizer updates exactly this row and no other.
+        let (_, entry) = schedule_x::resolve_confirmed_supply_entry(
+            connection,
+            store_id,
+            sale_id,
+            &line.id,
+            &line.product_id,
+            &line.batch_id,
+            line.quantity_atoms,
+            business_date,
+        )
+        .await
+        .map_err(map_database_error)?;
+        let Some(entry) = entry else {
+            return Err(SaleError::Internal);
+        };
+        plans.push(ScheduleXLinePlan {
+            sale_line_id: line.id.clone(),
+            entry_id: entry.id,
+            entry_reference: entry.reference,
+            product_id: line.product_id.clone(),
+            batch_id: line.batch_id.clone(),
+            quantity_atoms: line.quantity_atoms,
+            prescription_id: entry.prescription_id,
+            prescription_item_id: entry.prescription_item_id,
+        });
+    }
+    Ok(plans)
+}
+
+/// Phase 1M-D3-C2 — binds and finalizes this Sale's confirmed Schedule X working entries.
+///
+/// The three bindings rule 65(21)(b) needs and migration 0030 permits exactly once —
+/// `dispensing_id`, `bill_number` and `bill_date` — are written here, in the posting transaction,
+/// in one statement per line, together with the transition to `finalized`.
+///
+/// Every identifying particular is restated in the `WHERE` clause rather than trusted from the plan:
+/// the same Sale, the same line, the same drug, the same lot, the same quantity, still `confirmed`,
+/// still attested, and all three bindings still NULL. If anything moved between the evaluation above
+/// and this statement, `rows_affected` is zero and the whole posting rolls back.
+///
+/// Nothing here creates an entry, skips a line, finalizes a `prepared` entry, or reaches another
+/// line's entry or dispensing.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_schedule_x_entries(
+    connection: &mut PoolConnection<Sqlite>,
+    sale_id: &str,
+    store_id: &str,
+    plans: &[ScheduleXLinePlan],
+    dispensing_ids: &[(String, String)],
+    bill_number: &str,
+    bill_date: &str,
+    actor_id: &str,
+    now: &str,
+) -> Result<(), SaleError> {
+    for plan in plans {
+        let Some((_, dispensing_id)) = dispensing_ids
+            .iter()
+            .find(|(line_id, _)| *line_id == plan.sale_line_id)
+        else {
+            // A Schedule X line with no dispensing is a contradiction: the plan was built from the
+            // planned dispensings. Refuse rather than finalize an entry with nothing to bind.
+            return Err(SaleError::Internal);
+        };
+        let bound = sqlx::query(
+            "UPDATE store_schedule_x_register_entries \
+             SET dispensing_id=?,bill_number=?,bill_date=?,status='finalized',\
+                 finalized_by_user_id=?,finalized_at_utc=? \
+             WHERE id=? AND store_id=? AND sale_document_id=? AND sale_line_id=? \
+               AND entry_kind='supply' AND status='confirmed' \
+               AND particulars_entered_in_physical_register=1 \
+               AND physical_entry_authenticated=1 \
+               AND product_id=? AND batch_id=? AND quantity_atoms=? \
+               AND prescription_id=? AND prescription_item_id=? \
+               AND dispensing_id IS NULL AND bill_number IS NULL AND bill_date IS NULL",
+        )
+        .bind(dispensing_id)
+        .bind(bill_number)
+        .bind(bill_date)
+        .bind(actor_id)
+        .bind(now)
+        .bind(&plan.entry_id)
+        .bind(store_id)
+        .bind(sale_id)
+        .bind(&plan.sale_line_id)
+        .bind(&plan.product_id)
+        .bind(&plan.batch_id)
+        .bind(plan.quantity_atoms)
+        .bind(&plan.prescription_id)
+        .bind(&plan.prescription_item_id)
+        .execute(&mut **connection)
+        .await
+        .map_err(map_database_error)?;
+        if bound.rows_affected() != 1 {
+            return Err(SaleError::Internal);
+        }
+        audit_entity(
+            connection,
+            "schedule_x_register_entry",
+            &plan.entry_id,
+            "posted",
+            &json!({
+                "saleDocumentId": sale_id,
+                "status": "finalized",
+                "reference": plan.entry_reference,
+            }),
             actor_id,
             now,
         )
@@ -12507,14 +13090,15 @@ mod tests {
 
     /// 22. Each of Schedule H, H1 and X refuses on its own, naming itself. Since Phase 1M-B a
     /// Schedule H line without its prescription is refused for exactly that; since Phase 1M-C so is
-    /// a Schedule H1 line established outside NDPS purview; X stays refused because its own
-    /// workflow does not exist yet.
+    /// a Schedule H1 line established outside NDPS purview; and since Phase 1M-D3-C2 so is a
+    /// Schedule X line, which now has a retail path of its own and is therefore refused for the
+    /// prescription it lacks rather than for a workflow that does not exist.
     #[tokio::test]
     async fn every_prescription_schedule_refuses_until_its_workflow_exists() {
         for (scheme, code) in [
             ("schedule_h", "prescription_requirements_incomplete"),
             ("schedule_h1", "prescription_requirements_incomplete"),
-            ("schedule_x", "schedule_x_workflow_not_available"),
+            ("schedule_x", "prescription_requirements_incomplete"),
         ] {
             let f = fixture().await;
             make_medicine(&f, &f.product_id).await;
@@ -13039,7 +13623,25 @@ mod tests {
             Value::Null,
         )
         .await;
+        // Phase 1M-D3-C2 — `clear_every_schedule` settles the five gating schemes and leaves the
+        // NDPS axis unrecorded, so a Schedule X line is blocked on NDPS and the quote names that
+        // axis. This is the same report Schedule H1 has given for an unrecorded purview since
+        // Phase 1M-C.
         assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "ndps_purview");
+
+        // With the NDPS axis established not to apply, the quote reports Schedule X's own gate —
+        // never "clear", and never the plain prescription requirement.
+        let (status, body) = classify_scheme(&f, "ndps_purview", false, "2020-01-01", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, quote) = request(
+            f.pool.clone(),
+            "GET",
+            &format!("/api/v1/sales/{id}/quote"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "schedule_x_required");
         assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "schedule_x");
     }
 
@@ -14311,6 +14913,10 @@ mod tests {
     }
 
     /// B-22. Schedule X is refused with its own typed error.
+    ///
+    /// Phase 1M-D3-C2: the twin of B-21 above. A complete prescription does not clear the
+    /// independent NDPS axis, and this fixture records no position on it, so the refusal names that
+    /// axis — for Schedule X under its own code, never under Schedule H1's.
     #[tokio::test]
     async fn b22_schedule_x_is_refused_even_with_a_complete_prescription() {
         let f = fixture().await;
@@ -14319,10 +14925,18 @@ mod tests {
         let professional = pharmacist(&f).await;
         let (_, item) = simple_prescription(&f, 20).await;
         let id = prepared_sale(&f, &item, &professional, 1).await;
+        let quote = quote_of(&f, &id).await;
+        assert_eq!(quote["lines"][0]["regulatoryGate"], "workflow_unavailable");
+        assert_eq!(quote["lines"][0]["regulatoryGateScheme"], "ndps_purview");
         let (status, refused) = post_as_quoted(&f, &id).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        assert_eq!(refused["code"], "schedule_x_workflow_not_available");
+        assert_eq!(refused["code"], "schedule_x_ndps_purview_unresolved");
         assert_nothing_posted(&f, &id, &f.batch_id, 100).await;
+        // An unrecorded finding is not a claim about the drug.
+        let text = refused.to_string().to_lowercase();
+        for word in ["banned", "prohibit", "illegal"] {
+            assert!(!text.contains(word), "{word}: {refused}");
+        }
     }
 
     /// B-23. A drug in Schedule H and Schedule C is held to both, and Schedule C's record does not
@@ -16731,10 +17345,26 @@ mod tests {
     async fn d1a_schedule_x_remains_unsupported_after_purchase_provenance() {
         let f = fixture().await;
         schedule_product(&f, &f.product_id, &["schedule_x"]).await;
+        // Phase 1M-D3-C2: the independent NDPS axis is established not to apply, so this test
+        // reaches the predicate it is actually about — that receipt provenance is a record of a
+        // purchase and not an authority to dispense — instead of stopping at an unrecorded overlay.
+        add_finding(&f, &f.product_id, "ndps_purview", false, "2020-01-01").await;
         let id = draft_with_line(&f, "pack", 1, 8000).await;
         let (status, refused) = post_as_quoted(&f, &id).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-        assert_eq!(refused["code"], "schedule_x_workflow_not_available");
+        // Nothing but the classification and the stock exists, so every Schedule X requirement that
+        // depends on a record is outstanding: the manufacturer rule 65(21)(b)(v) wants in the
+        // register, the prescription rule 65(9)(a) wants, and the registered pharmacist rule 65(2)
+        // wants supervising the supply. Provenance on the receipt side changed none of them.
+        assert_eq!(refused["code"], "prescription_requirements_incomplete");
+        assert_eq!(
+            prescription_issue_codes(&refused),
+            vec![
+                "lines.1.manufacturer_not_recorded".to_owned(),
+                "lines.1.prescription_missing".to_owned(),
+                "supply.supervising_pharmacist_required".to_owned(),
+            ]
+        );
         assert_nothing_sold(&f, &id).await;
         let text = refused.to_string().to_lowercase();
         for word in ["banned", "prohibit", "illegal"] {
@@ -16751,7 +17381,10 @@ mod tests {
                 &["schedule_h", "schedule_h1"][..],
                 "schedule_h1_ndps_workflow_not_available",
             ),
-            (&["schedule_x"][..], "schedule_x_workflow_not_available"),
+            // Phase 1M-D3-C2 — the Schedule X retail path exists now, so this case is refused on
+            // the independent axis the fixture leaves unrecorded. The point of S-17 is unchanged:
+            // preparing a rule 65(3) entry is never a way round the scheme gate.
+            (&["schedule_x"][..], "schedule_x_ndps_purview_unresolved"),
             (
                 &["schedule_h", "schedule_c"][..],
                 "regulated_sale_workflow_not_available",
@@ -18186,10 +18819,14 @@ mod tests {
                 true,
                 "regulatory_classification_unresolved",
             ),
+            // Phase 1M-D3-C2 — H1 with Schedule X keeps C-06's original meaning, under a code that
+            // names the intersection: the rule 65(3)(1)(h) H1 working entry is bound to the rule
+            // 65(3)(1) record that Schedule X is excluded from, so the two cannot be discharged
+            // together and no entry of either kind comes into existence.
             (
                 &["schedule_h1", "schedule_x"][..],
                 false,
-                "schedule_x_workflow_not_available",
+                "schedule_x_unsupported_intersecting_regime",
             ),
             (
                 &["schedule_h1", "schedule_c"][..],
@@ -19235,4 +19872,485 @@ mod tests {
         assert!(text.contains("punjab_restricted_supply"), "{view}");
         assert!(!text.contains("\"schedule_h1\":\"applies\""), "{view}");
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Phase 1M-D3-C2 — the read-only Schedule X preflight.
+//
+// One result per Schedule X line, every requirement reported on its own, so the counter can see what
+// is outstanding before anybody writes in a bound register or presses Post Sale.
+//
+// It is ADVISORY AND NOTHING ELSE. It allocates no document number, writes no row, attests nothing,
+// transitions nothing, and records no audit event. `canAttemptPosting` is a convenience for the
+// screen and carries no authority whatever: the posting transaction recomputes every predicate here
+// inside its own `BEGIN IMMEDIATE`, and the database checks the whole chain again at
+// `status = 'posted'`. A test proves a favourable preflight followed by a changed prerequisite is
+// still refused.
+//
+// There is deliberately ONE rule engine. The predicates below are the same functions the posting
+// path calls — `resolve_regulatory_for_lines` for the gate and the overlays, `plan_dispensings` for
+// the prescription, and `schedule_x_line_predicates` for the Schedule X chain — so a preflight that
+// says "established" and a posting that refuses can only ever differ because something changed in
+// between, never because two implementations disagreed.
+// -------------------------------------------------------------------------------------------------
+
+/// One Schedule X line's preflight, as the POS screen reads it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleXPreflightLine {
+    sale_line_id: String,
+    line_number: i64,
+    product_id: String,
+    product_display_name: String,
+    /// The exact lot the line draws on. Schedule X is answered per lot, never per product.
+    batch_id: String,
+    batch_number: Option<String>,
+    quantity_atoms: i64,
+    /// Identifiers only. No patient, no prescriber, no dose, no diagnosis: the screen does not need
+    /// them to show what is outstanding, and the register is not the invoice.
+    prescription_item_id: Option<String>,
+    prescription_reference: Option<String>,
+    predicates: Vec<schedule_x::NamedPredicate>,
+    /// Advisory. True only when every predicate on this line is established.
+    can_attempt_posting: bool,
+}
+
+/// The Sale's Schedule X preflight.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleXPreflightResponse {
+    sale_document_id: String,
+    status: String,
+    business_date: String,
+    /// Every line held to Schedule X, in line order. A Sale with none is reported with an empty
+    /// list rather than an error, so the screen can ask unconditionally.
+    lines: Vec<ScheduleXPreflightLine>,
+    /// Advisory, and advisory only. Posting re-evaluates everything inside its transaction.
+    can_attempt_posting: bool,
+}
+
+/// `GET /api/v1/sales/{id}/schedule-x-preflight`
+async fn schedule_x_preflight(
+    State(state): State<ReferenceState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ScheduleXPreflightResponse>, SaleError> {
+    require_reader(&state, &headers).await?;
+    validate_uuid_v7(&id, "id").map_err(validation_issue)?;
+    let header = sqlx::query_as::<_, PostingHeader>(&format!(
+        "SELECT {POSTING_HEADER_COLUMNS} FROM sale_documents WHERE id=?"
+    ))
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(map_database_error)?
+    .ok_or(SaleError::NotFound)?;
+
+    let mut connection = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|_| SaleError::Internal)?;
+    let lines = load_lines(&mut connection, &id).await?;
+    let regulatory = resolve_regulatory_for_lines(
+        &mut connection,
+        &header.store_id,
+        &lines,
+        &header.business_date,
+    )
+    .await?;
+    // The same planner the posting runs. It reads and reports; it writes nothing.
+    let plan = plan_dispensings(
+        &mut connection,
+        &header.store_id,
+        &id,
+        &lines,
+        &regulatory,
+        &header.business_date,
+    )
+    .await?;
+
+    let mut reported = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let drugs = &regulatory[index];
+        // Every line whose Schedule X position is not settled as inapplicable: the ones that apply,
+        // and the ones nobody has classified, because an unknown position is a Schedule X question
+        // too and the operator needs to see it.
+        if drugs.schemes.answer("schedule_x") == regulatory::Resolution::DoesNotApply {
+            continue;
+        }
+        let (product_display_name, batch_number): (String, Option<String>) = sqlx::query_as(
+            "SELECT product.display_name,batch.batch_number FROM products product \
+             LEFT JOIN product_batches batch ON batch.id=? WHERE product.id=?",
+        )
+        .bind(&line.batch_id)
+        .bind(&line.product_id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(map_database_error)?;
+
+        let summary = &plan.summaries[index];
+        let mut predicates = schedule_x_preflight_predicates(drugs, summary, &plan, line);
+
+        // The Schedule X chain itself, from the same resolver the posting uses — but only once the
+        // line is actually held to Schedule X with a prescription planned. Before that there is
+        // nothing to resolve it against, and guessing would report a lot and a drug the operator has
+        // not chosen yet.
+        if let Some(planned) = plan
+            .planned
+            .iter()
+            .find(|planned| planned.sale_line_id == line.id)
+            && drugs.gate == regulatory::SaleGate::ScheduleXRequired
+        {
+            predicates.extend(
+                schedule_x_line_predicates(
+                    &mut connection,
+                    &header.store_id,
+                    &id,
+                    &header.business_date,
+                    line,
+                    planned,
+                )
+                .await?,
+            );
+        } else {
+            // Say so, rather than leaving the Schedule X requirements out of the report entirely.
+            for (predicate, code) in SCHEDULE_X_CHAIN_PREDICATES {
+                predicates.push(schedule_x::NamedPredicate::new(
+                    predicate,
+                    code,
+                    schedule_x::Predicate::Unresolved {
+                        reason: "prescription_not_linked",
+                    },
+                ));
+            }
+        }
+
+        let can_attempt_posting = predicates
+            .iter()
+            .all(|predicate| predicate.verdict.is_established());
+        reported.push(ScheduleXPreflightLine {
+            sale_line_id: line.id.clone(),
+            line_number: line.line_number,
+            product_id: line.product_id.clone(),
+            product_display_name,
+            batch_id: line.batch_id.clone(),
+            batch_number,
+            quantity_atoms: line.quantity_atoms,
+            prescription_item_id: summary.prescription_item_id.clone(),
+            prescription_reference: summary.prescription_reference.clone(),
+            predicates,
+            can_attempt_posting,
+        });
+    }
+
+    let can_attempt_posting = header.status == "draft"
+        && !reported.is_empty()
+        && reported.iter().all(|line| line.can_attempt_posting);
+    Ok(Json(ScheduleXPreflightResponse {
+        sale_document_id: id,
+        status: header.status,
+        business_date: header.business_date,
+        lines: reported,
+        can_attempt_posting,
+    }))
+}
+
+/// The Schedule X chain predicates, named here so an unlinked line reports them as unresolved rather
+/// than omitting them. Kept beside `schedule_x_line_predicates`, which must report the same names.
+const SCHEDULE_X_CHAIN_PREDICATES: [(&str, &str); 8] = [
+    ("storeAuthority", "schedule_x_store_authority_missing"),
+    (
+        "productCoverage",
+        "schedule_x_store_authority_product_not_covered",
+    ),
+    ("lotProvenance", "schedule_x_lot_provenance_incomplete"),
+    ("sourceAuthorities", "schedule_x_source_authority_missing"),
+    (
+        "duplicatePrescriptionCopy",
+        "schedule_x_duplicate_copy_evidence_missing",
+    ),
+    (
+        "prescriptionAnnotation",
+        "schedule_x_prescription_annotation_missing",
+    ),
+    (
+        "physicalRegisterEntry",
+        "schedule_x_register_confirmation_missing",
+    ),
+    (
+        "supervisingPharmacist",
+        "schedule_x_supervising_pharmacist_invalid",
+    ),
+];
+
+/// The predicates that come from the gate and from the prescription planner, read off the verdicts
+/// those owners already reached. Nothing is recomputed here.
+fn schedule_x_preflight_predicates(
+    drugs: &LineRegulatory,
+    summary: &LinePrescriptionSummary,
+    plan: &DispensingPlan,
+    line: &DraftLine,
+) -> Vec<schedule_x::NamedPredicate> {
+    use schedule_x::{NamedPredicate as P, Predicate as V};
+
+    let classification = match drugs.schemes.answer("schedule_x") {
+        regulatory::Resolution::Applies => V::Established,
+        regulatory::Resolution::Unknown => V::Unresolved {
+            reason: "classification_not_recorded",
+        },
+        regulatory::Resolution::DoesNotApply => V::NotEstablished {
+            reason: "schedule_x_does_not_apply",
+        },
+    };
+
+    // Schedule C and C(1) are an intersection this software does not support, whatever the Schedule X
+    // evidence looks like. Form 28-B is the manufacturer's licence for such a drug and is out of
+    // scope, so the line fails closed here.
+    let intersection = if drugs.schemes.answer("schedule_c") == regulatory::Resolution::Applies {
+        V::Unsupported {
+            reason: "schedule_c_intersection",
+        }
+    } else if drugs.schemes.answer("schedule_c1") == regulatory::Resolution::Applies {
+        V::Unsupported {
+            reason: "schedule_c1_intersection",
+        }
+    } else {
+        V::Established
+    };
+
+    // NDPS is an independent axis. Only an established `does_not_apply` passes.
+    let ndps = match drugs.schemes.answer("ndps_purview") {
+        regulatory::Resolution::DoesNotApply => V::Established,
+        regulatory::Resolution::Applies => V::OverlayBlocked {
+            axis: "ndps_purview",
+            reason: "ndps_purview_applies",
+        },
+        regulatory::Resolution::Unknown => V::OverlayBlocked {
+            axis: "ndps_purview",
+            reason: "ndps_purview_unresolved",
+        },
+    };
+
+    // The Punjab boundary, read from the same state answer the posting freezes. Completing the
+    // Schedule X record never clears it.
+    let punjab = match drugs.state.punjab {
+        regulatory::StateAxisAnswer::NotApplicable => V::Established,
+        regulatory::StateAxisAnswer::Resolved(regulatory::Resolution::DoesNotApply) => {
+            V::Established
+        }
+        regulatory::StateAxisAnswer::Resolved(regulatory::Resolution::Applies) => {
+            V::OverlayBlocked {
+                axis: "punjab_restricted_supply",
+                reason: "state_workflow_unavailable",
+            }
+        }
+        regulatory::StateAxisAnswer::Resolved(regulatory::Resolution::Unknown) => {
+            V::OverlayBlocked {
+                axis: "punjab_restricted_supply",
+                reason: "state_position_not_recorded",
+            }
+        }
+        regulatory::StateAxisAnswer::Undetermined => V::OverlayBlocked {
+            axis: "punjab_restricted_supply",
+            reason: "premises_state_not_recorded",
+        },
+    };
+
+    // Schedule H1 is an additional, independent obligation on an X ∩ H1 line: rule 65(3)'s Schedule X
+    // exclusion touches the generic register only. Established where H1 does not apply, or where its
+    // own working entry raised no issue on this line.
+    let h1 = if drugs.schemes.answer("schedule_h1") == regulatory::Resolution::Applies
+        && drugs.schemes.answer("schedule_x") == regulatory::Resolution::Applies
+    {
+        // Structurally unsupported together: see `domain::regulatory::gate`. The rule 65(3)(1)(h)
+        // H1 working entry is bound to the rule 65(3)(1) record that Schedule X is excluded from.
+        V::Unsupported {
+            reason: "schedule_x_h1_intersection",
+        }
+    } else if !drugs.h1_any_day {
+        V::Established
+    } else if plan.issues.iter().any(|issue| {
+        issue.line_number == Some(line.line_number) && issue.code.starts_with("schedule_h1_")
+    }) {
+        V::NotEstablished {
+            reason: "h1_working_entry_outstanding",
+        }
+    } else {
+        V::Established
+    };
+
+    // One helper for the prescription predicates, each read off the single refusal the planner
+    // reached for this line. `check_dispense` owns these rules; nothing is re-decided here.
+    let issue = summary.issue;
+    let line_issue = |codes: &[&str]| -> bool { issue.is_some_and(|code| codes.contains(&code)) };
+    let linked = summary.prescription_item_id.is_some();
+
+    let linkage = if line_issue(&["prescription_missing"]) {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    } else if line_issue(&["prescription_not_found"]) {
+        V::NotEstablished {
+            reason: "prescription_not_of_this_pharmacy",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    let state = if line_issue(&["prescription_archived"]) {
+        V::NotEstablished {
+            reason: "prescription_archived",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    // Rule 65(11A). The planner refuses a different product outright; the database proves the
+    // identity again when the dispensing is written.
+    let product_match = if line_issue(&["prescription_substitution_not_permitted"]) {
+        V::NotEstablished {
+            reason: "substitution_not_permitted",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    // Rule 65(10)(c), the total. Captured as a required field, so what can fail is the arithmetic
+    // against what has already been supplied.
+    let quantity = if line_issue(&["prescription_quantity_exceeded"]) {
+        V::NotEstablished {
+            reason: "quantity_exceeds_authority",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    let repeat = if line_issue(&["prescription_repeat_not_authorised"]) {
+        V::NotEstablished {
+            reason: "repeat_not_authorised",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    let interval = if line_issue(&["prescription_repeat_too_soon"]) {
+        V::NotEstablished {
+            reason: "repeat_interval_not_elapsed",
+        }
+    } else if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    // What is left of the item's authority. Reported as its own predicate because a line can be
+    // within the total and still have nothing left after earlier supplies.
+    let remaining = match summary.remaining_atoms {
+        Some(left) if left >= line.quantity_atoms => V::Established,
+        Some(_) => V::NotEstablished {
+            reason: "remaining_authority_insufficient",
+        },
+        None => V::Unresolved {
+            reason: "prescription_not_linked",
+        },
+    };
+    // Rule 65(10)(a) and (c) are captured as required fields of the prescription — the written,
+    // signed and dated attestation and the dose — so they are established once the item is linked.
+    let written = if linked {
+        V::Established
+    } else {
+        V::Unresolved {
+            reason: "prescription_not_linked",
+        }
+    };
+    let dose = written.clone();
+    // Rule 65(2), at the level of the whole supply: the pharmacist this Sale is being supervised by,
+    // as opposed to the one named on the working entry.
+    let supply_supervision = if plan.issues.iter().any(|issue| {
+        issue.line_number.is_none()
+            && matches!(
+                issue.code,
+                "supervising_pharmacist_required"
+                    | "supervising_pharmacist_invalid"
+                    | "endorsement_not_confirmed"
+            )
+    }) {
+        V::NotEstablished {
+            reason: "supply_supervision_outstanding",
+        }
+    } else {
+        V::Established
+    };
+
+    vec![
+        P::new(
+            "scheduleXClassification",
+            "regulatory_classification_unresolved",
+            classification,
+        ),
+        P::new(
+            "supportedIntersection",
+            "regulated_sale_workflow_not_available",
+            intersection,
+        ),
+        P::new("ndpsOverlay", "schedule_x_ndps_purview_unresolved", ndps),
+        P::new(
+            "punjabOverlay",
+            "state_regulatory_position_unresolved",
+            punjab,
+        ),
+        P::new("h1Intersection", "schedule_h1_register_not_confirmed", h1),
+        P::new("exactBatch", "sale_line_batch_missing", V::Established),
+        P::new("prescriptionLinkage", "prescription_missing", linkage),
+        P::new("prescriptionState", "prescription_archived", state),
+        P::new(
+            "prescriptionProductMatch",
+            "prescription_substitution_not_permitted",
+            product_match,
+        ),
+        P::new(
+            "writtenSignedDated",
+            "prescription_written_signed_dated_missing",
+            written,
+        ),
+        P::new("prescribedDose", "prescription_dose_missing", dose),
+        P::new(
+            "quantityAuthority",
+            "prescription_quantity_exceeded",
+            quantity,
+        ),
+        P::new(
+            "repeatAuthority",
+            "prescription_repeat_not_authorised",
+            repeat,
+        ),
+        P::new("repeatInterval", "prescription_repeat_too_soon", interval),
+        P::new(
+            "remainingAuthority",
+            "prescription_quantity_exceeded",
+            remaining,
+        ),
+        P::new(
+            "supplySupervision",
+            "supervising_pharmacist_required",
+            supply_supervision,
+        ),
+    ]
 }

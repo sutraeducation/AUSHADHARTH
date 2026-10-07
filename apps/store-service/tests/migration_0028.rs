@@ -1078,9 +1078,10 @@ async fn the_earlier_migrations_are_unchanged() {
         .filter(|name| name.ends_with(".sql"))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 29, "expected exactly 29 migrations: {names:?}");
+    assert_eq!(names.len(), 30, "expected exactly 30 migrations: {names:?}");
     assert_eq!(names[27], "0028_schedule_x_supply_foundations.sql");
     assert_eq!(names[28], "0029_supplier_schedule_x_authority.sql");
+    assert_eq!(names[29], "0030_schedule_x_sale_enablement.sql");
     for name in &names[..27] {
         let bytes = std::fs::read(directory.join(name)).expect("read migration");
         assert!(!bytes.is_empty(), "{name} is empty");

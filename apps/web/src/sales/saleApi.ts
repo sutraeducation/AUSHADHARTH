@@ -1,5 +1,6 @@
 import {
   SaleDetailSchema,
+  ScheduleXPreflightSchema,
   SaleQuoteSchema,
   SaleSchema,
   SellableBatchSchema,
@@ -9,6 +10,7 @@ import {
   type SaleDraftInput,
   type SaleLineInput,
   type SaleQuote,
+  type ScheduleXPreflight,
   type SaleStatus,
   type SellableBatch,
   type TenderInput
@@ -217,4 +219,17 @@ export function basisUnitLabel(
   baseUnitLabel: string | null
 ): string {
   return basis === "pack" ? (packLabel ?? "pack") : (baseUnitLabel ?? "unit");
+}
+
+/**
+ * Phase 1M-D3-C2 — the read-only Schedule X preflight for a draft Sale.
+ *
+ * Advisory. It allocates nothing, writes nothing and attests nothing, and `canAttemptPosting` is a
+ * convenience for the screen rather than an authority: posting re-evaluates every requirement inside
+ * its own transaction.
+ */
+export async function getScheduleXPreflight(saleId: string): Promise<ScheduleXPreflight> {
+  return ScheduleXPreflightSchema.parse(
+    await localServiceRequest(`/api/v1/sales/${saleId}/schedule-x-preflight`)
+  );
 }

@@ -593,6 +593,12 @@ async fn get_product_regulatory(
                 .to_owned(),
             ),
         ),
+        // Phase 1M-D3-C2 — Schedule X has its own gate: lawfully sellable by retail, and only with
+        // the whole rule 65 Schedule X record. Never reported as "clear".
+        crate::domain::regulatory::SaleGate::ScheduleXRequired => (
+            "schedule_x_required".to_owned(),
+            Some("schedule_x".to_owned()),
+        ),
         crate::domain::regulatory::SaleGate::WorkflowUnavailable { scheme } => {
             ("workflow_unavailable".to_owned(), Some(scheme.to_owned()))
         }

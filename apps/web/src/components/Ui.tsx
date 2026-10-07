@@ -63,6 +63,12 @@ export function ScrollableTable({
       <div
         ref={scroller}
         className="table-scroll"
+        // A region that scrolls has to be reachable without a mouse, or its right-hand columns are
+        // simply unavailable to a keyboard user. It becomes a tab stop only while it actually
+        // overflows, so a table that fits adds nothing to the tab order.
+        tabIndex={overflowing ? 0 : undefined}
+        role={overflowing ? "region" : undefined}
+        aria-label={overflowing ? hint : undefined}
         data-overflowing={overflowing ? "true" : "false"}
         data-at-end={atEnd ? "true" : "false"}
         onScroll={measure}

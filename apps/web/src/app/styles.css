@@ -414,12 +414,15 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
    order — entry, the bill, and the amount payable — because a queue does not wait while somebody
    opens a dialog. The bill and the total sit side by side on a wide screen and stack on a narrow
    one, so the same screen works on the shop's monitor and on a phone at the delivery counter. */
-.pos { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); grid-template-areas: "entry entry" "lines summary" "prescription summary" "customer summary"; align-items: start; }
+.pos { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); grid-template-areas: "entry entry" "lines summary" "prescription summary" "schedulex summary" "customer summary"; align-items: start; }
 .pos-entry { grid-area: entry; }
 .pos-lines { grid-area: lines; min-width: 0; }
 .pos-summary { grid-area: summary; }
 .pos-customer { grid-area: customer; }
 .pos-prescription { grid-area: prescription; }
+/* Phase 1M-D3-C2 — the Schedule X requirements get an area of their own. Sharing the prescription
+   panel's grid area would stack the two on top of each other. */
+.pos-schedule-x { grid-area: schedulex; }
 .pos > .inline-notice { grid-area: entry; grid-row: 1; align-self: end; }
 
 /* The entry row. The search box is given the width because it is where every line begins, and the
@@ -478,8 +481,17 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 
 /* Phase 1M-B. The Schedule H supply panel appears only when a line needs it. Each line states its
    prescription in words; the supervising pharmacist and the endorsement are one short form. */
-.pos-prescription { display: grid; gap: 12px; min-width: 0; padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; }
-.pos-prescription h3 { margin: 0; font-size: .78rem; }
+.pos-prescription, .pos-schedule-x { display: grid; gap: 12px; min-width: 0; padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.pos-prescription h3, .pos-schedule-x h3 { margin: 0; font-size: .78rem; }
+.pos-schedule-x h4 { margin: 0; font-size: .74rem; }
+.pos-schedule-x h5 { margin: 0 0 4px; font-size: .64rem; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-500); }
+.pos-schedule-x .requirement-list { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: .72rem; line-height: 1.55; }
+.pos-schedule-x .requirement { font-weight: 700; }
+.pos-schedule-x .requirement--established { color: var(--ink-700); }
+.pos-schedule-x .requirement--not_established, .pos-schedule-x .requirement--unsupported { color: var(--danger-700); }
+.pos-schedule-x .requirement--unresolved, .pos-schedule-x .requirement--overlay_blocked { color: var(--ink-700); }
+.pos-schedule-x .subpanel { display: grid; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); min-width: 0; }
+.pos-schedule-x .subpanel__header { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; justify-content: space-between; }
 .pos-prescription .panel-note { margin: 0; }
 .pos-prescription__line, .pos-prescription__supply, .pos-prescription__record { display: grid; gap: 6px; min-width: 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .pos-prescription__record .button { justify-self: start; }
@@ -538,7 +550,7 @@ a.button { display: inline-flex; align-items: center; justify-content: center; t
 .pos-warning { color: var(--danger-700); font-weight: 700; }
 
 @media (max-width: 900px) {
-  .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "prescription" "customer"; }
+  .pos { grid-template-columns: minmax(0, 1fr); grid-template-areas: "entry" "summary" "lines" "prescription" "schedulex" "customer"; }
   .pos-summary { position: static; }
 }
 /* On the shop's monitor the amount payable and the posting action are what the cashier looks at

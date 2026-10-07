@@ -20,6 +20,7 @@ import type {
 import type { RegulatoryGate, RegulatoryScheme, SaleQuote, SaleQuoteLine } from "@aushadharth/contracts";
 import { useAuth } from "../auth/AuthContext";
 import { SCHEME_LABELS, listProfessionals } from "../regulatory/regulatoryApi";
+import type { ScheduleXNamedPredicate, ScheduleXPreflightLine } from "@aushadharth/contracts";
 import { H1_STATUS_LABELS, PRESCRIPTION_ISSUE_TEXT, RECORD_METHOD_LABELS, RECORD_STATUS_LABELS, SUPPLY_ISSUE_TEXT, getPrescription, listPrescriptions } from "../prescriptions/prescriptionApi";
 import { businessToday } from "../platform/businessDate";
 import { LocalServiceError } from "../platform/localService";
@@ -32,6 +33,7 @@ import {
   addSaleLine,
   basisUnitLabel,
   createSaleDraft,
+  getScheduleXPreflight,
   getSale,
   listSales,
   listSellableBatches,
@@ -374,6 +376,9 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
   // Refused whatever is done at the counter: an unclassified medicine, or a schedule whose statutory
   // record this version does not keep (H1, X, C, C(1)).
   const hardBlocked = quoteLines.filter((line) => line.regulatoryGate === "unresolved" || line.regulatoryGate === "workflow_unavailable");
+  // Phase 1M-D3-C2 — a Schedule X line is not a dead end. Its requirements are shown one by one by
+  // the preflight below, each with the action that would clear it.
+  const scheduleXLines = quoteLines.filter((line) => line.regulatoryGate === "schedule_x_required");
   // Phase 1M-B: Schedule H sells once its prescription, pharmacist and endorsement are in place.
   const prescriptionIncomplete = quoteLines.some((line) => line.prescription.issue !== null)
     || (quote.data?.supply.issues.length ?? 0) > 0;
@@ -610,6 +615,8 @@ function PointOfSale({ sale }: { sale: SaleDetail }) {
         canDispense={canDispense}
         onChanged={refresh}
       />}
+
+      {scheduleXLines.length > 0 && <ScheduleXPreflightSection saleId={sale.id} />}
 
       <CustomerPanel
         key={sale.id}
@@ -1012,6 +1019,219 @@ function isStale(error: unknown): boolean {
  * Phase 1M-A — what the Drugs Rules gate says about one line, in words, only when it is not clear.
  * An ordinary line shows nothing extra: the counter is not slowed for toothpaste.
  */
+/**
+ * Phase 1M-D3-C2 — what a Schedule X line still needs, requirement by requirement.
+ *
+ * Grouped the way an operator works: what the pharmacy is allowed to sell, where the stock came from,
+ * the prescription, the supervision and the physical register, and the independent axes that stop a
+ * supply however complete everything else is.
+ *
+ * Every verdict here is the Store Service's, read back from the read-only preflight. It is ADVISORY:
+ * posting re-checks every one of them inside its own transaction, so a panel that says "ready" is a
+ * convenience and never a permission. Nothing in this panel attests, confirms or overrides anything.
+ */
+function ScheduleXPreflightSection({ saleId }: { saleId: string }) {
+  const preflight = useQuery({
+    queryKey: ["schedule-x-preflight", saleId],
+    queryFn: () => getScheduleXPreflight(saleId),
+    retry: false
+  });
+
+  if (preflight.isPending) {
+    return <section className="pos-schedule-x" aria-busy="true"><h3>Schedule X requirements</h3><p>Checking…</p></section>;
+  }
+  if (preflight.isError) {
+    return <section className="pos-schedule-x"><h3>Schedule X requirements</h3>
+      <div className="empty-state" role="alert">
+        <p>The Local Store Service did not complete this check.</p>
+        <button className="button button--secondary" type="button" onClick={() => void preflight.refetch()}>Retry</button>
+      </div>
+    </section>;
+  }
+
+  return <section className="pos-schedule-x" aria-labelledby="pos-schedule-x-title" data-testid="schedule-x-preflight">
+    <h3 id="pos-schedule-x-title">Schedule X requirements</h3>
+    <p className="field-hint">
+      Each requirement is checked on its own. Posting checks them all again, so this list is a guide to
+      what is outstanding, not a permission to post.
+    </p>
+    {preflight.data.lines.map((line) => <ScheduleXPreflightLineCard key={line.saleLineId} line={line} />)}
+  </section>;
+}
+
+/** The five states an operator has to be able to tell apart, and what each one means for them. */
+const PREFLIGHT_STATE_LABELS: Record<string, string> = {
+  established: "Done",
+  not_established: "Action required",
+  unresolved: "Not recorded yet",
+  unsupported: "Not supported",
+  overlay_blocked: "Blocked by another rule"
+};
+
+/** Operator-facing names for the requirements, in place of the internal predicate names. */
+const PREDICATE_LABELS: Record<string, string> = {
+  scheduleXClassification: "Schedule X position recorded",
+  supportedIntersection: "No unsupported schedule combination",
+  ndpsOverlay: "NDPS position recorded as not applying",
+  punjabOverlay: "Punjab State position",
+  h1Intersection: "Schedule H1 combination",
+  exactBatch: "Exact batch chosen",
+  prescriptionLinkage: "Prescription linked",
+  prescriptionState: "Prescription still usable",
+  prescriptionProductMatch: "Prescription names this exact product",
+  writtenSignedDated: "Prescription written, signed and dated",
+  prescribedDose: "Dose recorded",
+  quantityAuthority: "Within the prescribed total",
+  repeatAuthority: "Repeat allowed by the prescriber",
+  repeatInterval: "Repeat interval elapsed",
+  remainingAuthority: "Enough of the prescription left",
+  supplySupervision: "Registered pharmacist supervising this supply",
+  storeAuthority: "Pharmacy's Form 20-F Schedule X retail authority",
+  productCoverage: "This drug named on the Form 20-F",
+  lotProvenance: "Batch traced to a recorded purchase",
+  sourceAuthorities: "Every supplier of this batch had Schedule X authority",
+  duplicatePrescriptionCopy: "Duplicate prescription copy retained",
+  prescriptionAnnotation: "Seller and date noted on the prescription",
+  physicalRegisterEntry: "Entry written and signed in the physical Schedule X register",
+  supervisingPharmacist: "Pharmacist named on the register entry is current"
+};
+
+/** The groups, in the order an operator works through them. */
+const PREDICATE_GROUPS: ReadonlyArray<{ title: string; predicates: readonly string[] }> = [
+  { title: "Authority", predicates: ["scheduleXClassification", "storeAuthority", "productCoverage"] },
+  { title: "Stock source", predicates: ["exactBatch", "lotProvenance", "sourceAuthorities"] },
+  {
+    title: "Prescription",
+    predicates: [
+      "prescriptionLinkage",
+      "prescriptionState",
+      "prescriptionProductMatch",
+      "writtenSignedDated",
+      "prescribedDose",
+      "quantityAuthority",
+      "repeatAuthority",
+      "repeatInterval",
+      "remainingAuthority",
+      "duplicatePrescriptionCopy",
+      "prescriptionAnnotation"
+    ]
+  },
+  {
+    title: "Supervision and the physical register",
+    predicates: ["supplySupervision", "supervisingPharmacist", "physicalRegisterEntry"]
+  },
+  {
+    title: "Independent rules",
+    predicates: ["ndpsOverlay", "punjabOverlay", "h1Intersection", "supportedIntersection"]
+  }
+];
+
+function ScheduleXPreflightLineCard({ line }: { line: ScheduleXPreflightLine }) {
+  const byName = new Map(line.predicates.map((predicate) => [predicate.predicate, predicate]));
+  const outstanding = line.predicates.filter((predicate) => predicate.verdict.state !== "established");
+  const overlayBlocked = outstanding.some((predicate) => predicate.verdict.state === "overlay_blocked");
+  const unsupported = outstanding.some((predicate) => predicate.verdict.state === "unsupported");
+  // Deliberately not one green "compliant" badge: the headline says which KIND of problem it is, and
+  // an independent rule or an unsupported combination is never presented as something to work through.
+  const headline = unsupported
+    ? "Not supported"
+    : overlayBlocked
+      ? "Blocked by another rule"
+      : outstanding.length === 0
+        ? "Ready to post"
+        : "Action required";
+
+  return <article className="subpanel" data-testid={`schedule-x-line-${line.lineNumber}`}>
+    <header className="subpanel__header">
+      <h4>Line {line.lineNumber}: {line.productDisplayName}</h4>
+      <span
+        className={`badge badge--${outstanding.length === 0 ? "ready" : "attention"}`}
+        data-testid={`schedule-x-line-${line.lineNumber}-state`}
+      >{headline}</span>
+    </header>
+    <dl className="detail-grid">
+      <dt>Batch</dt><dd>{line.batchNumber ?? line.batchId}</dd>
+      <dt>Prescription</dt><dd>{line.prescriptionReference ?? "Not linked"}</dd>
+    </dl>
+    {PREDICATE_GROUPS.map((group) => {
+      const rows = group.predicates
+        .map((name) => byName.get(name))
+        .filter((predicate): predicate is ScheduleXNamedPredicate => predicate !== undefined);
+      if (rows.length === 0) return null;
+      return <section key={group.title} className="field-group">
+        <h5>{group.title}</h5>
+        <ul className="requirement-list">
+          {rows.map((predicate) => <li key={predicate.predicate} data-testid={`predicate-${predicate.predicate}`}>
+            <strong>{PREDICATE_LABELS[predicate.predicate] ?? predicate.predicate}</strong>
+            {": "}
+            <span className={`requirement requirement--${predicate.verdict.state}`}>
+              {PREFLIGHT_STATE_LABELS[predicate.verdict.state] ?? predicate.verdict.state}
+            </span>
+            {predicate.verdict.state !== "established"
+              && <small>{" — "}{PREDICATE_REASON_TEXT[predicate.verdict.reason] ?? predicate.verdict.reason.replace(/_/g, " ")}</small>}
+          </li>)}
+        </ul>
+      </section>;
+    })}
+  </article>;
+}
+
+/**
+ * The reasons in the operator's words.
+ *
+ * Nothing here says a drug is illegal, banned or prohibited, and nothing says AUSHADHARTH has verified
+ * a licence with anybody. Where a combination is unsupported it says so, without claiming anything
+ * about whether the law requires a second register.
+ */
+const PREDICATE_REASON_TEXT: Record<string, string> = {
+  no_authority_recorded: "no Form 20-F Schedule X retail authority is recorded for this pharmacy",
+  authority_outside_validity: "the recorded Form 20-F does not cover this sale's date",
+  authority_not_established: "cannot be checked until the Form 20-F is recorded",
+  drug_not_covered: "this drug is not among those recorded on the Form 20-F",
+  no_qualifying_receipt: "no recorded purchase accounts for this batch's stock",
+  unresolved_inward_movement: "some stock in this batch did not arrive on a recorded purchase, and stock in one batch cannot be told apart",
+  no_contributing_source: "no purchase is recorded behind this batch",
+  outside_effective_period: "the supplier's recorded authority does not cover the date their goods were bought",
+  conflicting_authorities: "two overlapping authority records could both answer, so neither is relied on",
+  authority_suspended: "the supplier's authority is recorded as suspended for that date",
+  authority_cancelled: "the supplier's authority is recorded as cancelled for that date",
+  authority_status_unknown: "nobody recorded whether the supplier's authority was in force",
+  validity_basis_unknown: "nobody recorded whether the supplier's authority runs to a date or perpetually",
+  duplicate_copy_not_held: "the retained duplicate copy is recorded as not held",
+  no_attestation_recorded: "nobody has recorded whether the duplicate copy is held",
+  no_annotation_recorded: "the seller's name, address and the date have not been recorded as written on the prescription",
+  physical_entry_not_confirmed: "the entry is prepared; write the particulars in the bound register, have the registered pharmacist sign it, then confirm",
+  confirmed_entry_does_not_match_line: "the confirmed entry does not match this line's drug, batch or quantity",
+  entry_already_finalized: "this entry has already been closed",
+  no_working_entry_prepared: "the Schedule X working entry has not been prepared yet",
+  no_confirmed_entry: "no confirmed register entry to check the pharmacist against yet",
+  professional_archived: "the pharmacist named on the entry is no longer on the pharmacy's register of staff",
+  professional_of_another_store: "the pharmacist named on the entry belongs to another store",
+  not_a_registered_pharmacist: "the person named on the entry is not recorded as a registered pharmacist",
+  no_registration_number: "no Pharmacy Act registration number is recorded for that pharmacist",
+  registration_lapsed: "that pharmacist's registration does not cover this date",
+  registration_not_yet_valid: "that pharmacist's registration begins after this date",
+  prescription_not_linked: "no prescription is linked to this line",
+  prescription_not_of_this_pharmacy: "the linked prescription is not one of this pharmacy's",
+  prescription_archived: "the linked prescription has been archived",
+  substitution_not_permitted: "the prescription names a different product, and another preparation cannot be supplied in its place",
+  quantity_exceeds_authority: "more than the prescribed total, counting what was already supplied",
+  repeat_not_authorised: "the prescriber did not say it may be dispensed again",
+  repeat_interval_not_elapsed: "sooner than the stated interval allows",
+  remaining_authority_insufficient: "not enough of the prescription's total is left",
+  supply_supervision_outstanding: "choose the registered pharmacist supervising this supply and confirm the prescription note",
+  classification_not_recorded: "nobody has recorded this drug's Schedule X position",
+  schedule_c_intersection: "this drug is also in Schedule C, and that combination is not supported by the current Schedule X workflow",
+  schedule_c1_intersection: "this drug is also in Schedule C(1), and that combination is not supported by the current Schedule X workflow",
+  schedule_x_h1_intersection: "this regulatory combination is not supported by the current Schedule X workflow",
+  h1_working_entry_outstanding: "the Schedule H1 working entry for this line is not complete",
+  ndps_purview_applies: "this drug is recorded as falling within the NDPS Act, which this software does not handle",
+  ndps_purview_unresolved: "nobody has recorded whether this drug falls within the NDPS Act",
+  state_workflow_unavailable: "an additional Punjab drug-control workflow applies and is not supported",
+  state_position_not_recorded: "this drug's position under the Punjab notification is not recorded",
+  premises_state_not_recorded: "the pharmacy's premises State is not recorded"
+};
+
 function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
   gate: RegulatoryGate | undefined;
   scheme: RegulatoryScheme | null;
@@ -1021,9 +1241,12 @@ function RegulatoryLineState({ gate, scheme, productId, canClassify }: {
   if (!gate || gate === "clear") return null;
   const text = gate === "unresolved"
     ? (scheme === "punjab_restricted_supply" ? "Punjab restricted-supply position not recorded — not sellable until recorded" : "Classification unresolved — not sellable until recorded")
-    : gate === "prescription_required"
-      ? (scheme === "schedule_h1" ? "Schedule H1 — sold only on a prescription, with its separate H1 register entry" : "Schedule H — sold only on a prescription")
-      : workflowText(scheme);
+    : gate === "schedule_x_required"
+      // Phase 1M-D3-C2 — Schedule X is sellable by retail, and only with its whole rule 65 record.
+      ? "Schedule X — sold only on a prescription, from an accounted-for lot, with its entry written and signed in the bound Schedule X register"
+      : gate === "prescription_required"
+        ? (scheme === "schedule_h1" ? "Schedule H1 — sold only on a prescription, with its separate H1 register entry" : "Schedule H — sold only on a prescription")
+        : workflowText(scheme);
   return <small className={`regulatory-line regulatory-line--${gate}`} role="note">
     {text}
     {gate === "unresolved" && canClassify && <> · <Link to={`/app/products/${productId}`}>Classify</Link></>}
@@ -1038,7 +1261,7 @@ function workflowText(scheme: RegulatoryScheme | null): string {
   switch (scheme) {
     case "ndps_purview": return "Schedule H1 with an NDPS purview that applies or is not recorded — an unsupported NDPS-intersection workflow AUSHADHARTH does not support.";
     case "punjab_restricted_supply": return "This drug is subject to an additional Punjab drug-control workflow that AUSHADHARTH does not yet support.";
-    case "schedule_x": return "Schedule X dispensing requires the Schedule X workflow, which is not yet available.";
+    case "schedule_x": return "This Schedule X line is outside the supported retail path.";
     case "schedule_c":
     case "schedule_c1": return `${SCHEME_LABELS[scheme]} — its statutory record is not yet available, so it cannot be sold.`;
     default: return "Regulated — the statutory record it needs is not yet available.";

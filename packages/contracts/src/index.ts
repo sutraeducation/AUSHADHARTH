@@ -1429,7 +1429,15 @@ export const RegulatoryAnswerSchema = z.enum(["applies", "does_not_apply", "unkn
  * needs does not exist in this version (Schedule X, C, C(1), an NDPS-intersection H1 line, or the
  * Punjab State boundary). The scheme beside it says which.
  */
-export const RegulatoryGateSchema = z.enum(["clear", "prescription_required", "unresolved", "workflow_unavailable"]);
+export const RegulatoryGateSchema = z.enum([
+  "clear",
+  "prescription_required",
+  // Phase 1M-D3-C2: Schedule X — lawfully sellable by retail, and only with the whole rule 65
+  // Schedule X record. Never reported as "clear".
+  "schedule_x_required",
+  "unresolved",
+  "workflow_unavailable",
+]);
 
 /**
  * Phase 1M-B — why a line's prescription is not yet enough, as the Store Service judged it. The
@@ -1594,8 +1602,18 @@ export const SaleErrorCodeSchema = z.enum([
   "state_restricted_drug_workflow_not_available",
   // Phase 1M-C: the Punjab position, or the store's premises State, is not recorded.
   "state_regulatory_position_unresolved",
-  // Phase 1M-B: a Schedule X line; its workflow and rule 65(21) record are a later phase.
+  // Phase 1M-B: a Schedule X line outside the supported retail path. Narrowed in Phase 1M-D3-C2,
+  // which enables the prescription-based retail path.
   "schedule_x_workflow_not_available",
+  // Phase 1M-D3-C2: this Schedule X drug is recorded as within the NDPS Act. Unsupported combined
+  // workflow, not a statement that the sale is prohibited.
+  "schedule_x_ndps_purview_applies",
+  // Phase 1M-D3-C2: nobody has recorded whether this Schedule X drug falls within the NDPS Act.
+  // An unrecorded axis is not a cleared one.
+  "schedule_x_ndps_purview_unresolved",
+  // Phase 1M-D3-C2: Schedule X together with another schedule whose own register this software
+  // cannot write for a Schedule X supply. A product support boundary, not a legal prohibition.
+  "schedule_x_unsupported_intersecting_regime",
   // Phase 1M-B: a Schedule H supply without everything rule 65 asks; the issues name each one.
   "prescription_requirements_incomplete",
   // Phase 1M-B: no rule 65(3)(2) election is in force, so the supply has no book to be entered in.
@@ -3484,6 +3502,64 @@ export type ScheduleXRegister = z.infer<typeof ScheduleXRegisterSchema>;
 export type ConfirmScheduleXEntryRequest = z.infer<typeof ConfirmScheduleXEntryRequestSchema>;
 export type VoidScheduleXEntryRequest = z.infer<typeof VoidScheduleXEntryRequestSchema>;
 export type DuplicateCopyAttestationRequest = z.infer<typeof DuplicateCopyAttestationRequestSchema>;
+/**
+ * Phase 1M-D3-C2 — one Schedule X requirement's verdict, as the read-only preflight reports it.
+ *
+ * `notEstablished` and `unresolved` are kept apart because they need different actions from
+ * different people: something is recorded and does not support this supply, against nobody has
+ * recorded anything yet. `unsupported` is AUSHADHARTH's own boundary rather than a statutory
+ * refusal, and `overlayBlocked` names an independent axis that stops the supply however complete the
+ * Schedule X evidence is.
+ */
+export const ScheduleXPredicateVerdictSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("established") }),
+  z.object({ state: z.literal("not_established"), reason: z.string() }),
+  z.object({ state: z.literal("unresolved"), reason: z.string() }),
+  z.object({ state: z.literal("unsupported"), reason: z.string() }),
+  z.object({ state: z.literal("overlay_blocked"), axis: z.string(), reason: z.string() })
+]);
+
+/** One named requirement, the code its refusal carries, and its verdict. */
+export const ScheduleXNamedPredicateSchema = z.object({
+  predicate: z.string(),
+  code: z.string(),
+  verdict: ScheduleXPredicateVerdictSchema
+});
+
+/**
+ * One Schedule X Sale line's preflight.
+ *
+ * Identifiers only on the prescription side: no patient, no prescriber, no dose and no diagnosis. The
+ * screen does not need them to show what is outstanding, and the register is not the invoice.
+ */
+export const ScheduleXPreflightLineSchema = z.object({
+  saleLineId: z.string(),
+  lineNumber: z.number().int(),
+  productId: z.string(),
+  productDisplayName: z.string(),
+  batchId: z.string(),
+  batchNumber: z.string().nullable(),
+  quantityAtoms: z.number().int(),
+  prescriptionItemId: z.string().nullable(),
+  prescriptionReference: z.string().nullable(),
+  predicates: ScheduleXNamedPredicateSchema.array(),
+  /** Advisory only. Posting re-evaluates every predicate inside its own transaction. */
+  canAttemptPosting: z.boolean()
+});
+
+/**
+ * The Sale's Schedule X preflight. Read-only: it allocates nothing, writes nothing, attests nothing
+ * and authorizes nothing.
+ */
+export const ScheduleXPreflightSchema = z.object({
+  saleDocumentId: z.string(),
+  status: SaleStatusSchema,
+  businessDate: z.string(),
+  lines: ScheduleXPreflightLineSchema.array(),
+  /** Advisory only. */
+  canAttemptPosting: z.boolean()
+});
+
 export type DuplicateCopyAttestation = z.infer<typeof DuplicateCopyAttestationSchema>;
 export type ScheduleXPendingAnnotationOccasion = z.infer<
   typeof ScheduleXPendingAnnotationOccasionSchema
@@ -3508,3 +3584,7 @@ export type SupplierAuthority = z.infer<typeof SupplierAuthoritySchema>;
 export type SupplierAuthorityCoverage = z.infer<typeof SupplierAuthorityCoverageSchema>;
 export type SupplierAuthorities = z.infer<typeof SupplierAuthoritiesSchema>;
 export type RecordSupplierAuthorityRequest = z.infer<typeof RecordSupplierAuthorityRequestSchema>;
+export type ScheduleXPredicateVerdict = z.infer<typeof ScheduleXPredicateVerdictSchema>;
+export type ScheduleXNamedPredicate = z.infer<typeof ScheduleXNamedPredicateSchema>;
+export type ScheduleXPreflightLine = z.infer<typeof ScheduleXPreflightLineSchema>;
+export type ScheduleXPreflight = z.infer<typeof ScheduleXPreflightSchema>;

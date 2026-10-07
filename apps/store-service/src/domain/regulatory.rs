@@ -44,12 +44,16 @@ pub const SALE_GATING_SCHEMES: [&str; 5] = [
 
 /// The schemes whose statutory record this software cannot yet produce.
 ///
-/// Schedule X needs the duplicate prescription and the rule 65(21) register; Schedule C and C(1)
-/// need the rule 65(4)(1) register or memo particulars. None of them is satisfied by a prescription
-/// alone, so a sale that needs any of them is refused rather than posted without it. Schedule H is
-/// not here since Phase 1M-B, and Schedule H1 is not here since Phase 1M-C: both are gated on their
-/// prescription workflow, and H1 additionally on its separate rule 65(3)(1)(h) working entry.
-pub const WORKFLOW_PENDING_SCHEMES: [&str; 3] = ["schedule_x", "schedule_c", "schedule_c1"];
+/// Schedule C and C(1) need the rule 65(4)(1) register or memo particulars, which no prescription
+/// alone satisfies, so a sale that needs either is refused rather than posted without it.
+///
+/// Schedule H left this list in Phase 1M-B and Schedule H1 in Phase 1M-C, each gated on its own
+/// prescription workflow and H1 additionally on its separate rule 65(3)(1)(h) working entry.
+/// Schedule X leaves it in Phase 1M-D3-C2, gated on `SaleGate::ScheduleXRequired` — which is NOT
+/// the same as leaving the list for `Clear`. A Schedule X line now has its own path through the
+/// gate, because dropping it from here without one would let an X-only line fall past every branch
+/// below and come out `Clear`.
+pub const WORKFLOW_PENDING_SCHEMES: [&str; 2] = ["schedule_c", "schedule_c1"];
 
 /// Phase 1M-C — State-level regulatory axes, recorded like any other finding but kept apart from
 /// `SCHEMES` on purpose: they are not central schedules, they are not frozen into the version-1
@@ -159,6 +163,17 @@ pub enum SaleGate {
     /// supervision, with every rule 65 fact present — and for H1 the separate working entry too.
     /// Whether they are is the posting's question, not this one's.
     PrescriptionRequired,
+    /// Phase 1M-D3-C2 — Schedule X: everything `PrescriptionRequired` means, and more besides.
+    ///
+    /// On top of the prescription, rule 65(9)(a) wants it in duplicate with a copy retained,
+    /// rule 65(11)(c) wants the seller and the date noted on it, rule 65(21) wants the supply in the
+    /// bound, serially page numbered register signed by the supervising person, and the Forms want
+    /// the store's own Form 20-F authority for this very drug and a purchase from a licensed dealer
+    /// or manufacturer. Whether all of that is present is the posting's question, not this one's.
+    ///
+    /// This is deliberately a state of its own and never equivalent to `Clear`: an X line that
+    /// reached `Clear` would be an ordinary counter sale of a Schedule X drug.
+    ScheduleXRequired,
     /// Phase 1M-C — a combination this software does not support, although each part alone may be:
     /// `schedule_h1_ndps` is a Schedule H1 drug whose NDPS purview applies or is unknown. This is
     /// AUSHADHARTH's own unsupported-workflow boundary, not a requirement rule 65 states.
@@ -200,6 +215,54 @@ pub fn gate(product_kind: &str, resolved: &ResolvedRegulatory) -> SaleGate {
         return SaleGate::UnsupportedIntersection {
             reason: "schedule_h1_ndps",
         };
+    }
+    // Phase 1M-D3-C2: the same boundary for Schedule X, which until now never reached this far
+    // because Schedule X was refused by the pending-workflow loop above. NDPS is an independent
+    // axis: `applies` and `unknown` both refuse, and only an established `does_not_apply` passes.
+    // Nothing here decides anything about the narcotic regime itself.
+    //
+    // The two outcomes are named apart because they need different actions: an established NDPS
+    // purview is a drug this software does not handle, while an unrecorded one is a finding nobody
+    // has made yet. Reporting both as one code would tell the counter to do the wrong thing.
+    if resolved.answer("schedule_x") == Resolution::Applies {
+        match resolved.answer("ndps_purview") {
+            Resolution::Applies => {
+                return SaleGate::UnsupportedIntersection {
+                    reason: "schedule_x_ndps_applies",
+                };
+            }
+            Resolution::Unknown => {
+                return SaleGate::UnsupportedIntersection {
+                    reason: "schedule_x_ndps_unresolved",
+                };
+            }
+            Resolution::DoesNotApply => {}
+        }
+    }
+    // Phase 1M-D3-C2 — Schedule X ∩ Schedule H1 is UNSUPPORTED, and this is a structural limit
+    // rather than a policy choice.
+    //
+    // An H1 line owes its separate rule 65(3)(1)(h) working entry, and that entry is
+    // `prescription_h1_register_entries`, whose `supply_record_id` is NOT NULL and references the
+    // rule 65(3)(1) record. Rule 65(3)(1) governs the supply of a drug "other than those specified
+    // in Schedule X", so a Schedule X supply has no entry in that register — and therefore nothing
+    // for the H1 entry to point at. The H1 obligation cannot be discharged for such a line without
+    // a schema change, which is a new foundation this phase does not make.
+    //
+    // So it fails closed here, under its own name, rather than posting without an H1 record or
+    // writing a Schedule X supply into a register that excludes it. The database refuses it
+    // independently too: `sale_documents_h1_register_required` wants a finalized H1 entry that
+    // cannot exist.
+    if resolved.answer("schedule_x") == Resolution::Applies
+        && resolved.answer("schedule_h1") == Resolution::Applies
+    {
+        return SaleGate::UnsupportedIntersection {
+            reason: "schedule_x_h1",
+        };
+    }
+    // Schedule X before Schedule H, because its requirements include Schedule H's and then some.
+    if resolved.answer("schedule_x") == Resolution::Applies {
+        return SaleGate::ScheduleXRequired;
     }
     // Last, so an unsupported scheme or an unknown position always wins: a line that is both
     // Schedule H and Schedule C is held to Schedule C as well, and a supported H requirement never
@@ -797,11 +860,11 @@ mod tests {
         assert_eq!(gate("medicine", &resolved), SaleGate::PrescriptionRequired);
     }
 
-    /// A supported Schedule H requirement never cancels an unsupported one: H with C, H1 or X is
+    /// A supported Schedule H requirement never cancels an unsupported one: H with C or C(1) is
     /// held to the unsupported scheme.
     #[test]
     fn schedule_h_with_an_unsupported_scheme_stays_blocked_on_that_scheme() {
-        for other in ["schedule_x", "schedule_c", "schedule_c1"] {
+        for other in ["schedule_c", "schedule_c1"] {
             let mut resolved = all(Resolution::DoesNotApply);
             resolved.set("schedule_h", Resolution::Applies);
             resolved.set(other, Resolution::Applies);
@@ -811,6 +874,101 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    /// Phase 1M-D3-C2 — Schedule H with Schedule X is held to Schedule X, whose requirements include
+    /// Schedule H's and then some. It is never reduced to the plain prescription requirement, and
+    /// never to `Clear`.
+    #[test]
+    fn schedule_h_with_schedule_x_is_held_to_schedule_x() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_h", Resolution::Applies);
+        resolved.set("schedule_x", Resolution::Applies);
+        assert_eq!(gate("medicine", &resolved), SaleGate::ScheduleXRequired);
+    }
+
+    /// Phase 1M-D3-C2 — Schedule X with Schedule C or C(1) stays refused on the unsupported scheme.
+    /// The Schedule X retail path does not reach a drug whose manufacturer authority would be
+    /// Form 28-B, which this software does not support.
+    #[test]
+    fn schedule_x_with_schedule_c_stays_blocked_on_that_scheme() {
+        for other in ["schedule_c", "schedule_c1"] {
+            let mut resolved = all(Resolution::DoesNotApply);
+            resolved.set("schedule_x", Resolution::Applies);
+            resolved.set(other, Resolution::Applies);
+            assert_eq!(
+                gate("medicine", &resolved),
+                SaleGate::WorkflowUnavailable { scheme: other },
+                "{other}"
+            );
+        }
+    }
+
+    /// Phase 1M-D3-C2 — the NDPS axis for Schedule X, named apart for each outcome. An established
+    /// purview and an unrecorded one both refuse, and only `does_not_apply` reaches Schedule X.
+    #[test]
+    fn schedule_x_requires_the_ndps_purview_to_be_established_as_inapplicable() {
+        for (purview, expected) in [
+            (
+                Resolution::Applies,
+                SaleGate::UnsupportedIntersection {
+                    reason: "schedule_x_ndps_applies",
+                },
+            ),
+            (
+                Resolution::Unknown,
+                SaleGate::UnsupportedIntersection {
+                    reason: "schedule_x_ndps_unresolved",
+                },
+            ),
+            (Resolution::DoesNotApply, SaleGate::ScheduleXRequired),
+        ] {
+            let mut resolved = all(Resolution::DoesNotApply);
+            resolved.set("schedule_x", Resolution::Applies);
+            resolved.set("ndps_purview", purview);
+            assert_eq!(gate("medicine", &resolved), expected, "{purview:?}");
+        }
+    }
+
+    /// Phase 1M-D3-C2 — Schedule X with Schedule H1 is unsupported, and named as such.
+    ///
+    /// Not a policy preference: the rule 65(3)(1)(h) H1 working entry is bound by a NOT NULL foreign
+    /// key to the rule 65(3)(1) record, and rule 65(3)(1) excludes Schedule X, so the H1 obligation
+    /// has nothing to attach to for such a line. It fails closed until that is given a foundation.
+    #[test]
+    fn schedule_x_with_schedule_h1_is_an_unsupported_intersection() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_x", Resolution::Applies);
+        resolved.set("schedule_h1", Resolution::Applies);
+        assert_eq!(
+            gate("medicine", &resolved),
+            SaleGate::UnsupportedIntersection {
+                reason: "schedule_x_h1"
+            }
+        );
+        // And the NDPS boundary still outranks it, so an H1 drug within the NDPS Act is reported on
+        // the axis that matters most.
+        resolved.set("ndps_purview", Resolution::Applies);
+        assert_eq!(
+            gate("medicine", &resolved),
+            SaleGate::UnsupportedIntersection {
+                reason: "schedule_h1_ndps"
+            }
+        );
+    }
+
+    /// Phase 1M-D3-C2 — the hazard this phase was built to avoid. Schedule X left
+    /// `WORKFLOW_PENDING_SCHEMES`, and if it had left without a gate of its own an X-only line would
+    /// fall past every branch and come out `Clear` — an ordinary counter sale of a Schedule X drug.
+    #[test]
+    fn schedule_x_alone_is_never_clear() {
+        let mut resolved = all(Resolution::DoesNotApply);
+        resolved.set("schedule_x", Resolution::Applies);
+        let verdict = gate("medicine", &resolved);
+        assert_ne!(verdict, SaleGate::Clear);
+        assert_ne!(verdict, SaleGate::PrescriptionRequired);
+        assert_eq!(verdict, SaleGate::ScheduleXRequired);
+        assert!(!WORKFLOW_PENDING_SCHEMES.contains(&"schedule_x"));
     }
 
     /// Schedule H with any other schedule still unknown is unresolved, not merely prescription-bound.
@@ -993,6 +1151,9 @@ mod tests {
         );
         // The central snapshot never carries the State axis.
         assert!(!h1.to_snapshot_json().contains("punjab"));
+        // Phase 1M-D3-C2 — Schedule X now has a gate of its own, so it no longer masks the State
+        // axis the way the blanket refusal did. A Punjab-restricted Schedule X line is refused ON
+        // PUNJAB, which is the point: completing the Schedule X record never clears that boundary.
         let mut x = all(Resolution::DoesNotApply);
         x.set("schedule_x", Resolution::Applies);
         assert_eq!(
@@ -1001,9 +1162,35 @@ mod tests {
                 &x,
                 &punjab(StateAxisAnswer::Resolved(Resolution::Applies))
             ),
-            SaleGate::WorkflowUnavailable {
-                scheme: "schedule_x"
+            SaleGate::StateWorkflowUnavailable {
+                scheme: "punjab_restricted_supply"
             }
+        );
+        // An unrecorded Punjab position refuses a Schedule X medicine too.
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &x,
+                &punjab(StateAxisAnswer::Resolved(Resolution::Unknown))
+            ),
+            SaleGate::StateUnresolved {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        assert_eq!(
+            combined_gate("medicine", &x, &punjab(StateAxisAnswer::Undetermined)),
+            SaleGate::StateUnresolved {
+                scheme: "punjab_restricted_supply"
+            }
+        );
+        // And only with the State axis clear does Schedule X's own requirement stand alone.
+        assert_eq!(
+            combined_gate(
+                "medicine",
+                &x,
+                &punjab(StateAxisAnswer::Resolved(Resolution::DoesNotApply))
+            ),
+            SaleGate::ScheduleXRequired
         );
     }
 

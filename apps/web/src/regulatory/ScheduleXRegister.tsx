@@ -44,6 +44,26 @@ import {
  * software no safe rule for pages. And it never calls a click a signature: what it records is that a
  * named registered pharmacist did the physical acts, attested by the person who ticked the boxes.
  */
+/**
+ * Phase 1M-D3-C2 — the supplier particulars of rule 65(21)(b)(ii).
+ *
+ * The sub-rule asks for "Quantity received, if any, the name and address of the supplier and the
+ * number of the relevant licence held by the supplier" — particulars of what came IN. A supply entry
+ * records what went out, and `store_schedule_x_register_entries` forbids one from carrying any of
+ * them: its kind-coherence CHECK requires `supplier_name`, `supplier_address` and
+ * `supplier_licence_number` to be NULL on every supply row.
+ *
+ * So on a supply row these are not missing, they are not applicable, and saying "Not recorded" would
+ * send an operator looking for a particular that cannot exist there. The supplier behind the stock is
+ * on the RECEIPT entry for the purchase that brought the lot in.
+ */
+function receiptParticular(entry: ScheduleXRegisterEntry, value: string | null) {
+  if (entry.entryKind === "supply") {
+    return <span className="not-recorded" title="A receipt particular under rule 65(21)(b)(ii). A supply entry does not carry it; it is on the receipt entry for the purchase that brought this lot in.">—</span>;
+  }
+  return value ?? <span className="not-recorded">{NOT_RECORDED}</span>;
+}
+
 export function ScheduleXRegisterPage() {
   const auth = useAuth();
   const role = auth.status?.user?.role;
@@ -150,9 +170,9 @@ export function ScheduleXRegisterPage() {
                     <td data-label="Quantity">{entry.quantityPacks !== null ? `${entry.quantityPacks} packs` : "—"}<small>{entry.quantityAtoms} units</small></td>
                     <td data-label="Batch">{entry.batchNumber ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
                     <td data-label="Manufacturer" className="cell-wide">{entry.manufacturerName ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
-                    <td data-label="Supplier" className="cell-wide">{entry.supplierName ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
-                    <td data-label="Supplier address" className="cell-wide">{entry.supplierAddress ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
-                    <td data-label="Supplier licence">{entry.supplierLicenceNumber ?? <span className="not-recorded">{NOT_RECORDED}</span>}</td>
+                    <td data-label="Supplier" className="cell-wide">{receiptParticular(entry, entry.supplierName)}</td>
+                    <td data-label="Supplier address" className="cell-wide">{receiptParticular(entry, entry.supplierAddress)}</td>
+                    <td data-label="Supplier licence">{receiptParticular(entry, entry.supplierLicenceNumber)}</td>
                     <td data-label="Bill">{entry.billNumber ?? <span className="not-recorded">{NOT_RECORDED}</span>}<small>{entry.billDate ?? ""}</small></td>
                     <td data-label="Physical register" className="cell-status">
                       <span className={`status-badge status-badge--${entry.status === "finalized" ? "posted" : entry.status === "void" ? "void" : "draft"}`}>{SCHEDULE_X_STATUS_LABELS[entry.status]}</span>

@@ -5205,6 +5205,150 @@ async fn pharmacist_over_http(service: &Service, world: &SaleWorld) -> String {
         .to_owned()
 }
 
+/// A veterinary prescription for the world's product: `subject_kind = animal` with the ANIMAL
+/// OWNER's name and address, which is exactly what rule 65(10)(b) asks for and all it asks for.
+async fn animal_prescription_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    atoms: i64,
+) -> (String, String) {
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/prescriptions",
+        Some(json!({
+            "prescribedOn": "2026-09-10",
+            "prescriberId": Value::Null,
+            "prescriberName": "Dr. Anjali Rao",
+            "prescriberAddress": "Rao Veterinary Clinic, FC Road, Pune 411005",
+            "subjectKind": "animal",
+            "subjectName": "Ramesh Patil",
+            "subjectAddress": "22 Shivaji Nagar, Pune 411005",
+            "repeatAuthority": "once",
+            "writtenSignedDatedAttested": true,
+            "items": [{
+                "productId": world.product,
+                "writtenDescription": "Tab. as prescribed",
+                "prescribedQuantityAtoms": atoms,
+                "doseText": "1 tablet twice daily",
+            }],
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let prescription = created.body["id"].as_str().expect("id").to_owned();
+    let item = created.body["items"][0]["id"]
+        .as_str()
+        .expect("item")
+        .to_owned();
+    (prescription, item)
+}
+
+/// A lot of the world's Schedule X product whose sellable stock arrived on a COUNTED SHELF.
+///
+/// No purchase, therefore no Schedule X receipt working entry, therefore nothing rule 65(21) can
+/// account for. This is the shape legacy stock has, and the shape a lot takes when goods are
+/// released back into the sellable balance by any route other than a qualifying purchase.
+async fn counted_lot_over_http(service: &Service, world: &SaleWorld) -> String {
+    let batch = call(
+        service,
+        "POST",
+        &format!("/api/v1/packs/{}/batches", world.pack),
+        Some(json!({
+            "batchNumber": "BX-COUNTED", "expiresOn": "2028-03-31", "mrpPaise": 9550
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(batch.status, 201, "{:?}", batch.body);
+    let batch_id = batch.body["id"].as_str().expect("batch id").to_owned();
+    let counted = run_operation(
+        service,
+        &world.cookie,
+        "physical_count",
+        json!({
+            "productPackId": world.pack, "batchId": batch_id, "stockStatus": "sellable",
+            "reasonCode": "physical_count_gain", "countedQuantity": 100,
+            "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(counted.status, 200, "{:?}", counted.body);
+    batch_id
+}
+
+/// A prescription whose repeat authority is whatever the prescriber wrote.
+async fn repeatable_prescription_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    atoms: i64,
+    repeat: Value,
+) -> (String, String) {
+    let mut body = json!({
+        "prescribedOn": "2026-09-10",
+        "prescriberId": Value::Null,
+        "prescriberName": "Dr. Anjali Rao",
+        "prescriberAddress": "Rao Clinic, FC Road, Pune 411005",
+        "subjectKind": "human",
+        "subjectName": "Sita Kulkarni",
+        "subjectAddress": "14 Lakshmi Road, Pune 411004",
+        "writtenSignedDatedAttested": true,
+        "items": [{
+            "productId": world.product,
+            "writtenDescription": "Tab. as prescribed",
+            "prescribedQuantityAtoms": atoms,
+            "doseText": "1 tablet twice daily",
+        }],
+    });
+    for (key, value) in repeat.as_object().expect("repeat object") {
+        body[key] = value.clone();
+    }
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/prescriptions",
+        Some(body),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let prescription = created.body["id"].as_str().expect("id").to_owned();
+    let item = created.body["items"][0]["id"]
+        .as_str()
+        .expect("item")
+        .to_owned();
+    (prescription, item)
+}
+
+/// A second registered pharmacist, distinct from `pharmacist_over_http`'s.
+///
+/// Rule 65(2) is asked twice of a Schedule X supply: of the pharmacist supervising the supply, and of
+/// the one named on the rule 65(21) working entry. They are usually the same person, and when they
+/// are, the supply-level answer comes first. Two people are needed to reach the entry-level predicate
+/// on its own.
+async fn second_pharmacist_over_http(service: &Service, world: &SaleWorld) -> String {
+    let professional = call(
+        service,
+        "POST",
+        "/api/v1/store/professionals",
+        Some(json!({
+            "fullName": "Arun Deshpande",
+            "capacity": "registered_pharmacist",
+            "registrationNumber": "MH-PH-51907",
+            "registeringAuthority": "Maharashtra State Pharmacy Council",
+            "validFrom": "2020-01-01",
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(professional.status, 201, "{:?}", professional.body);
+    professional.body["id"]
+        .as_str()
+        .expect("professional id")
+        .to_owned()
+}
+
 /// Enters a prescription for the world's product and returns (prescription, item).
 async fn prescription_over_http(
     service: &Service,
@@ -5665,7 +5809,10 @@ async fn real_service_keeps_schedule_h1_and_x_refused_with_a_complete_prescripti
             &["schedule_h", "schedule_h1"][..],
             "schedule_h1_ndps_workflow_not_available",
         ),
-        (&["schedule_x"][..], "schedule_x_workflow_not_available"),
+        // Phase 1M-D3-C2 — the Schedule X retail path now exists, so a complete prescription is
+        // refused on the independent axis this fixture leaves unrecorded rather than on a missing
+        // workflow. The point of the case is unchanged: a prescription alone is not enough.
+        (&["schedule_x"][..], "schedule_x_ndps_purview_unresolved"),
     ] {
         let service = start().await;
         let world = seed_sale_world(&service, 1).await;
@@ -6745,6 +6892,9 @@ async fn real_service_keeps_schedule_x_refused_with_established_form_20f_authori
     let service = start().await;
     let world = seed_sale_world(&service, 1).await;
     schedule_over_http(&service, &world, &["schedule_x"]).await;
+    // Phase 1M-D3-C2: the independent NDPS axis, established not to apply, so this test reaches
+    // the Schedule X predicate it is actually about instead of stopping at an unrecorded overlay.
+    finding_over_http(&service, &world, "ndps_purview", false).await;
     record_basis_over_http(&service, &world, Some("prescription_register")).await;
     let professional = pharmacist_over_http(&service, &world).await;
     let (_, item) = prescription_over_http(&service, &world, None, 20).await;
@@ -6775,7 +6925,11 @@ async fn real_service_keeps_schedule_x_refused_with_established_form_20f_authori
         prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
     let unprepared = prepare_entry_over_http(&service, &world, &sale_id, sale_revision).await;
     assert_eq!(unprepared.status, 409, "{:?}", unprepared.body);
-    assert_eq!(unprepared.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(
+        unprepared.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        unprepared.body
+    );
     let refused = post_quoted_over_http(
         &service,
         &world,
@@ -6785,8 +6939,34 @@ async fn real_service_keeps_schedule_x_refused_with_established_form_20f_authori
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
-    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+    assert_eq!(
+        refused.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        refused.body
+    );
+    // Exactly the Schedule X predicates this phase had not yet established, and no others. Every
+    // unmet predicate is reported together so the counter can clear them in one pass.
+    assert_eq!(
+        schedule_x_unmet(&refused.body),
+        vec![
+            "schedule_x_lot_provenance_incomplete",
+            "schedule_x_source_authority_missing",
+            "schedule_x_duplicate_copy_evidence_missing",
+            "schedule_x_prescription_annotation_missing",
+            "schedule_x_register_confirmation_missing",
+            "schedule_x_supervising_pharmacist_invalid",
+        ],
+        "{:?}",
+        refused.body
+    );
+    // The field still names the offending line, and now the predicate on it as well.
+    assert!(
+        refused.body["issues"][0]["field"]
+            .as_str()
+            .is_some_and(|field| field.starts_with("lines.1.")),
+        "{:?}",
+        refused.body
+    );
 
     let detail = call(
         &service,
@@ -8134,6 +8314,9 @@ async fn real_service_keeps_schedule_x_sales_refused_after_the_register_foundati
     let service = start().await;
     let world = seed_sale_world(&service, 1).await;
     schedule_over_http(&service, &world, &["schedule_x"]).await;
+    // Phase 1M-D3-C2: the independent NDPS axis, established not to apply, so this test reaches
+    // the Schedule X predicate it is actually about instead of stopping at an unrecorded overlay.
+    finding_over_http(&service, &world, "ndps_purview", false).await;
     record_basis_over_http(&service, &world, Some("prescription_register")).await;
     let professional = pharmacist_over_http(&service, &world).await;
     let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
@@ -8170,7 +8353,11 @@ async fn real_service_keeps_schedule_x_sales_refused_after_the_register_foundati
         prepared_sale_over_http(&service, &world, &item, &professional, 1).await;
     let unprepared = prepare_entry_over_http(&service, &world, &sale_id, sale_revision).await;
     assert_eq!(unprepared.status, 409, "{:?}", unprepared.body);
-    assert_eq!(unprepared.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(
+        unprepared.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        unprepared.body
+    );
     let refused = post_quoted_over_http(
         &service,
         &world,
@@ -8180,7 +8367,25 @@ async fn real_service_keeps_schedule_x_sales_refused_after_the_register_foundati
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    assert_eq!(
+        refused.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        refused.body
+    );
+    // Exactly the Schedule X predicates this phase had not yet established, and no others. Every
+    // unmet predicate is reported together so the counter can clear them in one pass.
+    assert_eq!(
+        schedule_x_unmet(&refused.body),
+        vec![
+            "schedule_x_lot_provenance_incomplete",
+            "schedule_x_source_authority_missing",
+            "schedule_x_prescription_annotation_missing",
+            "schedule_x_register_confirmation_missing",
+            "schedule_x_supervising_pharmacist_invalid",
+        ],
+        "{:?}",
+        refused.body
+    );
 
     let detail = call(
         &service,
@@ -8319,9 +8524,24 @@ async fn real_service_allocates_distinct_schedule_x_references_under_a_race_over
             Some(&world.cookie),
         )
     );
+    // Phase 1M-D3-C2 — this assertion used to require that exactly one of the two requests returned
+    // 200, which is not an invariant of the lifecycle and made the test non-deterministic. A void is
+    // reachable from `prepared` AND from `confirmed` (migration 0028, unchanged by 0030), so when
+    // the confirmation serializes first BOTH requests legitimately succeed and the entry passes
+    // through confirmed on its way to void. Measured on this machine, the old assertion failed on
+    // roughly one run in four.
+    //
+    // The valid serialization outcomes are enumerated instead, and the invariant is proved from the
+    // database below rather than from HTTP status codes:
+    //
+    //   void first     void 200, confirmation refused   -> void, never confirmed
+    //   confirm first  both 200                         -> void, having been confirmed
+    //
+    // Either way at least one request lands, neither can finalize anything, and the entry is left
+    // in exactly one state with its reference intact.
     assert!(
-        (confirmed.status == 200) ^ (voided.status == 200),
-        "both or neither won: confirm={:?} void={:?}",
+        confirmed.status == 200 || voided.status == 200,
+        "neither won: confirm={:?} void={:?}",
         confirmed.body,
         voided.body
     );
@@ -8329,16 +8549,38 @@ async fn real_service_allocates_distinct_schedule_x_references_under_a_race_over
     let pool = database::connect(&service.database_path)
         .await
         .expect("database");
-    let status: String =
-        sqlx::query_scalar("SELECT status FROM store_schedule_x_register_entries WHERE id=?")
-            .bind(&entry_id)
-            .fetch_one(&pool)
-            .await
-            .expect("status");
-    if confirmed.status == 200 {
-        assert_eq!(status, "confirmed");
-    } else {
+    let (status, void_reason, confirmed_at, finalized_at): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status,void_reason,confirmed_at_utc,finalized_at_utc \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("status");
+    // Whichever way the two serialized, the entry can never have been finalized: neither a
+    // confirmation nor a void closes a working record.
+    assert_eq!(finalized_at, None, "the race finalized an entry");
+    if voided.status == 200 {
+        // The void landed, from `prepared` or from `confirmed`, and carries its reason.
         assert_eq!(status, "void");
+        assert!(void_reason.is_some(), "a void without a reason");
+        // And it records truthfully whether the confirmation had already happened.
+        assert_eq!(
+            confirmed_at.is_some(),
+            confirmed.status == 200,
+            "confirmation history disagrees with the confirmation result"
+        );
+    } else {
+        // The void was refused, so the confirmation is what stands.
+        assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+        assert_eq!(status, "confirmed");
+        assert_eq!(void_reason, None);
+        assert!(confirmed_at.is_some());
     }
     // Exactly one row, in exactly one state, with its reference intact.
     let rows: i64 =
@@ -9071,6 +9313,9 @@ async fn real_service_keeps_schedule_x_refused_with_every_d3a_fact_present_over_
     let service = start().await;
     let world = seed_sale_world(&service, 1).await;
     schedule_over_http(&service, &world, &["schedule_x"]).await;
+    // Phase 1M-D3-C2: the independent NDPS axis, established not to apply, so this test reaches
+    // the Schedule X predicate it is actually about instead of stopping at an unrecorded overlay.
+    finding_over_http(&service, &world, "ndps_purview", false).await;
     record_basis_over_http(&service, &world, Some("prescription_register")).await;
     let professional = pharmacist_over_http(&service, &world).await;
 
@@ -9162,8 +9407,32 @@ async fn real_service_keeps_schedule_x_refused_with_every_d3a_fact_present_over_
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
-    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+    assert_eq!(
+        refused.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        refused.body
+    );
+    // Exactly the Schedule X predicates this phase had not yet established, and no others. Every
+    // unmet predicate is reported together so the counter can clear them in one pass.
+    assert_eq!(
+        schedule_x_unmet(&refused.body),
+        vec![
+            "schedule_x_lot_provenance_incomplete",
+            "schedule_x_source_authority_missing",
+            "schedule_x_register_confirmation_missing",
+            "schedule_x_supervising_pharmacist_invalid",
+        ],
+        "{:?}",
+        refused.body
+    );
+    // The field still names the offending line, and now the predicate on it as well.
+    assert!(
+        refused.body["issues"][0]["field"]
+            .as_str()
+            .is_some_and(|field| field.starts_with("lines.1.")),
+        "{:?}",
+        refused.body
+    );
 
     // The Sale is still a draft, with no number, no stock movement, no dispensing, and no supply
     // entry anywhere in the Schedule X register.
@@ -9802,6 +10071,9 @@ async fn real_service_keeps_schedule_x_refused_with_every_d3b_fact_present_over_
     let service = start().await;
     let world = seed_sale_world(&service, 1).await;
     schedule_over_http(&service, &world, &["schedule_x"]).await;
+    // Phase 1M-D3-C2: the independent NDPS axis, established not to apply, so this test reaches
+    // the Schedule X predicate it is actually about instead of stopping at an unrecorded overlay.
+    finding_over_http(&service, &world, "ndps_purview", false).await;
     record_basis_over_http(&service, &world, Some("prescription_register")).await;
     let professional = pharmacist_over_http(&service, &world).await;
 
@@ -9870,8 +10142,27 @@ async fn real_service_keeps_schedule_x_refused_with_every_d3b_fact_present_over_
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
-    assert_eq!(refused.body["issues"][0]["field"], "lines.1");
+    assert_eq!(
+        refused.body["code"], "prescription_requirements_incomplete",
+        "{:?}",
+        refused.body
+    );
+    // Exactly the Schedule X predicates this phase had not yet established, and no others. Every
+    // unmet predicate is reported together so the counter can clear them in one pass.
+    assert_eq!(
+        schedule_x_unmet(&refused.body),
+        vec!["schedule_x_source_authority_missing",],
+        "{:?}",
+        refused.body
+    );
+    // The field still names the offending line, and now the predicate on it as well.
+    assert!(
+        refused.body["issues"][0]["field"]
+            .as_str()
+            .is_some_and(|field| field.starts_with("lines.1.")),
+        "{:?}",
+        refused.body
+    );
 
     let detail = call(
         &service,
@@ -10510,11 +10801,18 @@ async fn real_service_reports_supplier_authority_beside_the_lot_verdict_over_htt
     }
 }
 
-/// D3C1-5, item 35 — THE HARD SCHEDULE X BOUNDARY, with supplier authority added.
+/// Phase 1M-D3-C2, item 29 case 15 — NDPS UNRESOLVED REFUSES A SCHEDULE X SALE.
 ///
-/// Every favourable fact this software can now record exists, including documentary evidence that
-/// the purchase source held Schedule X authority covering the drug on the purchase date. The sale
-/// is still refused: evidence is not an authority to dispense.
+/// This test began in Phase 1M-D3-C1 proving that a complete Schedule X evidence chain was still
+/// refused, because no Schedule X Sale could post at all. Phase 1M-D3-C2 enables that chain, and
+/// `real_service_posts_a_fully_supported_schedule_x_retail_sale_over_http` is the conversion of this
+/// very fixture to a successful posting.
+///
+/// What is left here is the one fact that fixture adds and this one deliberately does not: the NDPS
+/// purview. Every Schedule X predicate below is favourable — Form 20-F authority and coverage, a
+/// qualified lot, the source's authority, the duplicate copy, the rule 65(11)(c) annotation, the
+/// confirmed physical register entry — and the supply is STILL refused, because nobody has recorded
+/// whether this drug falls within the NDPS Act. An unrecorded axis is not a cleared one.
 #[tokio::test]
 async fn real_service_keeps_schedule_x_refused_with_every_d3c1_fact_present_over_http() {
     let service = start().await;
@@ -10598,7 +10896,8 @@ async fn real_service_keeps_schedule_x_refused_with_every_d3c1_fact_present_over
     )
     .await;
     assert_eq!(refused.status, 409, "{:?}", refused.body);
-    assert_eq!(refused.body["code"], "schedule_x_workflow_not_available");
+    // Named for the axis that is actually unresolved, not for a workflow that now exists.
+    assert_eq!(refused.body["code"], "schedule_x_ndps_purview_unresolved");
     assert_eq!(refused.body["issues"][0]["field"], "lines.1");
 
     let detail = call(
@@ -10789,4 +11088,3676 @@ async fn real_service_carries_supplier_authority_through_backup_and_restore_over
         "the restored database lost its no-delete guard"
     );
     reopened.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 1 — THE SUPPORTED SCHEDULE X RETAIL SALE POSTS.
+///
+/// Every predicate of the first supported path is established: the store's own Form 20-F retail
+/// authority with this very drug named on it, a lot whose whole sellable balance arrived on a posted
+/// purchase with an authenticated D2 receipt, documentary evidence that the purchase source held
+/// Schedule X authority covering the drug on the invoice date, a prescription in duplicate with the
+/// retained copy attested, the rule 65(11)(c) seller-and-date annotation, a registered pharmacist
+/// supervising, the rule 65(21) working entry written into the bound physical register and
+/// authenticated by hand, and the NDPS purview established NOT to apply.
+///
+/// This is the first Schedule X Sale AUSHADHARTH has ever posted. Everything the register, the
+/// dispensing and the bill particulars must carry is asserted from the database afterwards, not from
+/// the response.
+#[tokio::test]
+async fn real_service_posts_a_fully_supported_schedule_x_retail_sale_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    // The independent NDPS axis, established not to apply. Without this the supply is refused, and
+    // a test that left it out would never reach the Schedule X predicates at all.
+    finding_over_http(&service, &world, "ndps_purview", false).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    authorise_supplier_over_http(&service, &world).await;
+
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, sale_revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let entry_reference = prepared.body["reference"]
+        .as_str()
+        .expect("reference")
+        .to_owned();
+
+    // The physical act, then the record of it. Both attestations together; neither is prechecked.
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // AND IT POSTS.
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-00000000030a",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["status"], "posted");
+    let document_number = posted.body["documentNumber"]
+        .as_str()
+        .expect("documentNumber")
+        .to_owned();
+    assert!(!document_number.is_empty());
+
+    // ---------------------------------------------------------------------------------------------
+    // The durable state, read from the database rather than believed from the response.
+    // ---------------------------------------------------------------------------------------------
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+
+    let (status, number, business_date): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT status,document_number,business_date FROM sale_documents WHERE id=?",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("sale");
+    assert_eq!(status, "posted");
+    assert_eq!(number.as_deref(), Some(document_number.as_str()));
+
+    // Exactly one document number, and exactly one dispensing for the line.
+    let dispensings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM prescription_dispensings WHERE sale_line_id=?")
+            .bind(&line_id)
+            .fetch_one(&pool)
+            .await
+            .expect("dispensings");
+    assert_eq!(dispensings, 1);
+
+    // The inventory outflow exists, is negative, and names the lot.
+    let (outflow, moved_batch): (i64, String) = sqlx::query_as(
+        "SELECT quantity_delta_atoms,batch_id FROM inventory_movements \
+         WHERE movement_type='sale' AND sale_line_id=?",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("outflow");
+    assert!(outflow < 0, "outflow was {outflow}");
+    assert_eq!(moved_batch, batch);
+
+    // The rule 65(21) entry: finalized, bound to this dispensing, carrying the bill particulars,
+    // with both physical attestations still recorded and nothing else disturbed.
+    #[derive(sqlx::FromRow)]
+    struct FinalEntry {
+        status: String,
+        dispensing_id: Option<String>,
+        bill_number: Option<String>,
+        bill_date: Option<String>,
+        particulars_entered_in_physical_register: i64,
+        physical_entry_authenticated: i64,
+        reference: String,
+        batch_id: Option<String>,
+        finalized_at_utc: Option<String>,
+    }
+    let entry: FinalEntry = sqlx::query_as(
+        "SELECT status,dispensing_id,bill_number,bill_date,\
+         particulars_entered_in_physical_register,physical_entry_authenticated,reference,\
+         batch_id,finalized_at_utc \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry.status, "finalized");
+    assert_eq!(entry.reference, entry_reference);
+    assert_eq!(entry.batch_id.as_deref(), Some(batch.as_str()));
+    assert_eq!(entry.particulars_entered_in_physical_register, 1);
+    assert_eq!(entry.physical_entry_authenticated, 1);
+    assert!(entry.finalized_at_utc.is_some());
+    // Rule 65(21)(b)(ix): the bill number and date of the supply, which are the Sale's own.
+    assert_eq!(entry.bill_number.as_deref(), Some(document_number.as_str()));
+    assert_eq!(entry.bill_date.as_deref(), Some(business_date.as_str()));
+    // Bound to the dispensing of this very line.
+    let bound: String =
+        sqlx::query_scalar("SELECT sale_line_id FROM prescription_dispensings WHERE id=?")
+            .bind(entry.dispensing_id.as_deref().expect("dispensing_id"))
+            .fetch_one(&pool)
+            .await
+            .expect("bound dispensing");
+    assert_eq!(bound, line_id);
+
+    // No duplicate Schedule X supply entry for the line, and nothing left prepared or confirmed.
+    let supply_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE sale_line_id=? AND entry_kind='supply'",
+    )
+    .bind(&line_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(supply_entries, 1);
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+         WHERE sale_document_id=? AND status IN ('prepared','confirmed')",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("live count");
+    assert_eq!(live, 0);
+
+    // Rule 65(3)(1) excludes Schedule X by its own opening words: no generic prescription-register
+    // record was created for this supply.
+    let generic: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prescription_supply_records WHERE sale_document_id=?",
+    )
+    .bind(&sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("generic records");
+    assert_eq!(
+        generic, 0,
+        "a Schedule X supply was entered in the rule 65(3) register"
+    );
+
+    // The audit records the finalization against the entry, with identifiers and states only.
+    let audited: Vec<String> = sqlx::query_scalar(
+        "SELECT change_payload FROM master_change_events \
+         WHERE entity_type='schedule_x_register_entry' AND entity_id=? AND action='posted'",
+    )
+    .bind(&entry_id)
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    let payload = &audited[0];
+    assert!(payload.contains("finalized"), "{payload}");
+    // No patient, prescriber or medical particular in a generic audit payload.
+    let lowered = payload.to_lowercase();
+    for forbidden in ["address", "prescriber", "diagnos", "dose", "patient"] {
+        assert!(
+            !lowered.contains(forbidden),
+            "{forbidden} in audit: {payload}"
+        );
+    }
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2 — every unmet Schedule X predicate a structured refusal names, in the order the
+/// service reports them, with the `lines.N.` prefix removed.
+fn schedule_x_unmet(body: &Value) -> Vec<String> {
+    body["issues"]
+        .as_array()
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| issue["field"].as_str())
+                .filter_map(|field| field.rsplit_once('.').map(|(_, code)| code.to_owned()))
+                .filter(|code| code.starts_with("schedule_x_"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Phase 1M-D3-C2, item 29 cases 24 and 25 — A FAILED POSTING LEAVES THE PAPER TRUTHFUL.
+///
+/// The whole supported chain is established and the physical register entry is written and signed,
+/// then the posting is made to fail by taking the lot's stock away underneath it. What must survive
+/// is exactly one thing: the confirmed working entry, because the pharmacist's signature is on a
+/// page of a bound register and a transaction cannot un-sign it.
+///
+/// Everything else must be gone — no posted document, no document number consumed, no dispensing, no
+/// stock movement, no tender, and above all no FINALIZED Schedule X entry with a bill number for a
+/// bill that was never issued.
+#[tokio::test]
+async fn real_service_rolls_a_failed_schedule_x_posting_back_to_a_confirmed_entry_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    finding_over_http(&service, &world, "ndps_purview", false).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    authorise_supplier_over_http(&service, &world).await;
+
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, sale_revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // The paper is signed. Now the stock goes away underneath the posting: a stock removal of the
+    // whole lot, which is an ordinary thing another terminal might do between the signature and the
+    // Post Sale press.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let available: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity_delta_atoms),0) FROM inventory_movements \
+         WHERE batch_id=? AND stock_status='sellable'",
+    )
+    .bind(&batch)
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert!(available > 0, "nothing to remove");
+    let number_before: Option<i64> = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("series");
+    sqlx::query(
+        "INSERT INTO inventory_movements (id,store_id,product_id,product_pack_id,batch_id,\
+         movement_type,stock_status,quantity_delta_atoms,occurred_on,reason,idempotency_key,\
+         posted_by_user_id,posted_at_utc) \
+         SELECT ?,store_id,product_id,product_pack_id,batch_id,'adjustment','sellable',?,\
+         occurred_on,'drawn down for the rollback case',?,posted_by_user_id,posted_at_utc \
+         FROM inventory_movements WHERE batch_id=? AND movement_type='purchase' LIMIT 1",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(-available)
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&batch)
+    .execute(&pool)
+    .await
+    .expect("removal");
+
+    // The posting now fails on availability, after every Schedule X predicate was satisfied.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-00000000031b",
+    )
+    .await;
+    assert_ne!(refused.status, 200, "{:?}", refused.body);
+
+    // ---------------------------------------------------------------------------------------------
+    // Nothing durable survived, and the entry is still truthfully confirmed.
+    // ---------------------------------------------------------------------------------------------
+    let (status, document_number): (String, Option<String>) =
+        sqlx::query_as("SELECT status,document_number FROM sale_documents WHERE id=?")
+            .bind(&sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("sale");
+    assert_eq!(status, "draft");
+    assert_eq!(document_number, None);
+
+    // The invoice series was not consumed.
+    let number_after: Option<i64> = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("series");
+    assert_eq!(
+        number_after, number_before,
+        "an invoice number was consumed"
+    );
+
+    for (what, sql) in [
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "outward movement",
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+             AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "{what} survived a failed posting");
+    }
+
+    // The Schedule X entry: still confirmed, never finalized, and with none of the three posting
+    // bindings written. A bill number here would name a bill that does not exist.
+    #[derive(sqlx::FromRow)]
+    struct AfterFailure {
+        status: String,
+        dispensing_id: Option<String>,
+        bill_number: Option<String>,
+        bill_date: Option<String>,
+        finalized_at_utc: Option<String>,
+        particulars_entered_in_physical_register: i64,
+        physical_entry_authenticated: i64,
+    }
+    let entry: AfterFailure = sqlx::query_as(
+        "SELECT status,dispensing_id,bill_number,bill_date,finalized_at_utc,\
+         particulars_entered_in_physical_register,physical_entry_authenticated \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry.status, "confirmed");
+    assert_eq!(entry.dispensing_id, None);
+    assert_eq!(entry.bill_number, None);
+    assert_eq!(entry.bill_date, None);
+    assert_eq!(entry.finalized_at_utc, None);
+    // The signature is still recorded, because it was really made.
+    assert_eq!(entry.particulars_entered_in_physical_register, 1);
+    assert_eq!(entry.physical_entry_authenticated, 1);
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 28 — THE DATABASE REFUSES EVERY DIRECT-SQL BYPASS.
+///
+/// The service is not the only thing standing between an under-evidenced Schedule X supply and a
+/// posted Sale. Every attempt below goes straight at the tables with SQL, with no service code in
+/// the way, and every one of them is refused by a trigger or a constraint.
+///
+/// Where a predicate rests on something outside any database — a page of a bound register, a
+/// pharmacist's signature, a retained sheet of paper — what is refused here is an attempt to claim
+/// the ATTESTATION AND LINKAGE without it. No trigger pretends to have inspected the physical world.
+#[tokio::test]
+async fn real_service_refuses_every_direct_sql_schedule_x_bypass_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    schedule_over_http(&service, &world, &["schedule_x"]).await;
+    finding_over_http(&service, &world, "ndps_purview", false).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    authorise_supplier_over_http(&service, &world).await;
+
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, sale_revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(&service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let prepared = prepare_supply_over_http(&service, &world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+
+    // Every statement below must be refused. The message each trigger raises is asserted so a later
+    // change cannot quietly move a refusal to a different, weaker guard.
+    async fn refuses(pool: &sqlx::SqlitePool, what: &str, statement: &str, expected: &str) {
+        let error = sqlx::query(statement)
+            .execute(pool)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("ACCEPTED a statement it must refuse — {what}: {statement}"))
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "{what}: expected {expected}, got {error}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // While the entry is only PREPARED: none of the three posting bindings may be written, and the
+    // entry may not jump straight to finalized.
+    // ---------------------------------------------------------------------------------------------
+    refuses(
+        &pool,
+        "bill number written while prepared",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET bill_number='INV/2026-27/0001' \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "bill date written while prepared",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET bill_date='2026-05-04' \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "prepared jumped straight to finalized",
+        &format!(
+            "UPDATE store_schedule_x_register_entries \
+             SET status='finalized',finalized_at_utc='2026-05-04T06:00:00.000Z' \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    // Setting one attestation without the other would also break the table's own CHECK that keeps
+    // the pair equal, but SQLite runs a BEFORE trigger ahead of CHECK evaluation, so the transition
+    // guard is what answers. Either way the pair cannot be forced apart.
+    refuses(
+        &pool,
+        "attestation flags forced apart",
+        &format!(
+            "UPDATE store_schedule_x_register_entries \
+             SET particulars_entered_in_physical_register=1 WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "the lot was swapped",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET batch_id=NULL WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "the entry was deleted",
+        &format!("DELETE FROM store_schedule_x_register_entries WHERE id='{entry_id}'"),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    // And the Sale cannot be posted while the entry is only prepared.
+    refuses(
+        &pool,
+        "posted with a prepared entry outstanding",
+        &format!("UPDATE sale_documents SET status='posted' WHERE id='{sale_id}'"),
+        "schedule_x_register_entry_missing",
+    )
+    .await;
+
+    // ---------------------------------------------------------------------------------------------
+    // Now CONFIRMED: the physical page is written and signed. Still none of the three bindings may
+    // be written outside finalization, and finalization still needs all three.
+    // ---------------------------------------------------------------------------------------------
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    refuses(
+        &pool,
+        "bill number written while merely confirmed",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET bill_number='INV/2026-27/0001' \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "finalized with no dispensing and no bill particulars",
+        &format!(
+            "UPDATE store_schedule_x_register_entries \
+             SET status='finalized',finalized_at_utc='2026-05-04T06:00:00.000Z',\
+                 finalized_by_user_id=(SELECT id FROM users WHERE role='owner_admin' LIMIT 1) \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    // A confirmed entry is still not a posted Sale: the Sale needs the entry FINALIZED, which only
+    // the posting transaction can do.
+    refuses(
+        &pool,
+        "posted with a confirmed but unfinalized entry",
+        &format!("UPDATE sale_documents SET status='posted' WHERE id='{sale_id}'"),
+        "schedule_x_register_entry_missing",
+    )
+    .await;
+
+    // ---------------------------------------------------------------------------------------------
+    // Post it properly, then prove the finalized record is beyond reach.
+    // ---------------------------------------------------------------------------------------------
+    let posted = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        sale_revision,
+        "01997a00-0000-7000-8000-00000000032c",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    refuses(
+        &pool,
+        "the dispensing was re-pointed after finalization",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET dispensing_id=NULL WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "the bill number was rewritten after finalization",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET bill_number='INV/2026-27/9999' \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "a statutory particular was altered after finalization",
+        &format!(
+            "UPDATE store_schedule_x_register_entries SET quantity_atoms=quantity_atoms+1 \
+             WHERE id='{entry_id}'"
+        ),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    refuses(
+        &pool,
+        "the finalized entry was deleted",
+        &format!("DELETE FROM store_schedule_x_register_entries WHERE id='{entry_id}'"),
+        "schedule_x_register_entry_immutable",
+    )
+    .await;
+    pool.close().await;
+}
+
+// ==============================================================================================
+// Phase 1M-D3-C2 — the read-only preflight, and the proof that it never authorizes a posting
+// ==============================================================================================
+
+/// Everything a supported Schedule X retail Sale needs, built once.
+struct FavourableX {
+    world: SaleWorld,
+    /// The prescription item the line is dispensed against.
+    item: String,
+    professional: String,
+    /// The professional named on the working entry. Usually the same as `professional`.
+    entry_professional: String,
+    licence: String,
+    authority: String,
+    batch: String,
+    sale_id: String,
+    line_id: String,
+    revision: i64,
+    entry_id: String,
+}
+
+/// The whole supported chain, up to and optionally including the physical-register confirmation.
+///
+/// `confirm = false` leaves the working entry `prepared`, which is the state the counter is in while
+/// the particulars are still being written into the bound register.
+async fn favourable_schedule_x_over_http(service: &Service, confirm: bool) -> FavourableX {
+    favourable_schedule_x_with_options(
+        service,
+        FavourableOptions {
+            confirm,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// How a favourable Schedule X world should differ from the ordinary one.
+#[derive(Default, Clone)]
+struct FavourableOptions {
+    /// Record that the particulars were entered in the physical register and signed by hand.
+    confirm: bool,
+    /// Confirm the working entry under a SECOND registered pharmacist, leaving the supply supervised
+    /// by the first, so a test can reach the entry-level rule 65(2) predicate on its own.
+    separate_entry_pharmacist: bool,
+    /// A veterinary supply: the prescription names an animal and its owner's name and address.
+    animal: bool,
+    /// Stop before preparing the working entry, leaving `entry_id` empty.
+    ///
+    /// A prepared entry PINS the draft — it names exactly what is about to be supplied — so a test
+    /// that still has lines to add to the basket must finish the basket first and prepare after.
+    skip_prepare: bool,
+    /// Record no Form 20-F Schedule X retail authority at all for the store.
+    skip_form_20f: bool,
+    /// Supply from a lot whose sellable stock arrived by a counted shelf rather than a purchase with
+    /// an authenticated Schedule X receipt — the shape legacy stock has.
+    counted_lot: bool,
+    /// The prescription's repeat authority, as the prescriber wrote it.
+    repeat: Option<Value>,
+    /// The supplier authority's own effective period, as (from, to, validity basis). The default is a
+    /// perpetual authority from 2020-01-01, which covers every purchase these fixtures make.
+    authority_period: Option<(String, Option<String>, String)>,
+}
+
+async fn favourable_schedule_x_with_entry_pharmacist(
+    service: &Service,
+    confirm: bool,
+    separate_entry_pharmacist: bool,
+) -> FavourableX {
+    favourable_schedule_x_with_options(
+        service,
+        FavourableOptions {
+            confirm,
+            separate_entry_pharmacist,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn favourable_schedule_x_with_options(
+    service: &Service,
+    options: FavourableOptions,
+) -> FavourableX {
+    let FavourableOptions {
+        confirm,
+        separate_entry_pharmacist,
+        animal,
+        skip_prepare,
+        skip_form_20f,
+        counted_lot,
+        repeat,
+        authority_period,
+    } = options;
+    let world = seed_sale_world(service, 1).await;
+    schedule_over_http(service, &world, &["schedule_x"]).await;
+    finding_over_http(service, &world, "ndps_purview", false).await;
+    record_basis_over_http(service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(service, &world).await;
+
+    // The store's own Form 20-F Schedule X retail authority, and this drug named on it.
+    let licence = if skip_form_20f {
+        String::new()
+    } else {
+        let (licence, revision) = form_20f_over_http(service, &world, "MH-PUNE-20F-4471").await;
+        let authorised = set_authority_over_http(
+            service,
+            &world,
+            &licence,
+            revision,
+            json!({
+                "legalStatus": "in_force",
+                "validityBasis": "perpetual",
+                "validFrom": "2020-01-01",
+            }),
+        )
+        .await;
+        assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+        let covered = cover_over_http(service, &world, &licence, "2020-01-01", None).await;
+        assert_eq!(covered.status, 201, "{:?}", covered.body);
+        licence
+    };
+
+    // The lot. A qualified one arrived on a posted purchase whose Schedule X receipt entry was
+    // written into the physical register; a counted one simply appeared on a shelf, which is the
+    // shape legacy stock has and which rule 65(21) cannot account for.
+    let batch = if counted_lot {
+        counted_lot_over_http(service, &world).await
+    } else {
+        qualified_lot_over_http(service, &world, &professional).await
+    };
+    let authority = match authority_period.clone() {
+        None => authorise_supplier_over_http(service, &world).await,
+        Some((from, to, basis)) => {
+            let recorded = record_authority_over_http(
+                service,
+                &world.cookie,
+                &world.supplier,
+                "form_20g",
+                "20G-MH-5511",
+                &from,
+                to.as_deref(),
+                &basis,
+                "in_force",
+            )
+            .await;
+            assert_eq!(recorded.status, 201, "{:?}", recorded.body);
+            let authority = recorded.body["id"]
+                .as_str()
+                .expect("authority id")
+                .to_owned();
+            // Coverage spans exactly the authority's own period: a drug cannot be covered by a
+            // licence before that licence exists, nor after it ends. So the period under test is the
+            // AUTHORITY's and nothing else.
+            let covered = call(
+                service,
+                "POST",
+                &format!("/api/v1/store/schedule-x/supplier-authorities/{authority}/coverage"),
+                Some(json!({
+                    "productId": world.product,
+                    "effectiveFrom": from,
+                    "effectiveTo": to,
+                    "sourceCitation": "Drug endorsed on the licence copy",
+                    "reason": Value::Null,
+                })),
+                Some(&world.cookie),
+            )
+            .await;
+            assert_eq!(covered.status, 201, "{:?}", covered.body);
+            authority
+        }
+    };
+
+    let (prescription, item) = if animal {
+        animal_prescription_over_http(service, &world, 20).await
+    } else if let Some(repeat) = repeat.clone() {
+        repeatable_prescription_over_http(service, &world, 40, repeat).await
+    } else {
+        prescription_over_http(service, &world, None, 20).await
+    };
+    let duplicate = call(
+        service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, revision) =
+        prepared_sale_on_lot_over_http(service, &world, &batch, &item, &professional).await;
+    let annotated = record_annotation_over_http(service, &world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let entry_id = if skip_prepare {
+        String::new()
+    } else {
+        let prepared = prepare_supply_over_http(service, &world.cookie, &line_id).await;
+        assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+        prepared.body["id"].as_str().expect("id").to_owned()
+    };
+
+    let entry_professional = if separate_entry_pharmacist {
+        second_pharmacist_over_http(service, &world).await
+    } else {
+        professional.clone()
+    };
+
+    if confirm {
+        let confirmed = call(
+            service,
+            "POST",
+            &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+            Some(json!({
+                "supervisingProfessionalId": entry_professional,
+                "particularsEnteredInPhysicalRegister": true,
+                "physicalEntryAuthenticated": true,
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    }
+
+    FavourableX {
+        world,
+        item,
+        professional,
+        entry_professional,
+        licence,
+        authority,
+        batch,
+        sale_id,
+        line_id,
+        revision,
+        entry_id,
+    }
+}
+
+async fn preflight_over_http(service: &Service, cookie: &str, sale_id: &str) -> Value {
+    let reply = call(
+        service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}/schedule-x-preflight"),
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{:?}", reply.body);
+    reply.body
+}
+
+/// Every predicate a preflight line reports that is NOT established, as `name:reason`.
+fn unmet_predicates(line: &Value) -> Vec<String> {
+    line["predicates"]
+        .as_array()
+        .expect("predicates")
+        .iter()
+        .filter(|predicate| predicate["verdict"]["state"] != "established")
+        .map(|predicate| {
+            format!(
+                "{}:{}",
+                predicate["predicate"].as_str().unwrap_or("?"),
+                predicate["verdict"]["reason"].as_str().unwrap_or("?")
+            )
+        })
+        .collect()
+}
+
+/// Phase 1M-D3-C2, item 3 — THE READ-ONLY PREFLIGHT.
+///
+/// It reports every Schedule X requirement on its own, it is advisory, and it changes nothing. The
+/// Sale is left exactly as it was: still a draft, no number allocated, no dispensing, no stock
+/// movement, no audit event, and the working entry in the state the operator left it in.
+#[tokio::test]
+async fn real_service_reports_every_schedule_x_predicate_without_changing_anything_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, false).await;
+
+    // Before the physical page is written and signed, exactly one requirement is outstanding.
+    let before = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    assert_eq!(before["status"], "draft");
+    let lines = before["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 1, "{before}");
+    let line = &lines[0];
+    assert_eq!(line["saleLineId"], f.line_id.as_str());
+    assert_eq!(line["batchId"], f.batch.as_str());
+    assert_eq!(
+        unmet_predicates(line),
+        vec![
+            "physicalRegisterEntry:physical_entry_not_confirmed".to_owned(),
+            "supervisingPharmacist:no_confirmed_entry".to_owned(),
+        ],
+        "{line}"
+    );
+    assert_eq!(line["canAttemptPosting"], false);
+    assert_eq!(before["canAttemptPosting"], false);
+
+    // Every predicate is named, including the ones other owners answer, so the screen can show the
+    // whole picture rather than only the Schedule X chain.
+    let named: Vec<&str> = line["predicates"]
+        .as_array()
+        .expect("predicates")
+        .iter()
+        .map(|predicate| predicate["predicate"].as_str().expect("name"))
+        .collect();
+    for required in [
+        "scheduleXClassification",
+        "supportedIntersection",
+        "ndpsOverlay",
+        "punjabOverlay",
+        "h1Intersection",
+        "exactBatch",
+        "prescriptionLinkage",
+        "prescriptionState",
+        "prescriptionProductMatch",
+        "writtenSignedDated",
+        "prescribedDose",
+        "quantityAuthority",
+        "repeatAuthority",
+        "repeatInterval",
+        "remainingAuthority",
+        "supplySupervision",
+        "storeAuthority",
+        "productCoverage",
+        "lotProvenance",
+        "sourceAuthorities",
+        "duplicatePrescriptionCopy",
+        "prescriptionAnnotation",
+        "physicalRegisterEntry",
+        "supervisingPharmacist",
+    ] {
+        assert!(
+            named.contains(&required),
+            "{required} missing from {named:?}"
+        );
+    }
+
+    // No patient, prescriber or medical particular is exposed.
+    let text = before.to_string().to_lowercase();
+    for forbidden in [
+        "prescriber",
+        "diagnos",
+        "subjectname",
+        "patientname",
+        "dosetext",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "{forbidden} in preflight: {before}"
+        );
+    }
+
+    // After the physical act is recorded, every predicate is established.
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{}/confirm", f.entry_id),
+        Some(json!({
+            "supervisingProfessionalId": f.professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    let after = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    let line = &after["lines"].as_array().expect("lines")[0];
+    assert_eq!(unmet_predicates(line), Vec::<String>::new(), "{line}");
+    assert_eq!(line["canAttemptPosting"], true);
+    assert_eq!(after["canAttemptPosting"], true);
+
+    // And after two preflights, nothing has happened to the Sale.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let (status, number): (String, Option<String>) =
+        sqlx::query_as("SELECT status,document_number FROM sale_documents WHERE id=?")
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("sale");
+    assert_eq!(status, "draft");
+    assert_eq!(number, None);
+    let series: Option<i64> = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("series");
+    assert_eq!(series, None, "the preflight allocated a document number");
+    for (what, sql) in [
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "the preflight created a {what}");
+    }
+    // The entry is still exactly `confirmed`: the preflight neither finalized nor attested anything.
+    let (entry_status, finalized): (String, Option<String>) = sqlx::query_as(
+        "SELECT status,finalized_at_utc FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry_status, "confirmed");
+    assert_eq!(finalized, None);
+    // And it wrote no audit event of its own.
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM master_change_events \
+         WHERE entity_type='schedule_x_register_entry' AND entity_id=? AND action='posted'",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 0, "the preflight wrote an audit event");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 31 — A FAVOURABLE PREFLIGHT AUTHORIZES NOTHING.
+///
+/// Three mutable prerequisites, one per case. In each, the preflight is fully favourable and
+/// `canAttemptPosting` is true; then the prerequisite changes underneath, exactly as it could while
+/// an operator is walking to the register; then the posting is refused on that predicate and nothing
+/// durable exists.
+///
+/// This is why the posting recomputes everything inside `BEGIN IMMEDIATE` and why the advisory
+/// boolean is never an authority.
+#[tokio::test]
+async fn real_service_refuses_posting_when_a_preflight_prerequisite_changes_over_http() {
+    for (case, mutation, expected) in [
+        (
+            "form_20f_product_coverage_archived",
+            "UPDATE store_licence_drug_coverage SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='withdrawn' \
+             WHERE licence_id=?",
+            "schedule_x_store_authority_product_not_covered",
+        ),
+        (
+            "supplier_authority_archived",
+            "UPDATE supplier_schedule_x_authorities SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='withdrawn' WHERE id=?",
+            "schedule_x_source_authority_missing",
+        ),
+        (
+            "supervising_pharmacist_archived",
+            "UPDATE store_professionals SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='left the pharmacy' \
+             WHERE id=?",
+            "schedule_x_supervising_pharmacist_invalid",
+        ),
+    ] {
+        let service = start().await;
+        // The pharmacist case needs the entry's professional to be somebody other than the one
+        // supervising the supply, or the supply-level rule 65(2) check answers first and this case
+        // never reaches the predicate it is about.
+        let separate = case == "supervising_pharmacist_archived";
+        let f = favourable_schedule_x_with_entry_pharmacist(&service, true, separate).await;
+
+        // The preflight says every requirement is established.
+        let ready = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+        let line = &ready["lines"].as_array().expect("lines")[0];
+        assert_eq!(
+            unmet_predicates(line),
+            Vec::<String>::new(),
+            "{case}: {line}"
+        );
+        assert_eq!(ready["canAttemptPosting"], true, "{case}: {ready}");
+
+        // Then one prerequisite changes.
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+        let target = match case {
+            "form_20f_product_coverage_archived" => f.licence.clone(),
+            "supplier_authority_archived" => f.authority.clone(),
+            _ => f.entry_professional.clone(),
+        };
+        let changed = sqlx::query(mutation)
+            .bind(&target)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(changed.rows_affected(), 1, "{case}: nothing was changed");
+
+        // And the posting is refused on exactly that predicate.
+        let refused = post_quoted_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-00000000033d",
+        )
+        .await;
+        assert_eq!(refused.status, 409, "{case}: {:?}", refused.body);
+        assert_eq!(
+            refused.body["code"], "prescription_requirements_incomplete",
+            "{case}: {:?}",
+            refused.body
+        );
+        assert!(
+            schedule_x_unmet(&refused.body).contains(&expected.to_owned()),
+            "{case}: expected {expected}, got {:?}",
+            refused.body
+        );
+
+        // Nothing durable.
+        let (status, number): (String, Option<String>) =
+            sqlx::query_as("SELECT status,document_number FROM sale_documents WHERE id=?")
+                .bind(&f.sale_id)
+                .fetch_one(&pool)
+                .await
+                .expect("sale");
+        assert_eq!(status, "draft", "{case}");
+        assert_eq!(number, None, "{case}");
+        let series: Option<i64> = sqlx::query_scalar(
+            "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("series");
+        assert_eq!(series, None, "{case}: a document number was consumed");
+        for (what, sql) in [
+            (
+                "dispensing",
+                "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+            ),
+            (
+                "outflow",
+                "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+                 AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+            ),
+            (
+                "tender",
+                "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(sql)
+                .bind(&f.sale_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+            assert_eq!(count, 0, "{case}: a {what} survived");
+        }
+        let (entry_status, finalized): (String, Option<String>) = sqlx::query_as(
+            "SELECT status,finalized_at_utc FROM store_schedule_x_register_entries WHERE id=?",
+        )
+        .bind(&f.entry_id)
+        .fetch_one(&pool)
+        .await
+        .expect("entry");
+        assert_eq!(entry_status, "confirmed", "{case}");
+        assert_eq!(finalized, None, "{case}");
+        pool.close().await;
+    }
+}
+
+/// Phase 1M-D3-C2, item 29 case 13 — THE SUPERVISING PHARMACIST, AS ITS OWN PREDICATE.
+///
+/// Rule 65(2) requires the supply to be effected under the personal supervision of a registered
+/// pharmacist. The 0028 transition trigger proves the professional named on the working entry
+/// qualified AT THE MOMENT OF CONFIRMATION; this proves the posting asks again, and refuses under its
+/// own code rather than claiming the physical register entry is missing.
+///
+/// Every case below confirms the entry under a second registered pharmacist, so the supply-level
+/// rule 65(2) answer stays favourable and these cases actually reach the entry-level predicate. Every
+/// other Schedule X predicate is established first, so nothing else can be masking the refusal.
+#[tokio::test]
+async fn real_service_refuses_schedule_x_on_the_entry_pharmacist_alone_over_http() {
+    for (case, mutation, reason) in [
+        (
+            "archived_after_confirmation",
+            "UPDATE store_professionals SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='left' WHERE id=?",
+            "professional_archived",
+        ),
+        (
+            "no_longer_a_registered_pharmacist",
+            "UPDATE store_professionals SET capacity='competent_person' WHERE id=?",
+            "not_a_registered_pharmacist",
+        ),
+        // A registered pharmacist's registration number cannot be taken away at all: the
+        // `store_professionals` CHECK refuses it outright, which is stronger than any predicate.
+        // Proved separately in `the_registration_number_cannot_be_removed_from_a_pharmacist` below.
+        (
+            "registration_lapsed_before_the_business_date",
+            "UPDATE store_professionals SET valid_upto='2026-09-11' WHERE id=?",
+            "registration_lapsed",
+        ),
+        (
+            "registration_not_yet_valid_on_the_business_date",
+            "UPDATE store_professionals SET valid_from='2026-12-01' WHERE id=?",
+            "registration_not_yet_valid",
+        ),
+    ] {
+        let service = start().await;
+        let f = favourable_schedule_x_with_entry_pharmacist(&service, true, true).await;
+
+        // Favourable to begin with, so the case reaches the predicate it is about.
+        let ready = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+        let line = &ready["lines"].as_array().expect("lines")[0];
+        assert_eq!(
+            unmet_predicates(line),
+            Vec::<String>::new(),
+            "{case}: {line}"
+        );
+
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+        let changed = sqlx::query(mutation)
+            .bind(&f.entry_professional)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(changed.rows_affected(), 1, "{case}: nothing was changed");
+
+        // The preflight names the pharmacist predicate and the exact reason — not the register.
+        let blocked = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+        let line = &blocked["lines"].as_array().expect("lines")[0];
+        assert_eq!(
+            unmet_predicates(line),
+            vec![format!("supervisingPharmacist:{reason}")],
+            "{case}: {line}"
+        );
+        assert_eq!(line["canAttemptPosting"], false, "{case}");
+
+        // And the posting refuses under the Schedule X pharmacist code.
+        let refused = post_quoted_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-00000000034e",
+        )
+        .await;
+        assert_eq!(refused.status, 409, "{case}: {:?}", refused.body);
+        assert_eq!(
+            schedule_x_unmet(&refused.body),
+            vec!["schedule_x_supervising_pharmacist_invalid".to_owned()],
+            "{case}: {:?}",
+            refused.body
+        );
+        // The physical entry is untouched: it is the pharmacist's record that needs attention.
+        let (entry_status, attested): (String, i64) = sqlx::query_as(
+            "SELECT status,physical_entry_authenticated \
+             FROM store_schedule_x_register_entries WHERE id=?",
+        )
+        .bind(&f.entry_id)
+        .fetch_one(&pool)
+        .await
+        .expect("entry");
+        assert_eq!(entry_status, "confirmed", "{case}");
+        assert_eq!(attested, 1, "{case}");
+        assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+        pool.close().await;
+    }
+}
+
+/// No posted document, no number consumed, no dispensing, no outflow, no tender, nothing finalized.
+async fn assert_nothing_durable_over_http(pool: &sqlx::SqlitePool, sale_id: &str) {
+    let (status, number): (String, Option<String>) =
+        sqlx::query_as("SELECT status,document_number FROM sale_documents WHERE id=?")
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .expect("sale");
+    assert_eq!(status, "draft");
+    assert_eq!(number, None);
+    let series: Option<i64> = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("series");
+    assert_eq!(series, None, "a document number was consumed");
+    for (what, sql) in [
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "outflow",
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+             AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+        (
+            "finalized Schedule X entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+             WHERE sale_document_id=? AND status='finalized'",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "a {what} survived");
+    }
+}
+
+/// Phase 1M-D3-C2 — the registration number of a registered pharmacist cannot be removed.
+///
+/// `resolve_entry_supervising_pharmacist` has a `no_registration_number` branch, and this records why
+/// that branch cannot be reached for an active registered pharmacist: `store_professionals` carries a
+/// CHECK that refuses the state outright. The branch stays as the fail-closed answer for a row that
+/// somehow lacked one; the guarantee relied on is the constraint, which is stronger.
+#[tokio::test]
+async fn the_registration_number_cannot_be_removed_from_a_pharmacist() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_entry_pharmacist(&service, true, true).await;
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let error = sqlx::query("UPDATE store_professionals SET registration_number=NULL WHERE id=?")
+        .bind(&f.entry_professional)
+        .execute(&pool)
+        .await
+        .expect_err("the database accepted a registered pharmacist with no registration number")
+        .to_string();
+    assert!(error.contains("CHECK constraint failed"), "{error}");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 10 — A SUPPORTED VETERINARY SCHEDULE X RETAIL SALE POSTS.
+///
+/// Rule 65(10)(b) requires, where the drug is meant for veterinary use, "the name and address of the
+/// owner of the animal". Rule 65(21)(b)(vii) requires the "Name and address of the patient/purchaser".
+/// Those are the facts, and they are all the facts: no species, no breed, no animal identifier and no
+/// age appears anywhere, because the Rules do not ask for any of them.
+///
+/// Every other requirement is identical to the human path — the same prescription rules, the same
+/// product and lot, the same Form 20-F authority and coverage, the same provenance and source
+/// authority, the same pharmacist, duplicate copy, annotation, physical register and NDPS/Punjab
+/// clearance. Nothing is relaxed for an animal.
+#[tokio::test]
+async fn real_service_posts_a_supported_veterinary_schedule_x_sale_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            confirm: true,
+            animal: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Every predicate established, on the same list as a human supply.
+    let ready = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    let line = &ready["lines"].as_array().expect("lines")[0];
+    assert_eq!(unmet_predicates(line), Vec::<String>::new(), "{line}");
+
+    let posted = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-00000000035f",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    assert_eq!(posted.body["status"], "posted");
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    // The register entry carries the animal's owner as the purchaser, and says which it is.
+    let (subject_kind, purchaser_name, purchaser_address, status): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT subject_kind,purchaser_name,purchaser_address,status \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(status, "finalized");
+    assert_eq!(subject_kind.as_deref(), Some("animal"));
+    assert_eq!(purchaser_name.as_deref(), Some("Ramesh Patil"));
+    assert_eq!(
+        purchaser_address.as_deref(),
+        Some("22 Shivaji Nagar, Pune 411005")
+    );
+
+    // No invented animal fact exists anywhere in the register entry or the prescription.
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('store_schedule_x_register_entries') \
+         UNION SELECT name FROM pragma_table_info('prescriptions')",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    for invented in ["species", "breed", "animal_id", "animal_identifier", "age"] {
+        assert!(
+            !columns.iter().any(|column| column.contains(invented)),
+            "{invented} was invented: {columns:?}"
+        );
+    }
+    pool.close().await;
+}
+
+// ==============================================================================================
+// Phase 1M-D3-C2 — mixed baskets. One Sale, one transaction, all or nothing.
+// ==============================================================================================
+
+/// A second product with no regulatory position at all, its own pack and lot, and sellable stock
+/// brought in by an opening-stock operation.
+///
+/// It is an `general_pharmacy_item` with every schedule recorded as not applying, so it is an ordinary
+/// counter line. Its stock arrives as opening stock, which would disqualify a Schedule X lot — and
+/// that is exactly right, because this product is not Schedule X and owes no provenance.
+async fn ordinary_product_over_http(
+    service: &Service,
+    world: &SaleWorld,
+) -> (String, String, String) {
+    let product = call(
+        service,
+        "POST",
+        "/api/v1/products",
+        Some(json!({"product":{
+            "productKind":"general_pharmacy_item","baseUnitId":TABLET,
+            "quantityScale":0,"displayName":"Digene Antacid Tablet"
+        }})),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(product.status, 201, "{:?}", product.body);
+    let product_id = product.body["id"].as_str().expect("product id").to_owned();
+
+    let pack = call(
+        service,
+        "POST",
+        &format!("/api/v1/products/{product_id}/packs"),
+        Some(json!({
+            "containerUnitId": STRIP, "baseQuantityAtoms": 10, "displayLabel": "Strip of 10"
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(pack.status, 201, "{:?}", pack.body);
+    let pack_id = pack.body["id"].as_str().expect("pack id").to_owned();
+
+    // The same tax classification the world's own product carries, so the money path is ordinary.
+    let pool = database::connect(&service.database_path).await.expect("db");
+    let (hsn, category): (String, String) =
+        sqlx::query_as("SELECT hsn_code_id,tax_category_id FROM products WHERE id=?")
+            .bind(&world.product)
+            .fetch_one(&pool)
+            .await
+            .expect("classification");
+    pool.close().await;
+    let classified = call(
+        service,
+        "PUT",
+        &format!("/api/v1/products/{product_id}/tax-classification"),
+        Some(json!({ "expectedRevision": 1, "hsnCodeId": hsn, "taxCategoryId": category })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(classified.status, 200, "{:?}", classified.body);
+
+    // Outside every schedule, so the line is an ordinary one and the gate says so.
+    for scheme in [
+        "schedule_h",
+        "schedule_h1",
+        "schedule_x",
+        "schedule_c",
+        "schedule_c1",
+        "ndps_purview",
+    ] {
+        let finding = call(
+            service,
+            "POST",
+            &format!("/api/v1/products/{product_id}/regulatory/classifications"),
+            Some(json!({
+                "scheme": scheme,
+                "applies": false,
+                "effectiveFrom": "2020-01-01",
+                "sourceCitation": "Drugs Rules, 1945, Schedules as amended",
+            })),
+            Some(&world.cookie),
+        )
+        .await;
+        assert_eq!(finding.status, 201, "{scheme}: {:?}", finding.body);
+    }
+
+    // A lot, and stock in it.
+    let batch = call(
+        service,
+        "POST",
+        &format!("/api/v1/packs/{pack_id}/batches"),
+        Some(json!({
+            "batchNumber": "DG-7781", "expiresOn": "2028-01-31", "mrpPaise": 9550
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(batch.status, 201, "{:?}", batch.body);
+    let batch_id = batch.body["id"].as_str().expect("batch id").to_owned();
+
+    // A counted shelf brings the stock in. For an ordinary line this is simply how stock arrives in
+    // a test; for a Schedule X lot the very same movement would be a DISQUALIFYING inward, which is
+    // exactly right — this product is not Schedule X and owes no provenance.
+    let counted = run_operation(
+        service,
+        &world.cookie,
+        "physical_count",
+        json!({
+            "productPackId": pack_id, "batchId": batch_id, "stockStatus": "sellable",
+            "reasonCode": "physical_count_gain", "countedQuantity": 100,
+            "quantityBasis": "base_unit"
+        }),
+    )
+    .await;
+    assert_eq!(counted.status, 200, "{:?}", counted.body);
+
+    // And the pack is enabled for sale at this store, the same way the world enables its own.
+    let policy = call(
+        service,
+        "PUT",
+        &format!("/api/v1/packs/{pack_id}/policy"),
+        Some(json!({
+            "expectedRevision": null,
+            "policy": {
+                "storeId": world.store, "purchaseEnabled": true, "saleEnabled": true,
+                "wholePackOnlyPurchase": false, "fractionalSaleAllowed": false,
+                "minimumSaleIncrementAtoms": 1,
+                "defaultPurchasePack": false, "defaultSalePack": true
+            }
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert!(
+        policy.status == 200 || policy.status == 201,
+        "{:?}",
+        policy.body
+    );
+    (product_id, pack_id, batch_id)
+}
+
+/// The draft Sale's current revision, read back over HTTP.
+async fn sale_revision_over_http(service: &Service, world: &SaleWorld, sale_id: &str) -> i64 {
+    let detail = call(
+        service,
+        "GET",
+        &format!("/api/v1/sales/{sale_id}"),
+        None,
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(detail.status, 200, "{:?}", detail.body);
+    detail.body["revision"].as_i64().expect("revision")
+}
+
+/// Adds one more line to an existing draft and returns (line id, new revision).
+async fn add_line_over_http(
+    service: &Service,
+    world: &SaleWorld,
+    sale_id: &str,
+    revision: i64,
+    product: &str,
+    pack: &str,
+    batch: &str,
+) -> (String, i64) {
+    let added = call(
+        service,
+        "POST",
+        &format!("/api/v1/sales/{sale_id}/lines"),
+        Some(json!({
+            "expectedRevision": revision,
+            "productId": product,
+            "productPackId": pack,
+            "batchId": batch,
+            "quantityBasis": "pack",
+            "quantity": 1,
+            "sellingRatePaise": 8000
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(added.status, 201, "{:?}", added.body);
+    let lines = added.body["lines"].as_array().expect("lines");
+    let line_id = lines
+        .last()
+        .and_then(|line| line["id"].as_str())
+        .expect("line id")
+        .to_owned();
+    let revision = added.body["revision"].as_i64().expect("revision");
+    (line_id, revision)
+}
+
+/// Phase 1M-D3-C2, item 11 case A — ORDINARY + SCHEDULE X, ALL FAVOURABLE, THE WHOLE SALE POSTS.
+#[tokio::test]
+async fn real_service_posts_a_mixed_ordinary_and_schedule_x_sale_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            skip_prepare: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (product, pack, batch) = ordinary_product_over_http(&service, &f.world).await;
+    let revision = sale_revision_over_http(&service, &f.world, &f.sale_id).await;
+    let (ordinary_line, revision) = add_line_over_http(
+        &service, &f.world, &f.sale_id, revision, &product, &pack, &batch,
+    )
+    .await;
+    // The Schedule X entry is prepared and confirmed only after the basket is final: it names
+    // exactly what is about to be supplied.
+    let prepared = prepare_supply_over_http(&service, &f.world.cookie, &f.line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let confirmed = call(
+        &service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": f.professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+
+    // The preflight reports only the Schedule X line; the ordinary one is not its business.
+    let ready = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    assert_eq!(
+        ready["lines"].as_array().expect("lines").len(),
+        1,
+        "{ready}"
+    );
+
+    let posted = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        revision,
+        "01997a00-0000-7000-8000-000000000370",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    // Both lines moved stock, and the Schedule X entry is finalized.
+    for line in [&f.line_id, &ordinary_line] {
+        let moved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+        )
+        .bind(line)
+        .fetch_one(&pool)
+        .await
+        .expect("movement");
+        assert_eq!(moved, 1, "line {line} did not move stock");
+    }
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM store_schedule_x_register_entries WHERE id=?")
+            .bind(&entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("entry");
+    assert_eq!(status, "finalized");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 11 cases B, F, G, H and I — ONE BAD LINE LEAVES THE WHOLE SALE A DRAFT.
+///
+/// Each case takes a Sale that would otherwise post and spoils exactly one thing about its Schedule X
+/// line. In every case the ORDINARY line is perfectly saleable, and in every case it does not post:
+/// a Sale is one transaction, and there is no partial posting to be had.
+#[tokio::test]
+async fn real_service_keeps_a_whole_mixed_sale_draft_when_one_schedule_x_line_fails_over_http() {
+    for (case, spoil, expected) in [
+        (
+            // B — the Schedule X line's working entry is never confirmed.
+            "schedule_x_register_not_confirmed",
+            "",
+            "schedule_x_register_confirmation_missing",
+        ),
+        (
+            // F — the lot's source authority is withdrawn.
+            "schedule_x_source_authority_archived",
+            "UPDATE supplier_schedule_x_authorities SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='withdrawn'",
+            "schedule_x_source_authority_missing",
+        ),
+        (
+            // G — the NDPS axis is withdrawn to unrecorded.
+            "ndps_unresolved",
+            "UPDATE product_regulatory_classifications SET status='archived',\
+             archived_at_utc='2026-09-12T06:00:00.000Z',archive_reason='withdrawn' \
+             WHERE scheme='ndps_purview'",
+            "",
+        ),
+        (
+            // I — the drug turns out to be Schedule C as well, an unsupported intersection.
+            "schedule_c_intersection",
+            "UPDATE product_regulatory_classifications SET applies=1 WHERE scheme='schedule_c'",
+            "",
+        ),
+    ] {
+        let service = start().await;
+        let f = favourable_schedule_x_with_options(
+            &service,
+            FavourableOptions {
+                skip_prepare: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (product, pack, batch) = ordinary_product_over_http(&service, &f.world).await;
+        let revision = sale_revision_over_http(&service, &f.world, &f.sale_id).await;
+        let (ordinary_line, revision) = add_line_over_http(
+            &service, &f.world, &f.sale_id, revision, &product, &pack, &batch,
+        )
+        .await;
+
+        // The basket is final, so now the working entry is prepared — and confirmed, except in the
+        // case that is about an unconfirmed entry.
+        let prepared = prepare_supply_over_http(&service, &f.world.cookie, &f.line_id).await;
+        assert_eq!(prepared.status, 201, "{case}: {:?}", prepared.body);
+        let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+        if case != "schedule_x_register_not_confirmed" {
+            let confirmed = call(
+                &service,
+                "POST",
+                &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+                Some(json!({
+                    "supervisingProfessionalId": f.professional,
+                    "particularsEnteredInPhysicalRegister": true,
+                    "physicalEntryAuthenticated": true,
+                })),
+                Some(&f.world.cookie),
+            )
+            .await;
+            assert_eq!(confirmed.status, 200, "{case}: {:?}", confirmed.body);
+        }
+
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+        if !spoil.is_empty() {
+            // Scoped to the world's own product where the statement does not already say so.
+            let statement = if spoil.contains("product_regulatory_classifications") {
+                format!("{spoil} AND product_id='{}'", f.world.product)
+            } else {
+                spoil.to_owned()
+            };
+            let changed = sqlx::query(&statement)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert!(changed.rows_affected() >= 1, "{case}: nothing changed");
+        }
+
+        let refused = post_quoted_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            revision,
+            "01997a00-0000-7000-8000-000000000381",
+        )
+        .await;
+        assert_ne!(refused.status, 200, "{case}: {:?}", refused.body);
+        if !expected.is_empty() {
+            assert!(
+                schedule_x_unmet(&refused.body).contains(&expected.to_owned()),
+                "{case}: expected {expected}, got {:?}",
+                refused.body
+            );
+        }
+
+        // The ordinary line did not post either.
+        assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+        let moved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+        )
+        .bind(&ordinary_line)
+        .fetch_one(&pool)
+        .await
+        .expect("movement");
+        assert_eq!(moved, 0, "{case}: the ordinary line posted on its own");
+        pool.close().await;
+    }
+}
+
+/// Phase 1M-D3-C2, item 11 case H — PUNJAB LEAVES THE WHOLE SALE A DRAFT.
+///
+/// Its own test because the Punjab axis is a property of the STORE's premises State, not of the
+/// product classification, so the fixture differs: the store sits in Punjab and the product's
+/// position under the State notification is left unrecorded.
+#[tokio::test]
+async fn real_service_keeps_a_schedule_x_sale_draft_on_the_punjab_axis_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+    // Move the premises into Punjab through the ordinary route, then record that the product IS
+    // within the State notification.
+    //
+    // `applies` rather than an unrecorded position, deliberately: Phase 1M-C refuses an UNRECORDED
+    // State position only for a `medicine`, and this world's product is a `general_pharmacy_item`,
+    // so leaving it unrecorded here would not refuse and the case would prove nothing. The
+    // unrecorded-position path for a medicine is proved in
+    // `domain::regulatory::tests::the_central_and_state_axes_stay_independent`, which asserts
+    // `StateUnresolved` for a Schedule X medicine on both `Resolved(Unknown)` and `Undetermined`.
+    let moved = call(
+        &service,
+        "PUT",
+        "/api/v1/store/address",
+        Some(json!({
+            "expectedRevision": 1, "line1": "12 Mall Road", "city": "Ludhiana",
+            "stateId": PUNJAB, "postalCode": "141001"
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(moved.status, 200, "{:?}", moved.body);
+    finding_over_http(&service, &f.world, "punjab_restricted_supply", true).await;
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+
+    let refused = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-000000000392",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    // Refused on the STATE axis, not on anything Schedule X: completing the Schedule X record never
+    // clears the Punjab boundary.
+    assert_eq!(
+        refused.body["code"], "state_restricted_drug_workflow_not_available",
+        "{:?}",
+        refused.body
+    );
+    assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 11 cases C and D — SCHEDULE X ∩ SCHEDULE H1 IS STRUCTURALLY UNSUPPORTED.
+///
+/// This case was designed expecting the two workflows to compose. They do not, and the reason is in
+/// the schema rather than in policy.
+///
+/// A Schedule H1 line owes its separate rule 65(3)(1)(h) working entry. That entry lives in
+/// `prescription_h1_register_entries`, whose `supply_record_id` is NOT NULL and references the rule
+/// 65(3)(1) record. Rule 65(3)(1) governs the supply of a drug "other than those specified in
+/// Schedule X", so a Schedule X supply has no record in that register for the H1 entry to point at.
+/// The H1 obligation therefore cannot be discharged for such a line without making
+/// `supply_record_id` nullable or giving the H1 entry an independent existence — a new foundation
+/// this phase does not lay.
+///
+/// So the line fails closed, under its own code, before anything is written. Both halves of the
+/// original case are proved here: the supply does not post, and neither register gains an entry.
+#[tokio::test]
+async fn real_service_refuses_a_schedule_x_and_h1_line_as_unsupported_over_http() {
+    let service = start().await;
+    let world = seed_sale_world(&service, 1).await;
+    // One drug, in Schedule X AND Schedule H1, outside the NDPS Act: each schedule is supported on
+    // its own, and this test is about the two together.
+    schedule_over_http(&service, &world, &["schedule_h1", "schedule_x"]).await;
+    finding_over_http(&service, &world, "ndps_purview", false).await;
+    record_basis_over_http(&service, &world, Some("prescription_register")).await;
+    let professional = pharmacist_over_http(&service, &world).await;
+
+    let (licence, revision) = form_20f_over_http(&service, &world, "MH-PUNE-20F-4471").await;
+    let authorised = set_authority_over_http(
+        &service,
+        &world,
+        &licence,
+        revision,
+        json!({
+            "legalStatus": "in_force",
+            "validityBasis": "perpetual",
+            "validFrom": "2020-01-01",
+        }),
+    )
+    .await;
+    assert_eq!(authorised.status, 200, "{:?}", authorised.body);
+    let covered = cover_over_http(&service, &world, &licence, "2020-01-01", None).await;
+    assert_eq!(covered.status, 201, "{:?}", covered.body);
+
+    let batch = qualified_lot_over_http(&service, &world, &professional).await;
+    authorise_supplier_over_http(&service, &world).await;
+
+    let (prescription, item) = prescription_over_http(&service, &world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{prescription}/schedule-x-duplicate-copy"),
+        Some(json!({
+            "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null
+        })),
+        Some(&world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+
+    let (sale_id, line_id, revision) =
+        prepared_sale_on_lot_over_http(&service, &world, &batch, &item, &professional).await;
+
+    // The preflight says so plainly, naming the intersection rather than an outstanding H1 entry the
+    // operator could never supply.
+    let preflight = preflight_over_http(&service, &world.cookie, &sale_id).await;
+    let line = &preflight["lines"].as_array().expect("lines")[0];
+    assert!(
+        unmet_predicates(line).contains(&"h1Intersection:schedule_x_h1_intersection".to_owned()),
+        "{line}"
+    );
+    assert_eq!(line["canAttemptPosting"], false, "{line}");
+
+    // And the posting refuses under the unsupported-intersection code.
+    let refused = post_quoted_over_http(
+        &service,
+        &world,
+        &sale_id,
+        revision,
+        "01997a00-0000-7000-8000-0000000003a3",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.body["code"], "schedule_x_unsupported_intersecting_regime",
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["issues"][0]["field"], "lines.1.schedule_h1");
+    // Nothing is called illegal, banned or prohibited: this is a combination the software does not
+    // implement, not a drug anybody is forbidden to sell.
+    let text = refused.body.to_string().to_lowercase();
+    for word in ["banned", "prohibit", "illegal"] {
+        assert!(!text.contains(word), "{word}: {:?}", refused.body);
+    }
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    assert_nothing_durable_over_http(&pool, &sale_id).await;
+    // Neither register gained an entry, and the Schedule X working record was never even prepared.
+    for (what, sql) in [
+        (
+            "rule 65(3) record",
+            "SELECT COUNT(*) FROM prescription_supply_records WHERE sale_document_id=?",
+        ),
+        (
+            "H1 entry",
+            "SELECT COUNT(*) FROM prescription_h1_register_entries WHERE sale_document_id=?",
+        ),
+        (
+            "Schedule X entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE sale_document_id=?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            count, 0,
+            "a {what} was written for an unsupported intersection"
+        );
+    }
+    let _ = line_id;
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 11 cases E and F — TWO SCHEDULE X LINES, ONE TRANSACTION.
+///
+/// Case E satisfies both lines and posts them together: two supplies, two register entries, two
+/// dispensings, one document number. Case F leaves the SECOND line's working entry unconfirmed, and
+/// neither line posts — not the good one either.
+#[tokio::test]
+async fn real_service_posts_or_refuses_two_schedule_x_lines_together_over_http() {
+    for (case, confirm_second, expect_post) in [
+        ("both_lines_favourable", true, true),
+        ("second_line_unconfirmed", false, false),
+    ] {
+        let service = start().await;
+        let f = favourable_schedule_x_with_options(
+            &service,
+            FavourableOptions {
+                skip_prepare: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        // A second line on the same drug and the same lot, against the same prescription item. The
+        // item authorises 20 atoms and each line takes 10, so the pair is exactly within it.
+        let revision = sale_revision_over_http(&service, &f.world, &f.sale_id).await;
+        let (second_line, revision) = add_line_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            revision,
+            &f.world.product,
+            &f.world.pack,
+            &f.batch,
+        )
+        .await;
+        let linked = call(
+            &service,
+            "PUT",
+            &format!("/api/v1/sale-lines/{second_line}/prescription"),
+            Some(json!({ "expectedRevision": revision, "prescriptionItemId": f.item })),
+            Some(&f.world.cookie),
+        )
+        .await;
+        assert_eq!(linked.status, 200, "{case}: {:?}", linked.body);
+        let revision = linked.body["revision"].as_i64().expect("revision");
+        let annotated =
+            record_annotation_over_http(&service, &f.world.cookie, &second_line, true).await;
+        assert_eq!(annotated.status, 201, "{case}: {:?}", annotated.body);
+        // The endorsement is about the prescription as this supply stands, so adding a line retires
+        // it. Confirm it again for the basket that is actually going to be supplied.
+        let supplied = call(
+            &service,
+            "PUT",
+            &format!("/api/v1/sales/{}/supply", f.sale_id),
+            Some(json!({
+                "expectedRevision": revision,
+                "supervisingProfessionalId": f.professional,
+                "prescriptionEndorsementConfirmed": true,
+            })),
+            Some(&f.world.cookie),
+        )
+        .await;
+        assert_eq!(supplied.status, 200, "{case}: {:?}", supplied.body);
+        let revision = supplied.body["revision"].as_i64().expect("revision");
+
+        // One working entry per line: two statutory drug/quantity pairs are two entries, never one.
+        let mut entries = Vec::new();
+        for (index, line) in [&f.line_id, &second_line].iter().enumerate() {
+            let prepared = prepare_supply_over_http(&service, &f.world.cookie, line).await;
+            assert_eq!(prepared.status, 201, "{case}: {:?}", prepared.body);
+            let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+            if index == 0 || confirm_second {
+                let confirmed = call(
+                    &service,
+                    "POST",
+                    &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+                    Some(json!({
+                        "supervisingProfessionalId": f.professional,
+                        "particularsEnteredInPhysicalRegister": true,
+                        "physicalEntryAuthenticated": true,
+                    })),
+                    Some(&f.world.cookie),
+                )
+                .await;
+                assert_eq!(confirmed.status, 200, "{case}: {:?}", confirmed.body);
+            }
+            entries.push(entry_id);
+        }
+
+        // The preflight reports both lines.
+        let preflight = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+        assert_eq!(
+            preflight["lines"].as_array().expect("lines").len(),
+            2,
+            "{case}: {preflight}"
+        );
+
+        let reply = post_quoted_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            revision,
+            "01997a00-0000-7000-8000-0000000003b4",
+        )
+        .await;
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+        if expect_post {
+            assert_eq!(reply.status, 200, "{case}: {:?}", reply.body);
+            // Two finalized entries, two dispensings, ONE document number.
+            let finalized: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+                 WHERE sale_document_id=? AND status='finalized'",
+            )
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("entries");
+            assert_eq!(finalized, 2, "{case}");
+            let dispensings: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+            )
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("dispensings");
+            assert_eq!(dispensings, 2, "{case}");
+            // Both entries carry the SAME bill number: one Sale, one bill.
+            let bills: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT bill_number FROM store_schedule_x_register_entries \
+                 WHERE sale_document_id=? AND status='finalized'",
+            )
+            .bind(&f.sale_id)
+            .fetch_all(&pool)
+            .await
+            .expect("bills");
+            assert_eq!(bills.len(), 1, "{case}: {bills:?}");
+            // And each entry is bound to its own line's dispensing, never the other's.
+            for entry in &entries {
+                let same: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM store_schedule_x_register_entries entry \
+                     JOIN prescription_dispensings dispensing ON dispensing.id=entry.dispensing_id \
+                     WHERE entry.id=? AND dispensing.sale_line_id=entry.sale_line_id",
+                )
+                .bind(entry)
+                .fetch_one(&pool)
+                .await
+                .expect("binding");
+                assert_eq!(
+                    same, 1,
+                    "{case}: entry {entry} is bound to another line's dispensing"
+                );
+            }
+        } else {
+            assert_ne!(reply.status, 200, "{case}: {:?}", reply.body);
+            assert!(
+                schedule_x_unmet(&reply.body)
+                    .contains(&"schedule_x_register_confirmation_missing".to_owned()),
+                "{case}: {:?}",
+                reply.body
+            );
+            assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+        }
+        pool.close().await;
+    }
+}
+
+/// Phase 1M-D3-C2, item 29 case 2 — NO FORM 20-F AUTHORITY REFUSES THE SALE.
+///
+/// Rule 61(3) issues the Schedule X retail licence in Form 20-F, and Form 20-F condition 3 and item 2
+/// are what the rest of this chain hangs on. Everything else here is favourable — the lot, its
+/// source's authority, the prescription, the duplicate copy, the annotation, the pharmacist, the
+/// signed physical register entry, the NDPS and State axes — and the supply is still refused, because
+/// the store has recorded no Schedule X retail authority of its own.
+#[tokio::test]
+async fn real_service_refuses_a_schedule_x_sale_with_no_form_20f_authority_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            confirm: true,
+            skip_form_20f: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The preflight names the authority, and the coverage as unresolvable without it.
+    let blocked = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    let line = &blocked["lines"].as_array().expect("lines")[0];
+    assert_eq!(
+        unmet_predicates(line),
+        vec![
+            "storeAuthority:no_authority_recorded".to_owned(),
+            "productCoverage:authority_not_established".to_owned(),
+        ],
+        "{line}"
+    );
+
+    let refused = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-0000000003c5",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        schedule_x_unmet(&refused.body),
+        vec![
+            "schedule_x_store_authority_missing".to_owned(),
+            "schedule_x_store_authority_product_not_covered".to_owned(),
+        ],
+        "{:?}",
+        refused.body
+    );
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 19 — LEGACY STOCK CANNOT BE SUPPLIED.
+///
+/// The lot's sellable balance arrived on a counted shelf rather than on a posted purchase with an
+/// authenticated Schedule X receipt entry. Every other predicate is favourable.
+///
+/// The refusal lands EARLIER than the posting: Phase 1M-D3-B's provenance trigger will not let the
+/// rule 65(21) working entry be prepared for such a lot at all, so no page is written in the physical
+/// register for a supply that could never be made. Stock inside one lot is fungible, so a lot that
+/// cannot account for where its units came from is held back whole — which is the position old stock
+/// is in, and the position stock released back into the sellable balance is in.
+#[tokio::test]
+async fn real_service_refuses_a_schedule_x_sale_from_legacy_counted_stock_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            counted_lot: true,
+            skip_prepare: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The preflight says the lot cannot account for itself.
+    let blocked = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+    let line = &blocked["lines"].as_array().expect("lines")[0];
+    let unmet = unmet_predicates(line);
+    assert!(
+        unmet.contains(&"lotProvenance:unresolved_inward_movement".to_owned())
+            || unmet.contains(&"lotProvenance:no_qualifying_receipt".to_owned()),
+        "{line}"
+    );
+    assert_eq!(line["canAttemptPosting"], false, "{line}");
+
+    // And the working entry cannot even be prepared.
+    let refused_prepare = prepare_supply_over_http(&service, &f.world.cookie, &f.line_id).await;
+    assert_eq!(refused_prepare.status, 409, "{:?}", refused_prepare.body);
+    assert_eq!(
+        refused_prepare.body["code"], "schedule_x_lot_provenance_unresolved",
+        "{:?}",
+        refused_prepare.body
+    );
+
+    // So the posting is refused too, and nothing durable exists.
+    let refused = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-0000000003d6",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert!(
+        schedule_x_unmet(&refused.body)
+            .contains(&"schedule_x_lot_provenance_incomplete".to_owned()),
+        "{:?}",
+        refused.body
+    );
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+    // No page was written in the register for a supply that could never be made.
+    let entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries          WHERE sale_document_id=? AND entry_kind='supply'",
+    )
+    .bind(&f.sale_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entries");
+    assert_eq!(entries, 0);
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 27 — RETRYING AN UNCERTAIN POSTING IS IDEMPOTENT.
+///
+/// The counter presses Post Sale, the response is lost, and the same request is sent again with the
+/// same idempotency key. One Sale was supplied, so there must be exactly one of everything: one
+/// document number, one dispensing, one outward movement, one tender, and one finalized Schedule X
+/// register entry. A second register entry would be a second supply in the statutory record of a
+/// supply that happened once.
+#[tokio::test]
+async fn real_service_replays_a_posted_schedule_x_sale_idempotently_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+
+    let key = "01997a00-0000-7000-8000-0000000003e7";
+    let first = post_quoted_over_http(&service, &f.world, &f.sale_id, f.revision, key).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let document_number = first.body["documentNumber"]
+        .as_str()
+        .expect("documentNumber")
+        .to_owned();
+
+    // The same key again, with the revision the draft had: the original invoice comes back rather
+    // than a second supply.
+    let replay = post_quoted_over_http(&service, &f.world, &f.sale_id, f.revision, key).await;
+    assert_eq!(replay.status, 200, "{:?}", replay.body);
+    assert_eq!(replay.body["documentNumber"], document_number.as_str());
+    assert_eq!(replay.body["status"], "posted");
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    for (what, sql) in [
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "outward movement",
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+             AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+        (
+            "finalized Schedule X entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+             WHERE sale_document_id=? AND status='finalized'",
+        ),
+        (
+            "posted audit event for the entry",
+            "SELECT COUNT(*) FROM master_change_events \
+             WHERE entity_type='schedule_x_register_entry' AND action='posted' \
+               AND entity_id IN (SELECT id FROM store_schedule_x_register_entries \
+                                 WHERE sale_document_id=?)",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "the replay produced {count} of: {what}");
+    }
+    // And exactly one number was taken from the series.
+    let next: i64 = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("series");
+    assert_eq!(next, 2, "the replay consumed a second document number");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 20 — RELEASED RETURNED STOCK CANNOT BE SUPPLIED AGAIN.
+///
+/// The real lineage, through the real flows: a supported Schedule X Sale posts; the customer brings
+/// some of it back and it goes into quarantine as a `sales_return`; the pharmacy inspects it and
+/// releases it to sellable through a stock disposition. The lot's sellable balance now contains
+/// units that did NOT arrive on a qualifying purchase.
+///
+/// Nothing was faked with a master edit. A returned-and-released unit is sellable again as far as
+/// ordinary stock is concerned, and Phase 1M-D3-B still refuses it for Schedule X — because stock
+/// inside one lot cannot be told apart, so the whole lot is held back and no amount of disposition
+/// paperwork restores the original purchase provenance.
+#[tokio::test]
+async fn real_service_refuses_schedule_x_from_returned_and_released_stock_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+
+    // A supported Schedule X Sale, posted.
+    let posted = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-0000000003f8",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+
+    // The customer returns it. It goes to quarantine, which is where a sales return must go.
+    let draft = call(
+        &service,
+        "POST",
+        "/api/v1/returns",
+        Some(json!({
+            "returnKind": "sales_return",
+            "originalDocumentId": f.sale_id,
+            "businessDate": SALE_DATE
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(draft.status, 201, "{:?}", draft.body);
+    let return_id = draft.body["id"].as_str().expect("return id").to_owned();
+    let with_line = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/lines"),
+        Some(json!({
+            "expectedRevision": 1,
+            "originalLineId": f.line_id,
+            "quantity": 1,
+            "disposition": "quarantined"
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(with_line.status, 201, "{:?}", with_line.body);
+    let returned = call(
+        &service,
+        "POST",
+        &format!("/api/v1/returns/{return_id}/post"),
+        Some(json!({
+            "expectedRevision": with_line.body["revision"],
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000003f9",
+            "taxAdjustmentStatus": "commercial_only",
+            "taxAdjustmentReason": "Tax was passed on to the customer"
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(returned.status, 200, "{:?}", returned.body);
+
+    // Inspected and released back to sellable, through the ordinary disposition flow.
+    let released = call(
+        &service,
+        "POST",
+        "/api/v1/stock-dispositions",
+        Some(json!({
+            "idempotencyKey": "01997a00-0000-7000-8000-0000000003fa",
+            "productPackId": f.world.pack,
+            "batchId": f.batch,
+            "quantityAtoms": 10,
+            "fromStatus": "quarantined",
+            "toStatus": "sellable",
+            "reason": "Sealed strip, inspected and found fit for sale",
+            "occurredOn": SALE_DATE
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(released.status, 201, "{:?}", released.body);
+
+    // The stock is sellable again as far as ordinary stock is concerned.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let released_inward: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements \
+         WHERE batch_id=? AND stock_status='sellable' AND quantity_delta_atoms > 0 \
+           AND movement_type='disposition_transfer'",
+    )
+    .bind(&f.batch)
+    .fetch_one(&pool)
+    .await
+    .expect("released inward");
+    assert_eq!(
+        released_inward, 1,
+        "the release did not reach the sellable balance"
+    );
+    pool.close().await;
+
+    // And a fresh Schedule X supply from that lot is refused, at the earliest point: the rule 65(21)
+    // working entry cannot be prepared for a lot whose stock no longer accounts for itself.
+    let (second_prescription, second_item) =
+        prescription_over_http(&service, &f.world, None, 20).await;
+    let duplicate = call(
+        &service,
+        "POST",
+        &format!("/api/v1/prescriptions/{second_prescription}/schedule-x-duplicate-copy"),
+        Some(json!({ "retainedDuplicatePrescriptionCopyConfirmed": true, "note": Value::Null })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(duplicate.status, 201, "{:?}", duplicate.body);
+    let (second_sale, second_line, second_revision) =
+        prepared_sale_on_lot_over_http(&service, &f.world, &f.batch, &second_item, &f.professional)
+            .await;
+    let annotated =
+        record_annotation_over_http(&service, &f.world.cookie, &second_line, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+
+    let refused_prepare = prepare_supply_over_http(&service, &f.world.cookie, &second_line).await;
+    assert_eq!(refused_prepare.status, 409, "{:?}", refused_prepare.body);
+    assert_eq!(
+        refused_prepare.body["code"], "schedule_x_lot_provenance_unresolved",
+        "{:?}",
+        refused_prepare.body
+    );
+
+    let refused = post_quoted_over_http(
+        &service,
+        &f.world,
+        &second_sale,
+        second_revision,
+        "01997a00-0000-7000-8000-0000000003fb",
+    )
+    .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert!(
+        schedule_x_unmet(&refused.body)
+            .contains(&"schedule_x_lot_provenance_incomplete".to_owned()),
+        "{:?}",
+        refused.body
+    );
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    assert_nothing_durable_over_http_for(&pool, &second_sale).await;
+    pool.close().await;
+}
+
+/// As `assert_nothing_durable_over_http`, for a Sale in a world where an earlier Sale legitimately
+/// consumed a document number.
+async fn assert_nothing_durable_over_http_for(pool: &sqlx::SqlitePool, sale_id: &str) {
+    let (status, number): (String, Option<String>) =
+        sqlx::query_as("SELECT status,document_number FROM sale_documents WHERE id=?")
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .expect("sale");
+    assert_eq!(status, "draft");
+    assert_eq!(number, None);
+    for (what, sql) in [
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "outflow",
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+             AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+        (
+            "finalized Schedule X entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+             WHERE sale_document_id=? AND status='finalized'",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "a {what} survived");
+    }
+}
+
+/// Phase 1M-D3-C2, item 29 case 8 — RULE 65(11A): NO SUBSTITUTION, EVEN FOR A SCHEDULE X LINE.
+///
+/// "No person dispensing a prescription containing substances specified in Schedule H and Schedule H1
+/// or X may supply any other preparation, whether containing the same substances or not in lieu
+/// thereof." The prescription here names a different product from the one on the Sale line, and the
+/// link is refused outright — the identity is checked where it is established, not re-litigated inside
+/// Schedule X.
+#[tokio::test]
+async fn real_service_refuses_a_schedule_x_line_against_another_products_prescription_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            skip_prepare: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A second product, and a prescription that names IT rather than the Schedule X drug.
+    let (other_product, _, _) = ordinary_product_over_http(&service, &f.world).await;
+    let created = call(
+        &service,
+        "POST",
+        "/api/v1/prescriptions",
+        Some(json!({
+            "prescribedOn": "2026-09-10",
+            "prescriberId": Value::Null,
+            "prescriberName": "Dr. Anjali Rao",
+            "prescriberAddress": "Rao Clinic, FC Road, Pune 411005",
+            "subjectKind": "human",
+            "subjectName": "Sita Kulkarni",
+            "subjectAddress": "14 Lakshmi Road, Pune 411004",
+            "repeatAuthority": "once",
+            "writtenSignedDatedAttested": true,
+            "items": [{
+                "productId": other_product,
+                "writtenDescription": "Tab. as prescribed",
+                "prescribedQuantityAtoms": 20,
+                "doseText": "1 tablet twice daily",
+            }],
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let other_item = created.body["items"][0]["id"]
+        .as_str()
+        .expect("item")
+        .to_owned();
+
+    // Re-pointing the Schedule X line at that item is refused: same molecule or not, it is not the
+    // preparation the prescriber wrote.
+    let revision = sale_revision_over_http(&service, &f.world, &f.sale_id).await;
+    let refused = call(
+        &service,
+        "PUT",
+        &format!("/api/v1/sale-lines/{}/prescription", f.line_id),
+        Some(json!({ "expectedRevision": revision, "prescriptionItemId": other_item })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_ne!(
+        refused.status, 200,
+        "a Schedule X line took another product's prescription item: {:?}",
+        refused.body
+    );
+    let text = refused.body.to_string().to_lowercase();
+    assert!(
+        text.contains("product") || text.contains("substitut") || text.contains("prescription"),
+        "{:?}",
+        refused.body
+    );
+
+    // The line still points at its own item, and the identity chain is intact in the database.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let linked: String =
+        sqlx::query_scalar("SELECT prescription_item_id FROM sale_lines WHERE id=?")
+            .bind(&f.line_id)
+            .fetch_one(&pool)
+            .await
+            .expect("link");
+    assert_eq!(linked, f.item);
+    assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 cases 9 and 10 — RULE 65(11)(a) AND (b), ON A SCHEDULE X SUPPLY.
+///
+/// (a) "the prescription must not be dispensed more than once unless the prescriber has stated thereon
+/// that it may be dispensed more than once". (b) "if the prescription contains a direction that it may
+/// be dispensed a stated number of times or at stated intervals it must not be dispensed otherwise
+/// than in accordance with the directions".
+///
+/// Both are answered by `domain::prescriptions::check_dispense`, which the Schedule X path joins
+/// rather than reimplements, and both are enforced again by the `prescription_dispensings` caps in the
+/// database. Each case posts one lawful Schedule X supply first, so the refusal is reached on the
+/// second — not on some earlier requirement.
+#[tokio::test]
+async fn real_service_refuses_a_second_schedule_x_supply_beyond_the_repeat_authority_over_http() {
+    for (case, repeat, expected) in [
+        (
+            // Case 9 — dispensed once already, and the prescriber authorised no repeat.
+            "repeat_not_authorised",
+            json!({ "repeatAuthority": "once" }),
+            "prescription_repeat_not_authorised",
+        ),
+        (
+            // Case 10 — a repeat IS authorised, but not yet: the stated interval has not elapsed.
+            "repeat_interval_not_elapsed",
+            json!({
+                "repeatAuthority": "stated_times",
+                "repeatTimes": 2,
+                "repeatIntervalDays": 30
+            }),
+            "prescription_repeat_too_soon",
+        ),
+    ] {
+        let service = start().await;
+        let f = favourable_schedule_x_with_options(
+            &service,
+            FavourableOptions {
+                confirm: true,
+                repeat: Some(repeat),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // One lawful supply.
+        let posted = post_quoted_over_http(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-000000000409",
+        )
+        .await;
+        assert_eq!(posted.status, 200, "{case}: {:?}", posted.body);
+
+        // A second Sale against the same prescription item, on the same lawful lot, with every other
+        // Schedule X requirement satisfied again.
+        let (second_sale, second_line, second_revision) =
+            prepared_sale_on_lot_over_http(&service, &f.world, &f.batch, &f.item, &f.professional)
+                .await;
+        let annotated =
+            record_annotation_over_http(&service, &f.world.cookie, &second_line, true).await;
+        assert_eq!(annotated.status, 201, "{case}: {:?}", annotated.body);
+
+        let refused = post_quoted_over_http(
+            &service,
+            &f.world,
+            &second_sale,
+            second_revision,
+            "01997a00-0000-7000-8000-00000000040a",
+        )
+        .await;
+        assert_eq!(refused.status, 409, "{case}: {:?}", refused.body);
+        assert_eq!(
+            refused.body["code"], "prescription_requirements_incomplete",
+            "{case}: {:?}",
+            refused.body
+        );
+        let codes = prescription_issue_fields(&refused.body);
+        assert!(
+            codes.iter().any(|code| code.ends_with(expected)),
+            "{case}: expected {expected}, got {codes:?}"
+        );
+
+        // The first supply stands; the second left nothing behind.
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+        let dispensings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE prescription_item_id=?",
+        )
+        .bind(&f.item)
+        .fetch_one(&pool)
+        .await
+        .expect("dispensings");
+        assert_eq!(dispensings, 1, "{case}: a second dispensing survived");
+        assert_nothing_durable_over_http_for(&pool, &second_sale).await;
+        pool.close().await;
+    }
+}
+
+/// Every issue field a structured prescription refusal names.
+fn prescription_issue_fields(body: &Value) -> Vec<String> {
+    body["issues"]
+        .as_array()
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| issue["field"].as_str())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Phase 1M-D3-C2, item 29 case 6 — THE SUPPLIER AUTHORITY'S PERIOD IS HALF-OPEN, AT THE SALE.
+///
+/// Phase 1M-D3-C1 models the recorded period as `[effective_from, effective_to)` with `effective_to`
+/// EXCLUSIVE, and resolves it against the purchase's own invoice date — never today. These are the
+/// four boundaries, exercised through a complete Schedule X Sale rather than through the resolver
+/// alone, so the arithmetic that actually gates a supply is the arithmetic under test.
+///
+/// Every fixture is otherwise fully favourable, and the lot's only purchase is invoiced 2026-09-10.
+#[tokio::test]
+async fn real_service_holds_the_supplier_authority_period_half_open_at_the_sale_over_http() {
+    const INVOICE: &str = "2026-09-10";
+    for (case, from, to, basis, eligible) in [
+        // The invoice date is exactly the first day the authority covers.
+        (
+            "invoice_on_effective_from",
+            INVOICE,
+            None,
+            "perpetual",
+            true,
+        ),
+        // One day later, so the invoice falls immediately BEFORE the period opens.
+        (
+            "invoice_immediately_before_effective_from",
+            "2026-09-11",
+            None,
+            "perpetual",
+            false,
+        ),
+        // `effective_to` is exclusive, so the invoice sits inside a period ending the day after.
+        (
+            "invoice_immediately_before_effective_to",
+            "2020-01-01",
+            Some("2026-09-11"),
+            "fixed_term",
+            true,
+        ),
+        // And exactly ON `effective_to` is outside it.
+        (
+            "invoice_exactly_on_effective_to",
+            "2020-01-01",
+            Some(INVOICE),
+            "fixed_term",
+            false,
+        ),
+    ] {
+        let service = start().await;
+        let f = favourable_schedule_x_with_options(
+            &service,
+            FavourableOptions {
+                confirm: eligible,
+                skip_prepare: !eligible,
+                authority_period: Some((from.to_owned(), to.map(str::to_owned), basis.to_owned())),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let preflight = preflight_over_http(&service, &f.world.cookie, &f.sale_id).await;
+        let line = &preflight["lines"].as_array().expect("lines")[0];
+        let unmet = unmet_predicates(line);
+        let pool = database::connect(&service.database_path)
+            .await
+            .expect("database");
+
+        if eligible {
+            assert_eq!(unmet, Vec::<String>::new(), "{case}: {line}");
+            let posted = post_quoted_over_http(
+                &service,
+                &f.world,
+                &f.sale_id,
+                f.revision,
+                "01997a00-0000-7000-8000-00000000041b",
+            )
+            .await;
+            assert_eq!(posted.status, 200, "{case}: {:?}", posted.body);
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM store_schedule_x_register_entries WHERE id=?",
+            )
+            .bind(&f.entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("entry");
+            assert_eq!(status, "finalized", "{case}");
+        } else {
+            // The source's authority does not cover the day its goods were bought, so the lot cannot
+            // support a Schedule X supply and the working entry is never even prepared.
+            assert!(
+                unmet.contains(&"sourceAuthorities:outside_effective_period".to_owned()),
+                "{case}: {unmet:?}"
+            );
+            let refused = post_quoted_over_http(
+                &service,
+                &f.world,
+                &f.sale_id,
+                f.revision,
+                "01997a00-0000-7000-8000-00000000041c",
+            )
+            .await;
+            assert_eq!(refused.status, 409, "{case}: {:?}", refused.body);
+            assert!(
+                schedule_x_unmet(&refused.body)
+                    .contains(&"schedule_x_source_authority_missing".to_owned()),
+                "{case}: {:?}",
+                refused.body
+            );
+            assert_nothing_durable_over_http(&pool, &f.sale_id).await;
+        }
+        pool.close().await;
+    }
+}
+
+// ==============================================================================================
+// Phase 1M-D3-C2 — concurrency. Enumerate the valid serializations, then prove the invariant from
+// the database. No sleeps, no retries, no serialization of the suite, no widened budgets.
+// ==============================================================================================
+
+/// A second favourable Schedule X Sale in an existing world, against the same lot and prescription
+/// item, with its own signed working entry. Returns (sale, line, revision, entry).
+async fn second_favourable_x_sale_over_http(
+    service: &Service,
+    f: &FavourableX,
+) -> (String, String, i64, String) {
+    let (sale_id, line_id, revision) =
+        prepared_sale_on_lot_over_http(service, &f.world, &f.batch, &f.item, &f.professional).await;
+    let annotated = record_annotation_over_http(service, &f.world.cookie, &line_id, true).await;
+    assert_eq!(annotated.status, 201, "{:?}", annotated.body);
+    let prepared = prepare_supply_over_http(service, &f.world.cookie, &line_id).await;
+    assert_eq!(prepared.status, 201, "{:?}", prepared.body);
+    let entry_id = prepared.body["id"].as_str().expect("id").to_owned();
+    let confirmed = call(
+        service,
+        "POST",
+        &format!("/api/v1/store/schedule-x/register/{entry_id}/confirm"),
+        Some(json!({
+            "supervisingProfessionalId": f.professional,
+            "particularsEnteredInPhysicalRegister": true,
+            "physicalEntryAuthenticated": true,
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(confirmed.status, 200, "{:?}", confirmed.body);
+    (sale_id, line_id, revision, entry_id)
+}
+
+/// Phase 1M-D3-C2, item 29 case 21 — TWO TERMINALS POSTING ONE SCHEDULE X SALE.
+///
+/// Both requests carry the same draft revision and different idempotency keys, so they are two
+/// genuine attempts at the same supply rather than a replay.
+///
+/// Valid serializations: whichever posting takes the write lock first commits; the other finds the
+/// document already posted, or its revision stale, and is refused. Either way the authoritative
+/// invariant is the same and is proved below — ONE effective posting, and exactly one of everything
+/// a supply writes, including one Schedule X register entry. A second entry would be a second supply
+/// in the statutory record of a supply that happened once.
+#[tokio::test]
+async fn real_service_posts_one_schedule_x_sale_once_under_a_double_post_race_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+    let total = quote_over_http(&service, &f.world, &f.sale_id).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+
+    let (first, second) = tokio::join!(
+        post_sale(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-00000000042c",
+            total
+        ),
+        post_sale(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-00000000042d",
+            total
+        )
+    );
+    // At least one landed, and they did not both.
+    assert!(
+        (first.status == 200) ^ (second.status == 200),
+        "exactly one posting must win: first={:?} second={:?}",
+        first.body,
+        second.body
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let status: String = sqlx::query_scalar("SELECT status FROM sale_documents WHERE id=?")
+        .bind(&f.sale_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sale");
+    assert_eq!(status, "posted");
+    for (what, sql) in [
+        (
+            "document",
+            "SELECT COUNT(*) FROM sale_documents WHERE id=? AND document_number IS NOT NULL",
+        ),
+        (
+            "dispensing",
+            "SELECT COUNT(*) FROM prescription_dispensings WHERE sale_document_id=?",
+        ),
+        (
+            "outward movement",
+            "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' \
+             AND sale_line_id IN (SELECT id FROM sale_lines WHERE sale_document_id=?)",
+        ),
+        (
+            "tender",
+            "SELECT COUNT(*) FROM sale_tenders WHERE sale_document_id=?",
+        ),
+        (
+            "finalized Schedule X entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries \
+             WHERE sale_document_id=? AND status='finalized'",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&f.sale_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "the race produced {count} of: {what}");
+    }
+    // Exactly one number left the series.
+    let next: i64 = sqlx::query_scalar(
+        "SELECT next_value FROM document_number_series WHERE document_kind='sale'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("series");
+    assert_eq!(next, 2, "the race consumed more than one document number");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 22 — TWO SCHEDULE X SALES AGAINST ONE PRESCRIPTION AUTHORITY.
+///
+/// The prescription item authorises 10 atoms. Two complete Schedule X Sales each want 10. Rule
+/// 65(10)(c) caps the total at what the prescriber wrote and rule 65(11)(a) caps the occasions at one,
+/// so both answers refuse the second supply.
+///
+/// Valid serializations: either order. The invariant proved from the database afterwards is the one
+/// that matters — the durable dispensed total for the item NEVER exceeds the authority, whichever
+/// Sale won.
+#[tokio::test]
+async fn real_service_never_exceeds_a_prescription_authority_under_a_schedule_x_race_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_with_options(
+        &service,
+        FavourableOptions {
+            confirm: true,
+            // Exactly one pack's worth of authority, so two Sales of one pack cannot both be lawful.
+            repeat: Some(json!({ "repeatAuthority": "once" })),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Narrow the authority to a single pack.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let narrowed =
+        sqlx::query("UPDATE prescription_items SET prescribed_quantity_atoms=10 WHERE id=?")
+            .bind(&f.item)
+            .execute(&pool)
+            .await
+            .expect("narrow");
+    assert_eq!(narrowed.rows_affected(), 1);
+    pool.close().await;
+
+    let (second_sale, _, second_revision, _) =
+        second_favourable_x_sale_over_http(&service, &f).await;
+
+    let first_total = quote_over_http(&service, &f.world, &f.sale_id).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    let second_total = quote_over_http(&service, &f.world, &second_sale).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    let (first, second) = tokio::join!(
+        post_sale(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-00000000043e",
+            first_total
+        ),
+        post_sale(
+            &service,
+            &f.world,
+            &second_sale,
+            second_revision,
+            "01997a00-0000-7000-8000-00000000043f",
+            second_total
+        )
+    );
+    // Both refusing is a valid serialization only if neither could proceed; at most one may post.
+    assert!(
+        !(first.status == 200 && second.status == 200),
+        "both Sales posted against one authority: first={:?} second={:?}",
+        first.body,
+        second.body
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let dispensed: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity_atoms),0) FROM prescription_dispensings \
+         WHERE prescription_item_id=?",
+    )
+    .bind(&f.item)
+    .fetch_one(&pool)
+    .await
+    .expect("dispensed");
+    assert!(
+        dispensed <= 10,
+        "the race dispensed {dispensed} atoms against an authority of 10"
+    );
+    // And exactly one finalized Schedule X entry exists across both Sales, at most.
+    let finalized: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM store_schedule_x_register_entries WHERE status='finalized'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("finalized");
+    assert!(finalized <= 1, "{finalized} supplies were finalized");
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 23 — TWO SCHEDULE X SALES AGAINST ONE LOT'S STOCK.
+///
+/// The lot is drawn down to a single pack, and two complete Schedule X Sales each want a pack from it.
+/// The Phase 1H inventory model takes the write lock before reading any balance, so the two cannot
+/// interleave between the availability check and the movement.
+///
+/// Valid serializations: either order. The invariants proved afterwards are that the lot's sellable
+/// balance never goes negative and the durable outward quantity never exceeds what the lot held.
+#[tokio::test]
+async fn real_service_never_oversells_a_schedule_x_lot_under_a_race_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+    let (second_sale, _, second_revision, _) =
+        second_favourable_x_sale_over_http(&service, &f).await;
+
+    // Draw the lot down to exactly one pack, so only one of the two Sales can be supplied.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let available: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity_delta_atoms),0) FROM inventory_movements \
+         WHERE batch_id=? AND stock_status='sellable'",
+    )
+    .bind(&f.batch)
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert!(available >= 10, "the lot held {available} atoms");
+    if available > 10 {
+        // A counted shelf sets the balance to exactly one pack. A count LOSS is a decrease, so it
+        // cannot add anything to the sellable balance and the lot's provenance is untouched.
+        let counted = run_operation(
+            &service,
+            &f.world.cookie,
+            "physical_count",
+            json!({
+                "productPackId": f.world.pack, "batchId": f.batch, "stockStatus": "sellable",
+                "reasonCode": "physical_count_loss", "countedQuantity": 10,
+                "quantityBasis": "base_unit"
+            }),
+        )
+        .await;
+        assert_eq!(counted.status, 200, "{:?}", counted.body);
+    }
+    pool.close().await;
+
+    let first_total = quote_over_http(&service, &f.world, &f.sale_id).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    let second_total = quote_over_http(&service, &f.world, &second_sale).await["grandTotalPaise"]
+        .as_i64()
+        .expect("total");
+    let (first, second) = tokio::join!(
+        post_sale(
+            &service,
+            &f.world,
+            &f.sale_id,
+            f.revision,
+            "01997a00-0000-7000-8000-000000000450",
+            first_total
+        ),
+        post_sale(
+            &service,
+            &f.world,
+            &second_sale,
+            second_revision,
+            "01997a00-0000-7000-8000-000000000451",
+            second_total
+        )
+    );
+    assert!(
+        !(first.status == 200 && second.status == 200),
+        "both Sales drew the same pack: first={:?} second={:?}",
+        first.body,
+        second.body
+    );
+
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    let balance: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity_delta_atoms),0) FROM inventory_movements \
+         WHERE batch_id=? AND stock_status='sellable'",
+    )
+    .bind(&f.batch)
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert!(balance >= 0, "the lot went to {balance} atoms");
+    let sold: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(-SUM(quantity_delta_atoms),0) FROM inventory_movements \
+         WHERE batch_id=? AND movement_type='sale'",
+    )
+    .bind(&f.batch)
+    .fetch_one(&pool)
+    .await
+    .expect("sold");
+    assert!(
+        sold <= 10,
+        "the race sold {sold} atoms out of a lot holding 10"
+    );
+    pool.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 29 — A POSTED SCHEDULE X SALE SURVIVES BACKUP AND RESTORE.
+///
+/// A genuinely posted supply, through the ordinary Phase 1K backup and restore workflow and no
+/// Schedule X-specific format. What must come back is the whole statutory record of that supply: the
+/// document and its number and date, the frozen regulatory snapshot, the dispensing, the outward
+/// movement, the finalized rule 65(21) entry with its three posting bindings and both physical
+/// attestations, the rule 65(11)(c) annotation linkage, the supplier's historical authority evidence,
+/// the provenance chain behind the lot, and the audit history.
+#[tokio::test]
+async fn real_service_carries_a_posted_schedule_x_sale_through_backup_and_restore_over_http() {
+    let harness = start_with_backups().await;
+    let service = &harness.service;
+    let f = favourable_schedule_x_over_http(service, true).await;
+    let posted = post_quoted_over_http(
+        service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-000000000462",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let document_number = posted.body["documentNumber"]
+        .as_str()
+        .expect("documentNumber")
+        .to_owned();
+
+    let created = call(
+        service,
+        "POST",
+        "/api/v1/backups/create",
+        Some(json!({})),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    let resolved = call(
+        service,
+        "GET",
+        &format!(
+            "/api/v1/backups/{}/download",
+            created.body["backupId"].as_str().expect("backup id")
+        ),
+        None,
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(resolved.status, 200, "{:?}", resolved.body);
+    let (status, _, downloaded) = get_bytes(
+        service,
+        resolved.body["url"].as_str().expect("url"),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Something after the backup that the restore must undo.
+    let after = call(
+        service,
+        "POST",
+        "/api/v1/parties",
+        Some(json!({
+            "party": { "displayName": "Post-Backup Supplier" },
+            "roles": [{ "role": "supplier" }]
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(after.status, 201, "{:?}", after.body);
+
+    let (status, _, body) = call_bytes(
+        service,
+        "/api/v1/backups/restore/prepare",
+        "application/octet-stream",
+        &downloaded,
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let prepared_restore: Value = serde_json::from_slice(&body).expect("prepared restore");
+    let committed = call(
+        service,
+        "POST",
+        "/api/v1/backups/restore/commit",
+        Some(json!({
+            "candidateToken": prepared_restore["candidateToken"].as_str().expect("token"),
+            "password": "Integration-Password-42"
+        })),
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+    api::backups::recover_interrupted_restore(&harness.backups, &service.database_path)
+        .await
+        .expect("recovery");
+    let reopened = database::connect(&service.database_path)
+        .await
+        .expect("reopened database");
+    assert!(
+        api::backups::complete_restore_after_open(&reopened, &harness.backups)
+            .await
+            .expect("completion")
+    );
+    let post_backup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM parties WHERE display_name='Post-Backup Supplier'",
+    )
+    .fetch_one(&reopened)
+    .await
+    .expect("parties");
+    assert_eq!(post_backup, 0, "the restore did not roll the pharmacy back");
+
+    // The Sale, its number, its date and its frozen regulatory snapshot.
+    let (status, number, business_date): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT status,document_number,business_date FROM sale_documents WHERE id=?",
+    )
+    .bind(&f.sale_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("the posted Sale did not survive the restore");
+    assert_eq!(status, "posted");
+    assert_eq!(number.as_deref(), Some(document_number.as_str()));
+    let (snapshot_version, schemes): (i64, String) = sqlx::query_as(
+        "SELECT regulatory_snapshot_version,regulatory_schemes_snapshot FROM sale_lines WHERE id=?",
+    )
+    .bind(&f.line_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("line");
+    assert_eq!(snapshot_version, 1);
+    assert!(schemes.contains("\"schedule_x\":\"applies\""), "{schemes}");
+
+    // The dispensing and the outward movement.
+    let dispensings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM prescription_dispensings WHERE sale_line_id=?")
+            .bind(&f.line_id)
+            .fetch_one(&reopened)
+            .await
+            .expect("dispensings");
+    assert_eq!(dispensings, 1);
+    let outflow: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_movements WHERE movement_type='sale' AND sale_line_id=?",
+    )
+    .bind(&f.line_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("outflow");
+    assert_eq!(outflow, 1);
+
+    // The finalized rule 65(21) entry, with all three bindings and both attestations.
+    #[derive(sqlx::FromRow)]
+    struct Restored {
+        status: String,
+        dispensing_id: Option<String>,
+        bill_number: Option<String>,
+        bill_date: Option<String>,
+        batch_id: Option<String>,
+        particulars_entered_in_physical_register: i64,
+        physical_entry_authenticated: i64,
+        supervising_professional_id: Option<String>,
+    }
+    let entry: Restored = sqlx::query_as(
+        "SELECT status,dispensing_id,bill_number,bill_date,batch_id,\
+         particulars_entered_in_physical_register,physical_entry_authenticated,\
+         supervising_professional_id \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("the finalized entry did not survive the restore");
+    assert_eq!(entry.status, "finalized");
+    assert!(entry.dispensing_id.is_some());
+    assert_eq!(entry.bill_number.as_deref(), Some(document_number.as_str()));
+    assert_eq!(entry.bill_date.as_deref(), Some(business_date.as_str()));
+    assert_eq!(entry.batch_id.as_deref(), Some(f.batch.as_str()));
+    assert_eq!(entry.particulars_entered_in_physical_register, 1);
+    assert_eq!(entry.physical_entry_authenticated, 1);
+    assert!(entry.supervising_professional_id.is_some());
+
+    // The rule 65(11)(c) annotation linkage, the supplier's historical authority evidence, the
+    // provenance chain behind the lot, and the audit history.
+    for (what, sql) in [
+        (
+            "rule 65(11)(c) annotation",
+            "SELECT COUNT(*) FROM schedule_x_prescription_annotations WHERE sale_line_id=?",
+        ),
+        (
+            "qualifying receipt entry",
+            "SELECT COUNT(*) FROM store_schedule_x_register_entries receipt \
+             JOIN inventory_movements inward ON inward.purchase_line_id=receipt.purchase_line_id \
+             WHERE receipt.entry_kind='receipt' AND inward.batch_id=(\
+                 SELECT batch_id FROM sale_lines WHERE id=?)",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(&f.line_id)
+            .fetch_one(&reopened)
+            .await
+            .expect("count");
+        assert!(count >= 1, "{what} did not survive the restore");
+    }
+    let authority: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM supplier_schedule_x_authorities WHERE id=?")
+            .bind(&f.authority)
+            .fetch_one(&reopened)
+            .await
+            .expect("authority");
+    assert_eq!(
+        authority, 1,
+        "the supplier's authority evidence did not survive"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM master_change_events \
+         WHERE entity_type='schedule_x_register_entry' AND entity_id=? AND action='posted'",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&reopened)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1, "the finalization audit did not survive");
+    reopened.close().await;
+}
+
+/// Phase 1M-D3-C2, item 29 case 30 — A POSTED SCHEDULE X SALE IS NEVER REREAD THROUGH TODAY'S MASTERS.
+///
+/// After the supply is posted, the masters move on, exactly as they are allowed to: the Form 20-F drug
+/// coverage is withdrawn, the supplier's authority is archived, the pharmacist leaves, and the drug's
+/// regulatory classification is corrected. None of that is historical evidence, and none of it is
+/// touched here — only current master state.
+///
+/// The posted document must not be reinterpreted by any of it. What was frozen at posting stays
+/// frozen, and the statutory record of what was supplied that day reads the same afterwards.
+#[tokio::test]
+async fn real_service_never_rereads_a_posted_schedule_x_sale_through_todays_masters_over_http() {
+    let service = start().await;
+    let f = favourable_schedule_x_over_http(&service, true).await;
+    let posted = post_quoted_over_http(
+        &service,
+        &f.world,
+        &f.sale_id,
+        f.revision,
+        "01997a00-0000-7000-8000-000000000473",
+    )
+    .await;
+    assert_eq!(posted.status, 200, "{:?}", posted.body);
+    let before = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{}", f.sale_id),
+        None,
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(before.status, 200, "{:?}", before.body);
+
+    // The masters move on. Every one of these is a CURRENT master the owner may lawfully change.
+    let pool = database::connect(&service.database_path)
+        .await
+        .expect("database");
+    for (what, statement, binding) in [
+        (
+            "Form 20-F drug coverage withdrawn",
+            "UPDATE store_licence_drug_coverage SET status='archived',\
+             archived_at_utc='2026-09-20T06:00:00.000Z',archive_reason='withdrawn' \
+             WHERE licence_id=?",
+            f.licence.clone(),
+        ),
+        (
+            "supplier authority archived",
+            "UPDATE supplier_schedule_x_authorities SET status='archived',\
+             archived_at_utc='2026-09-20T06:00:00.000Z',archive_reason='withdrawn' WHERE id=?",
+            f.authority.clone(),
+        ),
+        (
+            "pharmacist left the pharmacy",
+            "UPDATE store_professionals SET status='archived',\
+             archived_at_utc='2026-09-20T06:00:00.000Z',archive_reason='left' WHERE id=?",
+            f.professional.clone(),
+        ),
+        (
+            "Schedule X classification corrected to not applying",
+            "UPDATE product_regulatory_classifications SET applies=0 \
+             WHERE product_id=? AND scheme='schedule_x' AND status='active'",
+            f.world.product.clone(),
+        ),
+    ] {
+        let changed = sqlx::query(statement)
+            .bind(&binding)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{what}: {error}"));
+        assert!(changed.rows_affected() >= 1, "{what}: nothing changed");
+    }
+
+    // The posted document reads exactly as it did.
+    let after = call(
+        &service,
+        "GET",
+        &format!("/api/v1/sales/{}", f.sale_id),
+        None,
+        Some(&f.world.cookie),
+    )
+    .await;
+    assert_eq!(after.status, 200, "{:?}", after.body);
+    assert_eq!(after.body["status"], "posted");
+    assert_eq!(after.body["documentNumber"], before.body["documentNumber"]);
+    assert_eq!(
+        after.body["lines"][0]["regulatoryGate"], before.body["lines"][0]["regulatoryGate"],
+        "the posted line was re-gated against today's classification"
+    );
+
+    // And the frozen snapshot still says Schedule X applied, though the master now says otherwise.
+    let schemes: String =
+        sqlx::query_scalar("SELECT regulatory_schemes_snapshot FROM sale_lines WHERE id=?")
+            .bind(&f.line_id)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot");
+    assert!(
+        schemes.contains("\"schedule_x\":\"applies\""),
+        "the frozen snapshot followed the master: {schemes}"
+    );
+    let current: i64 = sqlx::query_scalar(
+        "SELECT applies FROM product_regulatory_classifications \
+         WHERE product_id=? AND scheme='schedule_x' AND status='active'",
+    )
+    .bind(&f.world.product)
+    .fetch_one(&pool)
+    .await
+    .expect("current");
+    assert_eq!(current, 0, "the master was not actually changed");
+
+    // The finalized register entry is untouched by any of it.
+    #[derive(sqlx::FromRow)]
+    struct Still {
+        status: String,
+        bill_number: Option<String>,
+        supervising_professional_name: Option<String>,
+        particulars_entered_in_physical_register: i64,
+    }
+    let entry: Still = sqlx::query_as(
+        "SELECT status,bill_number,supervising_professional_name,\
+         particulars_entered_in_physical_register \
+         FROM store_schedule_x_register_entries WHERE id=?",
+    )
+    .bind(&f.entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry.status, "finalized");
+    assert_eq!(
+        entry.bill_number.as_deref(),
+        before.body["documentNumber"].as_str()
+    );
+    // The pharmacist's name is the one frozen on the entry, not a lookup into a now-archived master.
+    assert!(entry.supervising_professional_name.is_some());
+    assert_eq!(entry.particulars_entered_in_physical_register, 1);
+    pool.close().await;
 }
